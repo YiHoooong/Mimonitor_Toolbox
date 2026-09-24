@@ -874,7 +874,11 @@ class PagesMixin:
         box.deleteLater()
         if not accepted:
             return
-        update_settings({"presets": [p for p in self._preset_list() if p.get("id") != preset_id]})
+        changes = {"presets": [p for p in self._preset_list() if p.get("id") != preset_id]}
+        if self.active_preset_id() == preset_id:
+            changes["active_preset_id"] = None
+            changes["preset_snapshot"] = None
+        update_settings(changes)
         self.log(f"已删除预设「{name}」")
         self._preset_sync()
 

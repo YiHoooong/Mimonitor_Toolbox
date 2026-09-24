@@ -35,6 +35,25 @@ class CoreSettingsTests(unittest.TestCase):
         self.assertEqual(settings["saved_ip"], "192.168.1.8")
         self.assertEqual(settings["close_behavior"], "exit")
 
+    def test_missing_active_preset_falls_back_to_baseline(self):
+        from mimonitor_toolbox import core
+
+        self.config_path.write_text(
+            '{"active_preset_id": "deleted", "presets": []}', encoding="utf-8"
+        )
+        with mock.patch.object(core, "get_settings_path", return_value=str(self.config_path)):
+            self.assertIsNone(core.load_settings()["active_preset_id"])
+
+    def test_existing_active_preset_is_preserved(self):
+        from mimonitor_toolbox import core
+
+        self.config_path.write_text(
+            '{"active_preset_id": "p1", "presets": [{"id": "p1"}]}',
+            encoding="utf-8",
+        )
+        with mock.patch.object(core, "get_settings_path", return_value=str(self.config_path)):
+            self.assertEqual(core.load_settings()["active_preset_id"], "p1")
+
     def test_source_mode_base_dir_is_project_root(self):
         from mimonitor_toolbox import core
 

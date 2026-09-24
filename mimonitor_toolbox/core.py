@@ -101,7 +101,9 @@ def _load_settings_unlocked():
     snapshot = merged.get("preset_snapshot")
     merged["preset_snapshot"] = snapshot if isinstance(snapshot, dict) else None
     active = merged.get("active_preset_id")
-    merged["active_preset_id"] = active if isinstance(active, str) and active else None
+    preset_ids = {preset.get("id") for preset in merged["presets"]
+                  if isinstance(preset.get("id"), str)}
+    merged["active_preset_id"] = active if isinstance(active, str) and active in preset_ids else None
     return merged
 
 def load_settings():

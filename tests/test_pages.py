@@ -1038,6 +1038,20 @@ class PresetAndTaskPageTests(TrayTestBase):
         self.assertEqual(settings["presets"], [])
         self.assertEqual(len(self._cards(window)), 2)        # 无预设 + 添加
 
+    def test_deleting_active_preset_returns_to_baseline(self):
+        from mimonitor_toolbox import pages as pages_module
+
+        settings = {"presets": [{"id": "p1", "name": "A", "values": {}}],
+                    "active_preset_id": "p1",
+                    "preset_snapshot": {"values": {"picture_mode": 9}}}
+        window = self._window(settings)
+        with mock.patch.object(pages_module, "MessageBox") as box:
+            box.return_value.exec.return_value = True
+            window._preset_delete("p1")
+        self.assertIsNone(settings["active_preset_id"])
+        self.assertIsNone(settings["preset_snapshot"])
+        self.assertTrue(window.chk_hdr_local_dimming_memory.isEnabled())
+
     def test_cancelled_delete_keeps_the_preset(self):
         from mimonitor_toolbox import pages as pages_module
 
