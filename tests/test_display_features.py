@@ -13,6 +13,38 @@ class DisplayFeatureTests(unittest.TestCase):
         self.assertEqual(DisplayFeaturesMixin._picture_mode_group_name(host, 25), "游戏")
         self.assertEqual(DisplayFeaturesMixin._picture_mode_group_name(host, 9), "电影")
 
+    def test_hdr_state_query_uses_selected_display_only(self):
+        from mimonitor_toolbox import display_features
+        from mimonitor_toolbox.display_features import DisplayFeaturesMixin
+
+        host = DisplayFeaturesMixin()
+        displays = [
+            {"device_name": "DISPLAY1", "device_id": "XMI27B3-1", "label": "红米"},
+            {"device_name": "DISPLAY2", "device_id": "VIRTUAL-2", "label": "虚拟屏"},
+        ]
+        with mock.patch.object(display_features, "load_settings",
+                               return_value={"hdr_target_display_id": "XMI27B3-1"}), \
+                mock.patch.object(display_features, "list_windows_displays", return_value=displays), \
+                mock.patch.object(display_features, "query_windows_hdr_enabled",
+                                  return_value=False) as query:
+            self.assertFalse(host._query_windows_hdr_state())
+        query.assert_called_once_with(target_device_id="XMI27B3-1")
+        self.assertEqual(host._hdr_target_display_label, "红米")
+
+    def test_missing_hdr_target_does_not_use_other_display(self):
+        from mimonitor_toolbox import display_features
+        from mimonitor_toolbox.display_features import DisplayFeaturesMixin
+
+        host = DisplayFeaturesMixin()
+        displays = [{"device_name": "DISPLAY2", "device_id": "VIRTUAL-2",
+                     "label": "虚拟屏"}]
+        with mock.patch.object(display_features, "load_settings",
+                               return_value={"hdr_target_display_id": "missing"}), \
+                mock.patch.object(display_features, "list_windows_displays", return_value=displays), \
+                mock.patch.object(display_features, "query_windows_hdr_enabled") as query:
+            self.assertIsNone(host._query_windows_hdr_state())
+        query.assert_not_called()
+
 
 class CrosshairModeReconcileTests(unittest.TestCase):
     """准星模式联动：离开游戏模式记住并隐藏，回到游戏模式还原。"""

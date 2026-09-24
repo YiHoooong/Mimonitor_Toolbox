@@ -25,7 +25,7 @@ class WindowsRuntimeTests(unittest.TestCase):
 
         fake_dxgi = SimpleNamespace(CreateDXGIFactory1=FailingCreateFactory())
         pointer_cache = windows.ctypes._pointer_type_cache
-        initial_size = len(pointer_cache)
+        initial_size = len(pointer_cache) if hasattr(pointer_cache, "__len__") else None
 
         with mock.patch.object(windows.sys, "platform", "win32"), mock.patch.object(
             windows.ctypes,
@@ -36,7 +36,34 @@ class WindowsRuntimeTests(unittest.TestCase):
             for _ in range(4):
                 self.assertIsNone(windows.query_windows_hdr_enabled())
 
-        self.assertEqual(len(pointer_cache), initial_size)
+        if initial_size is not None:
+            self.assertEqual(len(pointer_cache), initial_size)
+        self.assertIs(windows.ctypes.POINTER(windows._GUID), windows._GUID_POINTER)
+
+    def test_hdr_selection_only_uses_the_target_display(self):
+        from mimonitor_toolbox import windows
+
+        outputs = [
+            (r"\\.\DISPLAY1", 101, False),
+            (r"\\.\DISPLAY2", 202, True),
+        ]
+        self.assertFalse(windows._select_hdr_output_state(outputs, r"\\.\DISPLAY1"))
+        self.assertTrue(windows._select_hdr_output_state(outputs, r"\\.\DISPLAY2"))
+        self.assertIsNone(windows._select_hdr_output_state(outputs, r"\\.\DISPLAY3"))
+        self.assertIsNone(windows._select_hdr_output_state(outputs, target_monitor=999))
+
+    def test_target_resolution_does_not_substitute_the_second_screen(self):
+        from mimonitor_toolbox import windows
+
+        displays = [
+            {"device_name": "DISPLAY1", "device_id": "XMI27B3-1", "label": "Mi Monitor"},
+            {"device_name": "DISPLAY2", "device_id": "OTHER-2", "label": "Other"},
+        ]
+        self.assertEqual(windows.resolve_hdr_target_display(displays), displays[0])
+        self.assertIsNone(windows.resolve_hdr_target_display(displays, "missing"))
+        self.assertIsNone(windows.resolve_hdr_target_display(displays[1:] + [
+            {"device_name": "DISPLAY3", "device_id": "OTHER-3", "label": "Other"},
+        ]))
 
     def test_hdr_query_walks_dxgi_vtables_and_releases_interfaces(self):
         from mimonitor_toolbox import windows

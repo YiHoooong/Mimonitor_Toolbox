@@ -336,6 +336,15 @@ class CountdownSettingsUiTests(TrayTestBase):
         self.window.countdown_seconds_slider.setValue(1)
         self.assertEqual(self.window.countdown_seconds_slider.value(), 2)
 
+    def test_hdr_source_and_memory_options_have_plain_labels(self):
+        window = self.window
+        options = [window.hdr_target_combo.itemText(i)
+                   for i in range(window.hdr_target_combo.count())]
+        self.assertEqual(options[0], "自动识别")
+        self.assertTrue(all("（" not in text and "(" not in text for text in options))
+        self.assertEqual(window.chk_hdr_local_dimming_memory.text(), "HDR/SDR 分区控光记忆")
+        self.assertEqual(window.chk_freesync_mode_memory.text(), "FreeSync Pro 模式记忆")
+
 
 class TrayMenuTests(TrayTestBase):
     """托盘右键菜单：目录、取值联动、菜单结构与左右键分流。"""

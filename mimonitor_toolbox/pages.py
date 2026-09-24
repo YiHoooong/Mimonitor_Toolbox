@@ -59,6 +59,7 @@ from .core import (
     update_settings,
 )
 from .presets import BASELINE_PRESET_ID, find_preset, new_id, unique_name
+from .windows import list_windows_displays
 from .widgets import (
     TRAY_ROW_HEIGHT,
     AddPresetCard,
@@ -71,7 +72,7 @@ from .widgets import (
     TrayItemList,
 )
 
-# 有预设生效时两个「记忆」暂停的原因说明（既是开关的括号提示，也是 tooltip）
+# 有预设生效时两个「记忆」暂停的原因说明。
 MEMORY_TAKEOVER_HINT = "使用预设时由预设接管"
 
 
@@ -814,7 +815,7 @@ class PagesMixin:
             if checkbox is None:
                 continue
             checkbox.setEnabled(not suspended)
-            checkbox.setToolTip(MEMORY_TAKEOVER_HINT if suspended else "")
+            checkbox.setToolTip(MEMORY_TAKEOVER_HINT)
 
     def _preset_apply(self, preset_id):
         self.apply_preset_by_id(preset_id)
@@ -1315,12 +1316,36 @@ class PagesMixin:
         hdr_memory_layout = QHBoxLayout()
         hdr_memory_layout.setSpacing(15)
         self.chk_hdr_local_dimming_memory = CheckBox(
-            f"HDR/SDR 分区控光记忆（{MEMORY_TAKEOVER_HINT}）", card3)
+            "HDR/SDR 分区控光记忆", card3)
         self.chk_hdr_local_dimming_memory.setChecked(settings.get("hdr_sdr_local_dimming_enabled", False))
         self.chk_hdr_local_dimming_memory.stateChanged.connect(self._toggle_hdr_local_dimming_memory)
         hdr_memory_layout.addWidget(self.chk_hdr_local_dimming_memory)
         hdr_memory_layout.addStretch()
         c3_lay.addLayout(hdr_memory_layout)
+
+        hdr_target_layout = QHBoxLayout()
+        hdr_target_layout.setSpacing(15)
+        hdr_target_layout.addWidget(BodyLabel("HDR 状态来源", card3))
+        self.hdr_target_combo = ComboBox(card3)
+        self.hdr_target_combo.setFixedWidth(300)
+        self.hdr_target_combo.addItem("自动识别")
+        self.hdr_target_combo.setToolTip(
+            "单屏时使用当前显示器；多屏时自动识别 G Pro 27U 2025。也可以手动指定。")
+        self._hdr_target_display_ids = [""]
+        for display in list_windows_displays():
+            self.hdr_target_combo.addItem(display["label"])
+            self._hdr_target_display_ids.append(display["device_id"])
+        configured_target = settings.get("hdr_target_display_id", "")
+        if configured_target and configured_target not in self._hdr_target_display_ids:
+            self.hdr_target_combo.addItem("显示器已断开")
+            self._hdr_target_display_ids.append(configured_target)
+        if configured_target in self._hdr_target_display_ids:
+            self.hdr_target_combo.setCurrentIndex(
+                self._hdr_target_display_ids.index(configured_target))
+        self.hdr_target_combo.currentIndexChanged.connect(self._select_hdr_target_display)
+        hdr_target_layout.addWidget(self.hdr_target_combo)
+        hdr_target_layout.addStretch()
+        c3_lay.addLayout(hdr_target_layout)
 
         self.hdr_memory_status_label = CaptionLabel("当前信号：未检测", card3)
         self.hdr_memory_status_label.setTextColor(QColor(120, 120, 120), QColor(255, 255, 255, 140))
@@ -1329,7 +1354,7 @@ class PagesMixin:
         freesync_memory_layout = QHBoxLayout()
         freesync_memory_layout.setSpacing(15)
         self.chk_freesync_mode_memory = CheckBox(
-            f"FreeSync Pro 模式记忆（{MEMORY_TAKEOVER_HINT}）", card3)
+            "FreeSync Pro 模式记忆", card3)
         self.chk_freesync_mode_memory.setChecked(settings.get("freesync_mode_memory_enabled", False))
         self.chk_freesync_mode_memory.stateChanged.connect(self._toggle_freesync_mode_memory)
         freesync_memory_layout.addWidget(self.chk_freesync_mode_memory)

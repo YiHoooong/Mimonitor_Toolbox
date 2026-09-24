@@ -32,7 +32,7 @@ from .presets import (
     unique_name,
 )
 from .widgets import LoadingSpinner, OverlayResizeFilter
-from .windows import query_windows_hdr_enabled
+from .windows import list_windows_displays, query_windows_hdr_enabled, resolve_hdr_target_display
 
 _preset_overlay_filter = None
 
@@ -59,6 +59,7 @@ class DisplayFeaturesMixin:
         self._hdr_last_state = None
         self._hdr_state_source = None
         self._hdr_windows_state = None
+        self._hdr_target_display_label = None
         self._hdr_memory_apply_timer = QTimer(self)
         self._hdr_memory_apply_timer.setSingleShot(True)
         self._hdr_memory_apply_timer.timeout.connect(self._apply_hdr_memory_for_current_state)
@@ -1353,9 +1354,22 @@ class DisplayFeaturesMixin:
 
     def _query_windows_hdr_state(self):
         try:
-            return query_windows_hdr_enabled(int(self.winId()))
+            displays = list_windows_displays()
+            target = resolve_hdr_target_display(
+                displays, load_settings().get("hdr_target_display_id"))
+            self._hdr_target_display_label = target["label"] if target else None
+            return query_windows_hdr_enabled(target_device_id=target["device_id"]) if target else None
         except Exception:
-            return query_windows_hdr_enabled()
+            self._hdr_target_display_label = None
+            return None
+
+    def _select_hdr_target_display(self, index):
+        ids = getattr(self, "_hdr_target_display_ids", [])
+        if not 0 <= index < len(ids):
+            return
+        update_settings({"hdr_target_display_id": ids[index]})
+        self._hdr_last_state = None
+        self._schedule_hdr_memory_check("切换目标显示器", delay_ms=80)
 
     def _poll_hdr_memory_state(self, reason="timer"):
         visible_interval = 3000
@@ -1470,7 +1484,12 @@ class DisplayFeaturesMixin:
             label.setTextColor(QColor(216, 59, 1), QColor(216, 59, 1))
         else:
             label.setTextColor(QColor(120, 120, 120), QColor(255, 255, 255, 140))
-        label.setText(f"分区控光记忆：{prefix}，当前信号：{state_text}{state_source_text}，记忆模式：SDR={sdr_text}，HDR={hdr_text}{source_text}{runtime_note}")
+        target = getattr(self, "_hdr_target_display_label", None) or "未找到目标显示器"
+        label.setText(
+            f"目标屏：{target}；分区控光记忆：{prefix}，当前信号：{state_text}"
+            f"{state_source_text}，记忆模式：SDR={sdr_text}，HDR={hdr_text}"
+            f"{source_text}{runtime_note}"
+        )
 
     def _schedule_hdr_memory_apply(self, delay_ms=250):
         timer = getattr(self, "_hdr_memory_apply_timer", None)

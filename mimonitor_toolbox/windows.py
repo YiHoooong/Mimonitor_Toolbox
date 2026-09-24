@@ -23,6 +23,8 @@ MOD_WIN = 0x0008
 DXGI_ERROR_NOT_FOUND = 0x887A0002
 DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 = 12
 MONITOR_DEFAULTTONEAREST = 2
+DISPLAY_DEVICE_ATTACHED_TO_DESKTOP = 0x00000001
+EDD_GET_DEVICE_INTERFACE_NAME = 0x00000001
 
 
 class _GUID(ctypes.Structure):
@@ -40,6 +42,17 @@ class _RECTL(ctypes.Structure):
         ("top", wt.LONG),
         ("right", wt.LONG),
         ("bottom", wt.LONG),
+    ]
+
+
+class _DISPLAY_DEVICEW(ctypes.Structure):
+    _fields_ = [
+        ("cb", wt.DWORD),
+        ("DeviceName", wt.WCHAR * 32),
+        ("DeviceString", wt.WCHAR * 128),
+        ("StateFlags", wt.DWORD),
+        ("DeviceID", wt.WCHAR * 128),
+        ("DeviceKey", wt.WCHAR * 128),
     ]
 
 
@@ -125,13 +138,76 @@ def dispatch_power_broadcast(message, power_event, on_resume):
     return True
 
 
-def query_windows_hdr_enabled(window_handle=None):
+def list_windows_displays():
+    """List attached monitors with stable interface IDs and their DXGI display names."""
+    if sys.platform != "win32" or not user32:
+        return []
+    enum_devices = user32.EnumDisplayDevicesW
+    enum_devices.argtypes = [wt.LPCWSTR, wt.DWORD, ctypes.POINTER(_DISPLAY_DEVICEW), wt.DWORD]
+    enum_devices.restype = wt.BOOL
+    displays = []
+    adapter_index = 0
+    while True:
+        adapter = _DISPLAY_DEVICEW()
+        adapter.cb = ctypes.sizeof(adapter)
+        if not enum_devices(None, adapter_index, ctypes.byref(adapter), 0):
+            break
+        adapter_index += 1
+        if not adapter.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP:
+            continue
+        monitor_index = 0
+        while True:
+            monitor = _DISPLAY_DEVICEW()
+            monitor.cb = ctypes.sizeof(monitor)
+            if not enum_devices(adapter.DeviceName, monitor_index, ctypes.byref(monitor),
+                                EDD_GET_DEVICE_INTERFACE_NAME):
+                break
+            monitor_index += 1
+            if monitor.DeviceID:
+                display_name = adapter.DeviceName.rsplit("\\", 1)[-1]
+                display_number = display_name.removeprefix("DISPLAY")
+                slot_label = f"屏幕 {display_number}" if display_number.isdigit() else display_name
+                displays.append({
+                    "device_name": adapter.DeviceName,
+                    "device_id": monitor.DeviceID,
+                    "label": f"{monitor.DeviceString or '显示器'} · {slot_label}",
+                })
+    return displays
+
+
+def resolve_hdr_target_display(displays, configured_id=None):
+    """Never substitute another screen when a configured target disappears."""
+    if configured_id:
+        return next((item for item in displays if item["device_id"] == configured_id), None)
+    matches = [item for item in displays if "XMI27B3" in item["device_id"].upper()]
+    if len(matches) == 1:
+        return matches[0]
+    return displays[0] if len(displays) == 1 else None
+
+
+def _select_hdr_output_state(outputs, target_device_name=None, target_monitor=None):
+    if target_device_name:
+        return next((hdr for name, monitor, hdr in outputs
+                     if name == target_device_name), None)
+    if target_monitor:
+        return next((hdr for name, monitor, hdr in outputs
+                     if monitor == target_monitor), None)
+    return any(hdr for name, monitor, hdr in outputs) if outputs else None
+
+
+def query_windows_hdr_enabled(window_handle=None, *, target_device_id=None):
     """Return True/False for the active Windows HDR color space, or None when unavailable."""
     if sys.platform != "win32":
         return None
     try:
         target_monitor = None
-        if window_handle and user32:
+        target_device_name = None
+        if target_device_id:
+            target = resolve_hdr_target_display(list_windows_displays(), target_device_id)
+            if target is None:
+                return None
+            target_device_name = target["device_name"]
+        if not target_device_name and window_handle and user32:
             target_monitor = user32.MonitorFromWindow(wt.HWND(int(window_handle)), MONITOR_DEFAULTTONEAREST)
             try:
                 target_monitor = int(target_monitor or 0)
@@ -149,8 +225,7 @@ def query_windows_hdr_enabled(window_handle=None):
         if create_factory(ctypes.byref(iid_factory1), ctypes.byref(factory_ptr)) != 0 or not factory_ptr.value:
             return None
 
-        attached_states = []
-        matched_state = None
+        attached_outputs = []
         factory = factory_ptr.value
         try:
             enum_adapters1 = _com_method(factory, 12, _ENUM_INDEXED_PROTO)
@@ -192,13 +267,11 @@ def query_windows_hdr_enabled(window_handle=None):
                                     )
                                     if get_desc1(output6, ctypes.byref(desc)) == 0 and desc.AttachedToDesktop:
                                         is_hdr = desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
-                                        attached_states.append(is_hdr)
                                         try:
                                             monitor = int(desc.Monitor or 0)
                                         except Exception:
                                             monitor = None
-                                        if target_monitor and monitor == target_monitor:
-                                            matched_state = is_hdr
+                                        attached_outputs.append((desc.DeviceName, monitor, is_hdr))
                                 finally:
                                     _release_com(output6)
                         finally:
@@ -210,11 +283,7 @@ def query_windows_hdr_enabled(window_handle=None):
         finally:
             _release_com(factory)
 
-        if matched_state is not None:
-            return matched_state
-        if attached_states:
-            return any(attached_states)
-        return None
+        return _select_hdr_output_state(attached_outputs, target_device_name, target_monitor)
     except Exception:
         return None
 

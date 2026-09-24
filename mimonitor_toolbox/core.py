@@ -55,6 +55,7 @@ def _load_settings_unlocked():
         "never_ask_close": False,
         "saved_ip": "",
         "hdr_sdr_local_dimming_enabled": False,
+        "hdr_target_display_id": "",
         "local_dimming_memory": {"sdr": None, "hdr": None},
         "local_dimming_toggle_last_value": 3,
         "freesync_mode_memory_enabled": False,
