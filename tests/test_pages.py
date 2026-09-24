@@ -196,6 +196,27 @@ class PageContractTests(unittest.TestCase):
         window.deleteLater()
         _qt_application.processEvents()
 
+    def test_zero_scenario_displays_dolby_vision_picture_mode(self):
+        from mimonitor_toolbox.main_window import App
+
+        with mock.patch.object(App, "register_global_hotkeys"), \
+                mock.patch.object(App, "setup_tray"), \
+                mock.patch.object(App, "_auto_connect_on_startup"):
+            window = App()
+
+        window._apply_polled_values({
+            "picture_preset_scenario": 0,
+            "picture_mode": 13,
+        })
+
+        self.assertEqual(window.picture_mode_hint_label.text(), "当前场景：Dolby Vision 自定义")
+        self.assertIn("FluentLabelBase", window.picture_mode_hint_label.styleSheet())
+        self.assertTrue(all(not button.isChecked() for button in window.mode_btns.values()))
+        self.assertFalse(window.hdr_tone_mapping_card.isHidden())
+        window._cleanup_done = True
+        window.deleteLater()
+        _qt_application.processEvents()
+
     def test_crosshair_toggle_lives_in_tools_page_and_defaults_on(self):
         """准星联动开关放在软件设置页（不在游戏页），且默认开启。"""
         from mimonitor_toolbox import display_features

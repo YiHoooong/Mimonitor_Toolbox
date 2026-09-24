@@ -5,7 +5,7 @@ import time
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
-from qfluentwidgets import BodyLabel, MessageBox, ToggleButton
+from qfluentwidgets import BodyLabel, FluentStyleSheet, MessageBox, ToggleButton
 
 from .adb import async_run
 from .core import (
@@ -1669,13 +1669,16 @@ class DisplayFeaturesMixin:
 
     def _active_picture_scene_mode(self):
         current_vals = getattr(self, "current_vals", {})
-        for key in ("picture_preset_scenario", "picture_mode"):
-            value = current_vals.get(key)
-            try:
-                return int(value)
-            except Exception:
-                pass
-        return None
+        try:
+            scenario = int(current_vals.get("picture_preset_scenario"))
+        except (TypeError, ValueError):
+            scenario = None
+        if scenario not in (None, 0):
+            return scenario
+        try:
+            return int(current_vals.get("picture_mode"))
+        except (TypeError, ValueError):
+            return scenario
 
     def _is_game_mode_active(self):
         current_vals = getattr(self, "current_vals", {})
@@ -1730,12 +1733,16 @@ class DisplayFeaturesMixin:
         group_name = self._picture_mode_group_name(mode_int)
         if group_name:
             label.setText(f"当前场景：{group_name}（{mode_int}）")
-            label.setStyleSheet("font-size: 12px;")
+            FluentStyleSheet.LABEL.apply(label)
             return
 
-        scene_name = PICTURE_SCENE_NAMES.get(mode_int, "未知场景")
-        label.setText(f"当前场景：{scene_name}（{mode_int}），不匹配上方模式按钮")
-        label.setStyleSheet("color: #f0b85a; font-size: 12px;")
+        scene_name = PICTURE_SCENE_NAMES.get(mode_int)
+        if scene_name:
+            label.setText(f"当前场景：{scene_name}")
+            FluentStyleSheet.LABEL.apply(label)
+        else:
+            label.setText(f"当前场景：未知场景（{mode_int}），不匹配上方模式按钮")
+            label.setStyleSheet("color: #f0b85a; font-size: 12px;")
 
     def _set_mode(self, val, name):
         if not self.check_connection(): return

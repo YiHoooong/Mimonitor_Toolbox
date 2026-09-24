@@ -1363,10 +1363,8 @@ class DeviceFeaturesMixin:
         if "tv_picture_light_sensor" in vals:
             self._sync_light_sensor_switch(str(vals["tv_picture_light_sensor"]).strip() == "1")
 
-        if "picture_preset_scenario" in vals:
-            self._highlight_mode(vals["picture_preset_scenario"])
-        elif "picture_mode" in vals:
-            self._highlight_mode(vals["picture_mode"])
+        if "picture_preset_scenario" in vals or "picture_mode" in vals:
+            self._highlight_mode(self._active_picture_scene_mode())
 
         if "mitv.tvplayer.hdmi.last.source" in vals:
             sid = vals["mitv.tvplayer.hdmi.last.source"]

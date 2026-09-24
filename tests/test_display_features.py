@@ -13,6 +13,19 @@ class DisplayFeatureTests(unittest.TestCase):
         self.assertEqual(DisplayFeaturesMixin._picture_mode_group_name(host, 25), "游戏")
         self.assertEqual(DisplayFeaturesMixin._picture_mode_group_name(host, 9), "电影")
 
+    def test_zero_scenario_uses_picture_mode_without_overriding_valid_scenarios(self):
+        from mimonitor_toolbox.display_features import DisplayFeaturesMixin
+
+        host = DisplayFeaturesMixin()
+        host.current_vals = {"picture_preset_scenario": 0, "picture_mode": 13}
+        self.assertEqual(host._active_picture_scene_mode(), 13)
+        host.current_vals["picture_mode"] = 14
+        self.assertEqual(host._active_picture_scene_mode(), 14)
+        host.current_vals["picture_preset_scenario"] = 25
+        self.assertEqual(host._active_picture_scene_mode(), 25)
+        host.current_vals = {"picture_preset_scenario": 0, "picture_mode": 0}
+        self.assertEqual(host._active_picture_scene_mode(), 0)
+
 
 class CrosshairModeReconcileTests(unittest.TestCase):
     """准星模式联动：离开游戏模式记住并隐藏，回到游戏模式还原。"""
