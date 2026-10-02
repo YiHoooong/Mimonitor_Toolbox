@@ -14,6 +14,13 @@ public final class PresetEngine {
             throw PresetError("预设已被删除")
         }
         var config = configuration
+        config.menuBarPresetIDs = config.normalizedMenuBarPresetIDs
+        if visible {
+            guard config.canEnableMenuBarPreset(id: id) else {
+                throw PresetError("菜单栏最多添加 4 个预设，请先关闭一个已有预设的菜单栏显示")
+            }
+            if config.menuBarPresetIDs.contains(id) { return }
+        }
         config.menuBarPresetIDs.removeAll { $0 == id }
         if visible { config.menuBarPresetIDs.append(id) }
         try store.save(config)

@@ -13,13 +13,16 @@ struct PresetsView: View {
                 Text("预设模式").font(.title2.bold())
                 Text("从当前显示器设置创建预设。应用后，在画面页、快捷键或菜单栏中的调整会自动保存到当前预设。")
                     .foregroundColor(.secondary)
+                Text("菜单栏已加入 \(state.presetConfiguration.menuBarPresets.count)/4 个预设（含无预设）。")
+                    .font(.callout).foregroundColor(.secondary)
                 if !state.isConnected {
                     Label("未连接显示器，可以管理名称；创建、应用和编辑需要先连接。", systemImage: "wifi.slash")
                         .foregroundColor(.secondary)
                 }
                 PresetCard(title: "无预设", summary: "不使用任何预设，仅修改当前显示器状态",
                            isCurrent: baselineIsCurrent, applicationIncomplete: false,
-                           showInMenuBar: menuBarBinding(PicturePreset.baselineID)) {
+                           showInMenuBar: menuBarBinding(PicturePreset.baselineID),
+                           canEnableMenuBar: state.presetConfiguration.canEnableMenuBarPreset(id: PicturePreset.baselineID)) {
                     Button { state.restoreBaseline(edit: true) } label: {
                         Text("编辑画面").frame(width: 64)
                     }
@@ -34,7 +37,8 @@ struct PresetsView: View {
                     PresetCard(title: preset.name, summary: summary(preset),
                                isCurrent: state.isConnected && state.activePresetID == preset.id && !state.presetConfiguration.applicationIncomplete,
                                applicationIncomplete: state.activePresetID == preset.id && state.presetConfiguration.applicationIncomplete,
-                               showInMenuBar: menuBarBinding(preset.id)) {
+                               showInMenuBar: menuBarBinding(preset.id),
+                               canEnableMenuBar: state.presetConfiguration.canEnableMenuBarPreset(id: preset.id)) {
                         Menu {
                             Button("重命名") { editor = PresetNameRequest(preset: preset) }
                             Button("删除…", role: .destructive) { deleting = preset; showDelete = true }
@@ -90,7 +94,7 @@ struct PresetsView: View {
 
     private func menuBarBinding(_ id: String) -> Binding<Bool> {
         Binding(
-            get: { state.presetConfiguration.menuBarPresetIDs.contains(id) },
+            get: { state.presetConfiguration.normalizedMenuBarPresetIDs.contains(id) },
             set: { state.setPresetMenuBarVisibility(id: id, visible: $0) }
         )
     }
@@ -109,6 +113,7 @@ private struct PresetCard<Actions: View>: View {
     let isCurrent: Bool
     let applicationIncomplete: Bool
     @Binding var showInMenuBar: Bool
+    let canEnableMenuBar: Bool
     @ViewBuilder let actions: Actions
 
     var body: some View {
@@ -129,6 +134,8 @@ private struct PresetCard<Actions: View>: View {
             HStack(spacing: 8) {
                 Toggle("在菜单栏显示", isOn: $showInMenuBar)
                     .toggleStyle(.switch).controlSize(.small).fixedSize()
+                    .disabled(!showInMenuBar && !canEnableMenuBar)
+                    .help(canEnableMenuBar ? "将此预设加入菜单栏" : "菜单栏最多添加 4 个预设，请先关闭一个已有选项")
                 Spacer(minLength: 0)
                 actions
             }

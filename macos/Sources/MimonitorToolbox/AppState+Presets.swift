@@ -72,7 +72,10 @@ extension AppState {
                presetConfiguration.session?.occurrenceStart == PresetSchedule.occurrenceStart(wanted, minute: minute),
                !presetConfiguration.applicationIncomplete { return }
         } else if presetConfiguration.session == nil { return }
-        runPresetOperation("自动任务切换", automatic: true, refresh: true) { engine, device in
+        let targetID = wanted?.presetID ?? presetConfiguration.session?.previousPresetID
+        let targetName = presetConfiguration.presets.first { $0.id == targetID }?.name ?? "无预设"
+        runPresetOperation("自动任务切换", automatic: true, refresh: true,
+                           switchHUDTitle: "预设：\(targetName)") { engine, device in
             // The device queue may have been busy. Do not execute a window that already ended.
             try engine.reconcile(minute: self.currentMinute(), device: device)
         }
@@ -89,7 +92,9 @@ extension AppState {
             requestedPage = .picture
             return
         }
-        runPresetOperation("应用预设", refresh: true, navigateToPicture: edit) { engine, device in
+        let name = presetConfiguration.presets.first { $0.id == id }?.name ?? "预设"
+        runPresetOperation("应用预设", refresh: true, navigateToPicture: edit,
+                           switchHUDTitle: "预设：\(name)") { engine, device in
             guard let device else { throw PresetError("请先连接显示器") }
             try engine.apply(id: id, device: device)
         }
@@ -100,7 +105,8 @@ extension AppState {
             requestedPage = .picture
             return
         }
-        runPresetOperation("应用无预设", refresh: true, navigateToPicture: edit) { engine, device in
+        runPresetOperation("应用无预设", refresh: true, navigateToPicture: edit,
+                           switchHUDTitle: "预设：无预设") { engine, device in
             guard let device else { throw PresetError("请先连接显示器") }
             try engine.restore(device: device)
         }
@@ -114,7 +120,10 @@ extension AppState {
         }
     }
     func deletePreset(id: String) {
-        runPresetOperation("删除预设", refresh: true) { engine, device in try engine.delete(id: id, device: device) }
+        let hudTitle = presetConfiguration.activePresetID == id ? "预设：无预设" : nil
+        runPresetOperation("删除预设", refresh: true, switchHUDTitle: hudTitle) { engine, device in
+            try engine.delete(id: id, device: device)
+        }
     }
     func saveAutomaticTask(_ task: ScheduledPresetTask) {
         runPresetOperation("保存自动任务") { engine, _ in try engine.saveTask(task) }
@@ -176,6 +185,7 @@ extension AppState {
 
     private func runPresetOperation(_ label: String, automatic: Bool = false, refresh: Bool = false,
                                     navigateToPicture: Bool = false, flushAutosave: Bool = true,
+                                    switchHUDTitle: String? = nil,
                                     operation: @escaping (PresetEngine, AdbPresetDevice?) throws -> Void) {
         guard !isPresetOperationInFlight else { return }
         let request = connectionIntent.generation
@@ -189,6 +199,7 @@ extension AppState {
         isPresetBusy = refresh || navigateToPicture
         presetOperationText = label
         if refresh || navigateToPicture { invalidatePictureRefreshesForPreset() }
+        let hudToken = switchHUDTitle.map { HUDWindow.shared.beginOperation(title: $0) }
         updateHdrMemoryStatus()
         updateFreesyncMemoryStatus()
 
@@ -258,6 +269,13 @@ extension AppState {
                 if refresh, self.isConnected, self.connectionIntent.isCurrent(request) {
                     self.forceRefreshPage("picture")
                     self.forceRefreshPage("game")
+                }
+                if let hudToken {
+                    let result = HUDOperationResult.completion(
+                        isCurrentConnection: self.isConnected && self.connectionIntent.isCurrent(request) && self.adb.ip == identity,
+                        hasError: errorText != nil, verifiedApplications: reports.map { $0.ok })
+                    HUDWindow.shared.finishOperation(token: hudToken, result: result,
+                                                    title: result == .success ? "预设：\(self.activePresetName)" : nil)
                 }
                 if !automatic { self.checkAutomaticTasks() }
             }

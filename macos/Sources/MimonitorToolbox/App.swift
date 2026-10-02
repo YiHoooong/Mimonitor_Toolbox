@@ -320,6 +320,7 @@ private struct PresetSegmentedControl: NSViewRepresentable {
         control.segmentCount = presets.count
         for (index, preset) in presets.enumerated() {
             control.setLabel(preset.name, forSegment: index)
+            control.setToolTip(preset.name, forSegment: index)
             control.setWidth(0, forSegment: index)
             control.setEnabled(isEnabled && (preset.id != PicturePreset.baselineID || baselineEnabled), forSegment: index)
         }

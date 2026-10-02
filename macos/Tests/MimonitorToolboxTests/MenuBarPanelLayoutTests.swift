@@ -3,7 +3,7 @@ import XCTest
 
 final class MenuBarPanelLayoutTests: XCTestCase {
     func testShortPresetRowsFillTheAvailableWidthRatherThanTheirIntrinsicWidth() {
-        for count in [1, 2, 3] {
+        for count in [1, 2, 3, 4] {
             XCTAssertEqual(MenuBarPanelLayout.presetWidth(count: count), 292)
         }
         XCTAssertEqual(MenuBarPanelLayout.presetWidth(count: 5), 400)

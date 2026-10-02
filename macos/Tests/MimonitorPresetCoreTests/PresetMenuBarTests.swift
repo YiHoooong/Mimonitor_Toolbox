@@ -3,6 +3,41 @@ import XCTest
 @testable import MimonitorPresetCore
 
 final class PresetMenuBarTests: XCTestCase {
+    func testFourSlotLimitIncludesBaselineAndCanBeFreedByRemovingASelection() throws {
+        let suite = "menu-preset-limit-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = PresetStore(defaults: defaults)
+        var config = PresetConfiguration()
+        config.presets = (1...5).map { PicturePreset(id: "p\($0)", name: "预设\($0)", values: [:]) }
+        try store.save(config)
+        let engine = PresetEngine(store: store)
+        for id in ["__baseline__", "p1", "p2", "p3"] {
+            try engine.setMenuBarVisibility(id: id, visible: true)
+        }
+        XCTAssertFalse(engine.configuration.canEnableMenuBarPreset(id: "p4"))
+        XCTAssertTrue(engine.configuration.canEnableMenuBarPreset(id: "p1"))
+        XCTAssertThrowsError(try engine.setMenuBarVisibility(id: "p4", visible: true))
+        XCTAssertEqual(engine.configuration.menuBarPresets.count, 4)
+        // Re-enabling an existing selection is idempotent, even when all slots are occupied.
+        try engine.setMenuBarVisibility(id: "p1", visible: true)
+        XCTAssertEqual(engine.configuration.menuBarPresets.count, 4)
+        try engine.setMenuBarVisibility(id: "p1", visible: false)
+        XCTAssertTrue(engine.configuration.canEnableMenuBarPreset(id: "p4"))
+        try engine.setMenuBarVisibility(id: "p4", visible: true)
+        XCTAssertEqual(engine.configuration.menuBarPresets.map(\.id), ["__baseline__", "p2", "p3", "p4"])
+    }
+
+    func testOldOverLimitConfigurationKeepsOnlyFirstFourValidUniqueSelections() throws {
+        var config = PresetConfiguration()
+        config.presets = (1...5).map { PicturePreset(id: "p\($0)", name: "预设\($0)", values: [:]) }
+        config.menuBarPresetIDs = ["missing", "__baseline__", "p1", "p1", "p2", "p3", "p4", "p5"]
+        let reloaded = try JSONDecoder().decode(PresetConfiguration.self, from: JSONEncoder().encode(config))
+        XCTAssertEqual(reloaded.menuBarPresetIDs, ["__baseline__", "p1", "p2", "p3"])
+        XCTAssertEqual(reloaded.menuBarPresets.count, 4)
+        XCTAssertEqual(reloaded.presets.count, 5, "Menu limits must never remove saved presets")
+    }
+
     func testVisibilityPersistsAndFiltersByIdentityRatherThanName() throws {
         let suite = "menu-preset-test-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!

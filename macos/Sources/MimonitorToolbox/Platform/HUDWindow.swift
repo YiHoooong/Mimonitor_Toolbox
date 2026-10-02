@@ -6,6 +6,7 @@ import SwiftUI
 final class HUDModel: ObservableObject {
     @Published var title: String = ""
     @Published var value: String = ""
+    @Published var operationPhase: HUDOperationPhase?
     @Published var showsCountdown: Bool = false
     /// 倒计时起点与时长。进度条不存"当前进度"，而是每帧按这两个值现算 ——
     /// 这样由显示链路驱动，跟屏幕刷新率同步，不会有定时器的台阶感。
@@ -24,17 +25,33 @@ private struct HUDView: View {
     private let barWidth: CGFloat = 288
 
     var body: some View {
-        VStack(spacing: 2) {
+        VStack(spacing: model.operationPhase == nil ? 2 : 6) {
             Text(model.title)
                 .font(.subheadline.weight(.medium))
                 .foregroundStyle(.secondary)
+                .lineLimit(1).truncationMode(.middle)
 
-            Text(model.value)
-                .font(.system(.largeTitle, design: .rounded).weight(.semibold))
-                .monospacedDigit()
-                .foregroundStyle(.primary)
-                // 数值位数变化时不要带动画，否则会抽一下
-                .animation(nil, value: model.value)
+            if let phase = model.operationPhase {
+                switch phase {
+                case .running:
+                    ProgressView().progressViewStyle(.circular).controlSize(.large)
+                        .frame(width: 34, height: 34)
+                case .finished(.success):
+                    resultSymbol("checkmark.circle.fill", color: .green, fallback: "完成")
+                case .finished(.failure):
+                    resultSymbol("exclamationmark.circle.fill", color: .red, fallback: "失败")
+                case .finished(.cancelled):
+                    resultSymbol("minus.circle", color: .secondary, fallback: "已取消")
+                }
+                Text(model.value).font(.callout).foregroundStyle(.secondary)
+            } else {
+                Text(model.value)
+                    .font(.system(.largeTitle, design: .rounded).weight(.semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(.primary)
+                    // 数值位数变化时不要带动画，否则会抽一下
+                    .animation(nil, value: model.value)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .overlay(alignment: .bottom) {
@@ -65,6 +82,15 @@ private struct HUDView: View {
         // 阴影交给窗口本身（panel.hasShadow）：边界窗口会按内容 alpha 自动算形状，
         // 比在 SwiftUI 里画更原生，也不会被 360×112 的面板边界裁掉。
     }
+
+    @ViewBuilder
+    private func resultSymbol(_ name: String, color: Color, fallback: String) -> some View {
+        if let symbol = NSImage(systemSymbolName: name, accessibilityDescription: fallback) {
+            Image(nsImage: symbol).renderingMode(.template).resizable().scaledToFit()
+                .frame(width: 34, height: 34).foregroundStyle(color)
+        }
+        // If unavailable, the status text below already says 完成 / 切换失败 / 已取消.
+    }
 }
 
 /// 悬浮窗本体。用 NSPanel 而不是 SwiftUI 的 Window：
@@ -79,6 +105,8 @@ final class HUDWindow {
     private var hideTimer: Timer?
     /// 每次 show/fadeOut 自增，用于判断淡出动画是否已被新的显示取代
     private var generation = 0
+    private var operation = HUDOperationState()
+    private var isFadingOut = false
 
     private let size = NSSize(width: 360, height: 112)
     private let bottomInset: CGFloat = 150
@@ -91,6 +119,9 @@ final class HUDWindow {
 
     /// 显示一条提示（不带倒计时）。
     func show(title: String, value: String) {
+        guard operation.acceptsValueHint else { return }
+        operation.showValueHint()
+        model.operationPhase = nil
         present()
         model.title = title
         model.value = value
@@ -105,6 +136,9 @@ final class HUDWindow {
     ///   - `withAnimation`：在无边框 NSPanel 的 NSHostingView 里根本不驱动，条子纹丝不动
     ///   - 30Hz 定时器逐帧写值：能动，但只有 24 个台阶，肉眼能看出跳跃
     func show(title: String, value: String, countdown seconds: TimeInterval) {
+        guard operation.acceptsValueHint else { return }
+        operation.showValueHint()
+        model.operationPhase = nil
         present()
         model.title = title
         model.value = value
@@ -115,8 +149,32 @@ final class HUDWindow {
 
     /// 倒计时结束（值已下发）：隐藏进度条，并重新计时展示
     func endCountdown() {
+        guard !operation.keepsVisible else { return }
         stopCountdown()
         restartHideTimer()
+    }
+
+    /// Progress uses the same non-activating panel, and has no auto-hide timer while running.
+    func beginOperation(title: String) -> UUID {
+        let token = operation.begin()
+        model.title = title
+        model.value = "切换中…"
+        model.operationPhase = operation.phase
+        stopCountdown()
+        present(autoHide: false)
+        return token
+    }
+
+    func finishOperation(token: UUID, result: HUDOperationResult, title: String? = nil) {
+        guard operation.finish(token: token, result: result) else { return }
+        if let title { model.title = title }
+        model.operationPhase = operation.phase
+        switch result {
+        case .success: model.value = "完成"
+        case .failure: model.value = "切换失败"
+        case .cancelled: model.value = "已取消"
+        }
+        present()
     }
 
     // MARK: - 内部
@@ -125,20 +183,23 @@ final class HUDWindow {
         model.showsCountdown = false
     }
 
-    private func present() {
+    private func present(autoHide: Bool = true) {
         let panel = ensurePanel()
         hideTimer?.invalidate()
-        restartHideTimer()
+        if autoHide { restartHideTimer() }
         generation &+= 1
 
         // 已经在显示中就完全不碰窗口层级：连按时每 80ms 做一次 orderFront
         //（窗口服务器往返）是明显的开销。
-        if !panel.isVisible {
-            position(panel)
+        if isFadingOut || !panel.isVisible {
+            isFadingOut = false
             NSAnimationContext.beginGrouping()
             NSAnimationContext.current.duration = 0   // 打断可能正在进行的淡出
             panel.animator().alphaValue = 1
             NSAnimationContext.endGrouping()
+        }
+        if !panel.isVisible {
+            position(panel)
             panel.orderFrontRegardless()
         }
     }
@@ -184,7 +245,9 @@ final class HUDWindow {
     }
 
     private func fadeOut() {
+        guard !operation.keepsVisible else { return }
         guard let panel else { return }
+        isFadingOut = true
         generation &+= 1
         stopCountdown()
         let thisGeneration = generation
@@ -195,6 +258,7 @@ final class HUDWindow {
         } completionHandler: { [weak self] in
             // 淡出期间又显示过就不要再隐藏
             guard let self, self.generation == thisGeneration else { return }
+            self.isFadingOut = false
             panel.orderOut(nil)
         }
     }

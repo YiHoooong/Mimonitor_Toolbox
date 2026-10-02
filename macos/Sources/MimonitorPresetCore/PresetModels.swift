@@ -83,9 +83,21 @@ public struct PresetTaskSession: Codable, Equatable {
 }
 
 public struct PresetConfiguration: Codable, Equatable {
+    public static let menuBarPresetLimit = 4
+    public var normalizedMenuBarPresetIDs: [String] {
+        let valid = Set(presets.map(\.id)).union([PicturePreset.baselineID])
+        var seen = Set<String>()
+        return Array(menuBarPresetIDs.filter { valid.contains($0) && seen.insert($0).inserted }
+            .prefix(Self.menuBarPresetLimit))
+    }
+    public func canEnableMenuBarPreset(id: String) -> Bool {
+        guard id == PicturePreset.baselineID || presets.contains(where: { $0.id == id }) else { return false }
+        let enabled = normalizedMenuBarPresetIDs
+        return enabled.contains(id) || enabled.count < Self.menuBarPresetLimit
+    }
     public var menuBarPresetIDs: [String] = []
     public var menuBarPresets: [PicturePreset] {
-        let enabled = Set(menuBarPresetIDs)
+        let enabled = Set(normalizedMenuBarPresetIDs)
         var result: [PicturePreset] = []
         if enabled.contains(PicturePreset.baselineID) {
             result.append(PicturePreset(id: PicturePreset.baselineID, name: "无预设", values: [:]))
@@ -114,6 +126,7 @@ public struct PresetConfiguration: Codable, Equatable {
         session = try container.decodeIfPresent(PresetTaskSession.self, forKey: .session)
         applicationIncomplete = try container.decodeIfPresent(Bool.self, forKey: .applicationIncomplete) ?? false
         menuBarPresetIDs = try container.decodeIfPresent([String].self, forKey: .menuBarPresetIDs) ?? []
+        menuBarPresetIDs = normalizedMenuBarPresetIDs
     }
 }
 
