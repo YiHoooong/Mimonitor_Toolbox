@@ -9,7 +9,16 @@ extension AppState {
     var activePresetName: String {
         presetConfiguration.presets.first { $0.id == activePresetID }?.name ?? "无预设"
     }
-    var memoriesSuspendedByPreset: Bool { activePresetID != nil || isPresetBusy || presetConfiguration.applicationIncomplete }
+    var presetControlPolicy: PresetControlPolicy {
+        PresetControlPolicy(configuration: presetConfiguration, deviceIdentity: adb.ip, isSwitching: isPresetBusy)
+    }
+    var memoriesSuspendedByPreset: Bool { presetControlPolicy.memoriesLocked }
+    var effectiveHdrMemoryEnabled: Bool {
+        presetControlPolicy.effectiveMemoryEnabled(savedPreference: hdrMemoryEnabled)
+    }
+    var effectiveFreesyncMemoryEnabled: Bool {
+        presetControlPolicy.effectiveMemoryEnabled(savedPreference: freesyncMemoryEnabled)
+    }
     var canRestoreBaseline: Bool {
         isConnected && presetConfiguration.baseline?.deviceIdentity == adb.ip
             && !(presetConfiguration.baseline?.values.isEmpty ?? true)
@@ -85,8 +94,13 @@ extension AppState {
             try engine.apply(id: id, device: device)
         }
     }
-    func restoreBaseline() {
-        runPresetOperation("返回无预设", refresh: true) { engine, device in
+    func restoreBaseline(edit: Bool = false) {
+        if edit && isConnected && activePresetID == nil && !isPresetOperationInFlight
+            && !presetConfiguration.applicationIncomplete {
+            requestedPage = .picture
+            return
+        }
+        runPresetOperation("应用无预设", refresh: true, navigateToPicture: edit) { engine, device in
             guard let device else { throw PresetError("请先连接显示器") }
             try engine.restore(device: device)
         }

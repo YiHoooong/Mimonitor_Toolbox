@@ -10,7 +10,7 @@ struct AutomaticTasksView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                Text("自动任务").font(.largeTitle).fontWeight(.semibold)
+                Text("自动任务").font(.title2.bold())
                 Text("每天按本地时间切换预设，时段结束返回任务开始前的预设（使用其最新值）。支持跨午夜；时段重叠时靠下的任务优先。")
                     .foregroundColor(.secondary)
                 Label("应用需保持运行，关闭窗口驻留菜单栏也可执行；睡眠期间不执行，唤醒或重连后重新判断。", systemImage: "info.circle")
@@ -56,7 +56,7 @@ struct AutomaticTasksView: View {
                     Label("新增自动任务", systemImage: "plus").frame(maxWidth: .infinity).padding(14)
                 }
             }
-            .padding(30)
+            .padding(24)
             .disabled(state.isPresetOperationInFlight)
         }
         .onAppear { state.checkAutomaticTasks() }

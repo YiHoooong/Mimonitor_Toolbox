@@ -10,46 +10,51 @@ struct PresetsView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                Text("预设模式").font(.largeTitle).fontWeight(.semibold)
+                Text("预设模式").font(.title2.bold())
                 Text("从当前显示器设置创建预设。应用后，在画面页、快捷键或菜单栏中的调整会自动保存到当前预设。")
                     .foregroundColor(.secondary)
                 if !state.isConnected {
                     Label("未连接显示器，可以管理名称；创建、应用和编辑需要先连接。", systemImage: "wifi.slash")
                         .foregroundColor(.secondary)
                 }
-                SectionCard(title: "无预设") {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text(state.isConnected && state.activePresetID == nil && !state.presetConfiguration.applicationIncomplete ? "当前使用" : "普通画面设置")
-                                .font(.headline)
-                            Text("返回第一次进入预设前的设置；预设之间切换不会覆盖它。")
-                                .font(.callout).foregroundColor(.secondary)
-                        }
-                        Spacer()
-                        Button("切回无预设") { state.restoreBaseline() }
-                            .disabled(!state.canRestoreBaseline || (state.activePresetID == nil && !state.presetConfiguration.applicationIncomplete))
+                PresetCard(title: "无预设", summary: "不使用任何预设，仅修改当前显示器状态",
+                           isCurrent: baselineIsCurrent, applicationIncomplete: false) {
+                    Button { state.restoreBaseline(edit: true) } label: {
+                        Text("编辑画面").frame(width: 64)
                     }
+                    .disabled(!state.isConnected || (!baselineIsCurrent && !state.canRestoreBaseline))
+                    Button { state.restoreBaseline() } label: {
+                        Text("应用").frame(width: 48)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!state.canRestoreBaseline || baselineIsCurrent)
                 }
                 ForEach(state.presetConfiguration.presets) { preset in
-                    SectionCard(title: preset.name) {
-                        HStack {
-                            VStack(alignment: .leading, spacing: 6) {
-                                if state.activePresetID == preset.id {
-                                    Label(state.presetConfiguration.applicationIncomplete ? "上次应用未完成，请重新应用" : "当前使用 · 调整会自动保存", systemImage: "checkmark.circle.fill")
-                                        .foregroundColor(.accentColor)
-                                }
-                                Text(summary(preset)).font(.callout).foregroundColor(.secondary)
-                            }
-                            Spacer()
-                            Button("应用") { state.applyPreset(id: preset.id) }
-                                .disabled(!state.isConnected || (state.activePresetID == preset.id && !state.presetConfiguration.applicationIncomplete))
-                            Button("编辑画面") { state.applyPreset(id: preset.id, edit: true) }
-                                .disabled(!state.isConnected)
-                            Menu {
-                                Button("重命名") { editor = PresetNameRequest(preset: preset) }
-                                Button("删除…", role: .destructive) { deleting = preset; showDelete = true }
-                            } label: { Image(systemName: "ellipsis") }
+                    PresetCard(title: preset.name, summary: summary(preset),
+                               isCurrent: state.isConnected && state.activePresetID == preset.id && !state.presetConfiguration.applicationIncomplete,
+                               applicationIncomplete: state.activePresetID == preset.id && state.presetConfiguration.applicationIncomplete) {
+                        Menu {
+                            Button("重命名") { editor = PresetNameRequest(preset: preset) }
+                            Button("删除…", role: .destructive) { deleting = preset; showDelete = true }
+                        } label: {
+                            Image(systemName: "ellipsis").frame(width: 24, height: 24)
                         }
+                        .menuStyle(.borderlessButton)
+                        .menuIndicator(.hidden)
+                        .fixedSize()
+                        .frame(width: 28, height: 28)
+                        .background(Theme.control, in: RoundedRectangle(cornerRadius: 6))
+                        .help("管理预设")
+                        .accessibilityLabel("管理预设 \(preset.name)")
+                        Button { state.applyPreset(id: preset.id, edit: true) } label: {
+                            Text("编辑画面").frame(width: 64)
+                        }
+                        .disabled(!state.isConnected)
+                        Button { state.applyPreset(id: preset.id) } label: {
+                            Text("应用").frame(width: 48)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!state.isConnected || (state.activePresetID == preset.id && !state.presetConfiguration.applicationIncomplete))
                     }
                 }
                 Button {
@@ -60,7 +65,7 @@ struct PresetsView: View {
                 }
                 .disabled(!state.isConnected || state.presetConfiguration.applicationIncomplete)
             }
-            .padding(30)
+            .padding(24)
             .disabled(state.isPresetOperationInFlight)
         }
         .sheet(item: $editor) { request in
@@ -77,10 +82,52 @@ struct PresetsView: View {
         }
     }
 
+    private var baselineIsCurrent: Bool {
+        state.isConnected && state.activePresetID == nil && !state.presetConfiguration.applicationIncomplete
+    }
+
     private func summary(_ preset: PicturePreset) -> String {
         let mode = Int(preset.values["picture_mode"] ?? "") ?? -1
         let modeName = RegisterMap.sceneNames[mode] ?? "模式 \(mode)"
         return "\(modeName) · 背光 \(preset.values["picture_backlight"] ?? "—") · 对比度 \(preset.values["picture_contrast"] ?? "—") · FreeSync \(preset.values["freesync"] == "1" ? "开" : "关")"
+    }
+}
+
+/// One layout for the ordinary state and saved presets. The primary action is always last.
+private struct PresetCard<Actions: View>: View {
+    let title: String
+    let summary: String
+    let isCurrent: Bool
+    let applicationIncomplete: Bool
+    @ViewBuilder let actions: Actions
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                Text(title).font(.headline).lineLimit(1)
+                if isCurrent {
+                    Label("当前使用", systemImage: "checkmark.circle.fill")
+                        .font(.callout).foregroundColor(.blue).fixedSize()
+                } else if applicationIncomplete {
+                    Label("应用未完成", systemImage: "exclamationmark.circle.fill")
+                        .font(.callout).foregroundColor(.orange).fixedSize()
+                }
+                Spacer(minLength: 0)
+            }
+            Text(summary).font(.callout).foregroundColor(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            HStack(spacing: 8) {
+                Spacer(minLength: 0)
+                actions
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.regular)
+            .frame(minHeight: 28)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.stroke))
     }
 }
 

@@ -201,7 +201,7 @@ enum OptionLists {
 // MARK: - 侧边栏页面
 
 enum Page: String, CaseIterable, Identifiable, Hashable {
-    case home, picture, presets, autoTasks, game, source, light, menuBar, tools, remote
+    case home, picture, game, source, light, menuBar, presets, autoTasks, tools, remote
 
     var id: String { rawValue }
 

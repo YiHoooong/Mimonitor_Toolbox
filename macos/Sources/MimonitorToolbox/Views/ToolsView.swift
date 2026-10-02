@@ -122,19 +122,29 @@ struct ToolsView: View {
                 // HDR / SDR 分区控光记忆
                 SectionCard(title: "HDR/SDR 分区控光记忆") {
                     Toggle("按信号分别记忆精密控光（基于 macOS EDR 判断 HDR）", isOn: Binding(
-                        get: { state.hdrMemoryEnabled },
+                        get: { state.effectiveHdrMemoryEnabled },
                         set: { state.toggleHdrMemory($0) }
                     ))
+                    .disabled(state.memoriesSuspendedByPreset)
                     Text(state.hdrMemoryStatusText).font(.callout).foregroundColor(.secondary)
+                    if state.memoriesSuspendedByPreset {
+                        Label("使用预设期间已锁定，返回无预设后恢复原设置。", systemImage: "lock.fill")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
                 }
 
                 // FreeSync Pro 模式记忆
                 SectionCard(title: "FreeSync Pro 模式记忆") {
                     Toggle("开启 FreeSync 时记住画面模式，关闭后自动恢复", isOn: Binding(
-                        get: { state.freesyncMemoryEnabled },
+                        get: { state.effectiveFreesyncMemoryEnabled },
                         set: { state.toggleFreesyncMemory($0) }
                     ))
+                    .disabled(state.memoriesSuspendedByPreset)
                     Text(state.freesyncMemoryStatusText).font(.callout).foregroundColor(.secondary)
+                    if state.memoriesSuspendedByPreset {
+                        Label("使用预设期间已锁定，返回无预设后恢复原设置。", systemImage: "lock.fill")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
                 }
 
                 // 准星模式联动

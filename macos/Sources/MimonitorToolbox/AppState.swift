@@ -1490,6 +1490,7 @@ final class AppState: ObservableObject {
     // MARK: - HDR / SDR 分区控光记忆
 
     func toggleHdrMemory(_ enabled: Bool) {
+        guard let enabled = presetControlPolicy.memoryPreferenceChange(requested: enabled) else { return }
         hdrMemoryEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: "hdr_sdr_local_dimming_enabled")
         hdrLastState = nil
@@ -1575,8 +1576,8 @@ final class AppState: ObservableObject {
         let sdrText = m["sdr"].map { ["关", "低", "中", "高"][$0] } ?? "--"
         let hdrText = m["hdr"].map { ["关", "低", "中", "高"][$0] } ?? "--"
         let sourceText = hdrStateSource.isEmpty ? "" : "（\(hdrStateSource)）"
-        let pause = memoriesSuspendedByPreset ? "（预设生效或切换中，已暂停）" : ""
-        let text = "分区控光记忆：\(hdrMemoryEnabled ? "已开启" : "已关闭")\(pause)，当前信号：\(stateText)\(sourceText)，记忆模式：SDR=\(sdrText) / HDR=\(hdrText)"
+        let status = memoriesSuspendedByPreset ? "已锁定（预设生效或切换中）" : (hdrMemoryEnabled ? "已开启" : "已关闭")
+        let text = "分区控光记忆：\(status)，当前信号：\(stateText)\(sourceText)，记忆模式：SDR=\(sdrText) / HDR=\(hdrText)"
         // 只在内容真的变了才赋值：@Published 每次赋值都会让整个界面重绘，
         // 而 HDR 状态是 3 秒轮询一次，无脑赋值等于每 3 秒全量重绘一次。
         if hdrMemoryStatusText != text { hdrMemoryStatusText = text }
@@ -1585,6 +1586,7 @@ final class AppState: ObservableObject {
     // MARK: - FreeSync Pro 模式记忆
 
     func toggleFreesyncMemory(_ enabled: Bool) {
+        guard let enabled = presetControlPolicy.memoryPreferenceChange(requested: enabled) else { return }
         freesyncMemoryEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: "freesync_mode_memory_enabled")
         log("FreeSync Pro 模式记忆: \(enabled ? "开启" : "关闭")")
@@ -1594,8 +1596,8 @@ final class AppState: ObservableObject {
     func updateFreesyncMemoryStatus() {
         let saved = UserDefaults.standard.integer(forKey: "freesync_previous_mode")
         let savedText = saved == 0 ? "--" : (RegisterMap.sceneNames[saved] ?? "\(saved)")
-        let pause = memoriesSuspendedByPreset ? "（预设生效或切换中，已暂停）" : ""
-        let text = "模式记忆：\(freesyncMemoryEnabled ? "已开启" : "已关闭")\(pause)，记录模式：\(savedText)"
+        let status = memoriesSuspendedByPreset ? "已锁定（预设生效或切换中）" : (freesyncMemoryEnabled ? "已开启" : "已关闭")
+        let text = "模式记忆：\(status)，记录模式：\(savedText)"
         if freesyncMemoryStatusText != text { freesyncMemoryStatusText = text }
     }
 
