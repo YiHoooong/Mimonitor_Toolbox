@@ -111,6 +111,26 @@ final class AdbClient {
 
     // MARK: - 基础命令
 
+    /// Temporary, target-pinned validation. Never changes the active display or restarts its server.
+    func probeScannedDevice(ip targetIP: String) -> ScannedDevice? {
+        guard !targetIP.isEmpty else { return nil }
+        return transaction {
+            let target = "\(targetIP):5555"
+            defer { _ = run(["disconnect", target], timeout: 3) }
+            _ = run(["connect", target], timeout: 5)
+            let deadline = Date().addingTimeInterval(6)
+            while true {
+                let result = run(["-s", target, "get-state"], timeout: 2)
+                let state = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+                if result.exitCode == 0 && state == "device" { break }
+                if state.contains("unauthorized") || Date() >= deadline { return nil }
+                Thread.sleep(forTimeInterval: 0.25)
+            }
+            guard let model = try? checkedShell("getprop ro.product.model", target: target), !model.isEmpty else { return nil }
+            return ScannedDevice(ip: targetIP, model: model)
+        }
+    }
+
     @discardableResult
     func shell(_ command: String) -> String {
         run(["-s", serial, "shell", command], timeout: 25)

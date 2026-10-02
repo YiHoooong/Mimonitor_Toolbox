@@ -95,11 +95,11 @@ private struct AutomaticTaskSheet: View {
                     Text("无预设").tag(PicturePreset.baselineID)
                     ForEach(presets) { preset in Text(preset.name).tag(preset.id) }
                 }
-                TextField("开始时间", text: $task.start).textFieldStyle(.roundedBorder)
-                TextField("结束时间", text: $task.end).textFieldStyle(.roundedBorder)
+                DatePicker("开始时间", selection: timeBinding(start: true), displayedComponents: .hourAndMinute)
+                DatePicker("结束时间", selection: timeBinding(start: false), displayedComponents: .hourAndMinute)
                 Toggle("启用任务", isOn: $task.enabled)
             }
-            Text("使用 24 小时制 HH:mm，例如 23:00–02:00。开始时间包含在时段内，结束时间不包含；两者不能相同。")
+            Text("每天按所选时间执行，支持跨午夜，例如 23:00–02:00。开始时间包含在时段内，结束时间不包含；两者不能相同。")
                 .font(.callout).foregroundColor(.secondary)
             if !task.isValid { Text("请填写有效且不同的开始、结束时间。") .font(.callout).foregroundColor(.orange) }
             HStack {
@@ -110,5 +110,15 @@ private struct AutomaticTaskSheet: View {
             }
         }
         .padding(24).frame(width: 440)
+    }
+
+    private func timeBinding(start: Bool) -> Binding<Date> {
+        Binding(
+            get: { PresetSchedule.timeDate(start ? task.start : task.end) ?? Date() },
+            set: { date in
+                let text = PresetSchedule.timeText(date)
+                if start { task.start = text } else { task.end = text }
+            }
+        )
     }
 }

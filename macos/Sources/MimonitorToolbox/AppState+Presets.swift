@@ -108,6 +108,11 @@ extension AppState {
     func renamePreset(id: String, name: String) {
         runPresetOperation("重命名预设") { engine, _ in try engine.rename(id: id, name: name) }
     }
+    func setPresetMenuBarVisibility(id: String, visible: Bool) {
+        runPresetOperation("更新预设菜单栏显示") { engine, _ in
+            try engine.setMenuBarVisibility(id: id, visible: visible)
+        }
+    }
     func deletePreset(id: String) {
         runPresetOperation("删除预设", refresh: true) { engine, device in try engine.delete(id: id, device: device) }
     }

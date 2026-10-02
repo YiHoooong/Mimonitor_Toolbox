@@ -36,6 +36,16 @@ public struct ScheduledPresetTask: Codable, Equatable, Identifiable {
 }
 
 public enum PresetSchedule {
+    public static func timeDate(_ text: String, calendar: Calendar = .current) -> Date? {
+        guard let minute = Self.minute(text) else { return nil }
+        // A stable reference day avoids normalizing 02:30 away on today's DST boundary.
+        return calendar.date(from: DateComponents(year: 2001, month: 1, day: 15,
+                                                   hour: minute / 60, minute: minute % 60, second: 0))
+    }
+    public static func timeText(_ date: Date, calendar: Calendar = .current) -> String {
+        let parts = calendar.dateComponents([.hour, .minute], from: date)
+        return String(format: "%02d:%02d", parts.hour ?? 0, parts.minute ?? 0)
+    }
     public static func minute(_ text: String) -> Int? {
         let chars = Array(text.utf8)
         guard chars.count == 5, chars[2] == 58,
@@ -73,6 +83,16 @@ public struct PresetTaskSession: Codable, Equatable {
 }
 
 public struct PresetConfiguration: Codable, Equatable {
+    public var menuBarPresetIDs: [String] = []
+    public var menuBarPresets: [PicturePreset] {
+        let enabled = Set(menuBarPresetIDs)
+        var result: [PicturePreset] = []
+        if enabled.contains(PicturePreset.baselineID) {
+            result.append(PicturePreset(id: PicturePreset.baselineID, name: "无预设", values: [:]))
+        }
+        result.append(contentsOf: presets.filter { enabled.contains($0.id) })
+        return result
+    }
     public var presets: [PicturePreset] = []
     public var tasks: [ScheduledPresetTask] = []
     public var baseline: PresetBaseline?
@@ -82,7 +102,7 @@ public struct PresetConfiguration: Codable, Equatable {
     public var applicationIncomplete = false
     public init() {}
     private enum CodingKeys: String, CodingKey {
-        case presets, tasks, baseline, activePresetID, activeDeviceIdentity, session, applicationIncomplete
+        case presets, tasks, baseline, activePresetID, activeDeviceIdentity, session, applicationIncomplete, menuBarPresetIDs
     }
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -93,6 +113,7 @@ public struct PresetConfiguration: Codable, Equatable {
         activeDeviceIdentity = try container.decodeIfPresent(String.self, forKey: .activeDeviceIdentity)
         session = try container.decodeIfPresent(PresetTaskSession.self, forKey: .session)
         applicationIncomplete = try container.decodeIfPresent(Bool.self, forKey: .applicationIncomplete) ?? false
+        menuBarPresetIDs = try container.decodeIfPresent([String].self, forKey: .menuBarPresetIDs) ?? []
     }
 }
 

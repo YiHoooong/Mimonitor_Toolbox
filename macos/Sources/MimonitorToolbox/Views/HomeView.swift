@@ -28,16 +28,16 @@ struct HomeView: View {
                     }
                     HStack(spacing: 10) {
                         Text("已扫描设备:")
-                        Picker("", selection: $state.selectedDevice) {
+                        Picker("", selection: Binding(
+                            get: { state.selectedDevice },
+                            set: { state.selectScannedDevice($0) }
+                        )) {
                             Text("请选择扫描到的显示器...").tag("")
                             ForEach(state.scannedDevices, id: \.self) { d in
-                                Text(d).tag(d)
+                                Text(state.scannedDeviceModels[d].map { "\($0) (\(d))" } ?? d).tag(d)
                             }
                         }
                         .frame(width: 220)
-                        .onChange(of: state.selectedDevice) { d in
-                            if !d.isEmpty { state.ipInput = d }
-                        }
                         Text("连接状态:")
                         Text(state.statusText).fontWeight(.bold).foregroundColor(state.statusColor)
                         Spacer()

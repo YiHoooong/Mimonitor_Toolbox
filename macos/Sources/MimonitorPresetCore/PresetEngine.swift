@@ -8,6 +8,17 @@ public final class PresetEngine {
     public var onReport: ((PresetApplyReport) -> Void)?
     public init(store: PresetStore) { self.store = store }
 
+    public func setMenuBarVisibility(id: String, visible: Bool) throws {
+        try checkStorage()
+        guard id == PicturePreset.baselineID || configuration.presets.contains(where: { $0.id == id }) else {
+            throw PresetError("预设已被删除")
+        }
+        var config = configuration
+        config.menuBarPresetIDs.removeAll { $0 == id }
+        if visible { config.menuBarPresetIDs.append(id) }
+        try store.save(config)
+    }
+
     private func checkStorage() throws {
         if let loadError { throw PresetError(loadError) }
     }
@@ -61,6 +72,7 @@ public final class PresetEngine {
         }
         var config = configuration
         config.presets.removeAll { $0.id == id }
+        config.menuBarPresetIDs.removeAll { $0 == id }
         config.tasks.removeAll { $0.presetID == id }
         // Keep session identity until reconciliation restores the previous preset/baseline.
         try store.save(config)

@@ -87,6 +87,7 @@ final class AppState: ObservableObject {
     /// 于是滚动就再也不触发了。
     @Published var logSeq: Int = 0
     @Published var scannedDevices: [String] = []
+    @Published var scannedDeviceModels: [String: String] = [:]
     @Published var selectedDevice: String = ""
     @Published var activeSource: String = "未知"
     @Published var loadedPages: Set<String> = []
@@ -408,6 +409,7 @@ final class AppState: ObservableObject {
                     // 虽然自动连上了保存的 IP，下拉框却还显示占位符。
                     // 这里把当前 IP 补进列表，保证下拉框显示的就是实际连的设备。
                     if !ip.isEmpty {
+                        if !model.isEmpty { self.scannedDeviceModels[ip] = model }
                         if let idx = self.scannedDevices.firstIndex(of: ip) {
                             self.scannedDevices.remove(at: idx)
                         }
@@ -489,24 +491,56 @@ final class AppState: ObservableObject {
         }
         let request = connectionIntent.beginScan()
         connectionStatus = .scanning
+        scannedDevices = []
+        scannedDeviceModels = [:]
+        selectedDevice = ""
         log("开始扫描内网...")
-        runBackground {
+        runConnectionTask {
+            guard DispatchQueue.main.sync(execute: { self.connectionIntent.isCurrent(request) }) else { return }
             let subnets = NetworkScan.localIPv4Subnets()
             DispatchQueue.main.async {
                 self.log("本机网段: \(subnets.isEmpty ? "未识别" : subnets.joined(separator: ", "))")
             }
-            let found = NetworkScan.scan()
+            let candidates = NetworkScan.scan()
+            var found: [ScannedDevice] = []
+            for ip in candidates {
+                guard DispatchQueue.main.sync(execute: { self.connectionIntent.isCurrent(request) }) else { return }
+                self.log("[扫描] \(ip):5555 开放，正在验证设备型号...")
+                if let device = self.adb.probeScannedDevice(ip: ip) {
+                    found.append(device)
+                    self.log("[扫描] 已识别 \(device.label)")
+                } else { self.log("[扫描] \(ip) 未通过 ADB 验证，已跳过") }
+            }
             DispatchQueue.main.async {
                 guard self.connectionIntent.isCurrent(request) else { return }
-                self.scannedDevices = found
+                self.scannedDevices = found.map(\.ip)
+                self.scannedDeviceModels = Dictionary(uniqueKeysWithValues: found.map { ($0.ip, $0.model) })
                 self.connectionStatus = .disconnected
-                self.log("扫描完成，发现 \(found.count) 台设备")
-                if let first = found.first {
-                    self.selectedDevice = first
-                    self.ipInput = first
+                let monitors = found.filter(\.isMonitor)
+                self.log("扫描完成，发现 \(found.count) 台 ADB 设备，其中 \(monitors.count) 台 MiTV 显示器")
+                if let target = self.connectionIntent.scanConnectionTarget(request: request, devices: found) {
+                    self.selectedDevice = target.ip
+                    self.ipInput = target.ip
+                    self.log("扫描识别到唯一显示器，自动连接 \(target.label)")
+                    self.connect()
+                } else if monitors.count > 1 {
+                    self.selectedDevice = ""
+                    self.ipInput = ""
+                    self.log("扫描发现多台显示器，请在下拉列表中选择，选择后自动连接")
+                } else {
+                    self.log("未找到可自动连接的 MiTV 显示器，可手动选择或输入 IP 连接")
                 }
             }
         }
+    }
+
+    func selectScannedDevice(_ ip: String) {
+        guard !ip.isEmpty else { selectedDevice = ""; return }
+        if case .connecting = connectionStatus { log("正在连接显示器，请等待连接完成"); return }
+        selectedDevice = ip
+        ipInput = ip
+        guard !isConnected || adb.ip != ip else { return }
+        connect()
     }
 
     // MARK: - 改动后的合并刷新

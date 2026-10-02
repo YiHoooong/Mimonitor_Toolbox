@@ -18,7 +18,8 @@ struct PresetsView: View {
                         .foregroundColor(.secondary)
                 }
                 PresetCard(title: "无预设", summary: "不使用任何预设，仅修改当前显示器状态",
-                           isCurrent: baselineIsCurrent, applicationIncomplete: false) {
+                           isCurrent: baselineIsCurrent, applicationIncomplete: false,
+                           showInMenuBar: menuBarBinding(PicturePreset.baselineID)) {
                     Button { state.restoreBaseline(edit: true) } label: {
                         Text("编辑画面").frame(width: 64)
                     }
@@ -32,7 +33,8 @@ struct PresetsView: View {
                 ForEach(state.presetConfiguration.presets) { preset in
                     PresetCard(title: preset.name, summary: summary(preset),
                                isCurrent: state.isConnected && state.activePresetID == preset.id && !state.presetConfiguration.applicationIncomplete,
-                               applicationIncomplete: state.activePresetID == preset.id && state.presetConfiguration.applicationIncomplete) {
+                               applicationIncomplete: state.activePresetID == preset.id && state.presetConfiguration.applicationIncomplete,
+                               showInMenuBar: menuBarBinding(preset.id)) {
                         Menu {
                             Button("重命名") { editor = PresetNameRequest(preset: preset) }
                             Button("删除…", role: .destructive) { deleting = preset; showDelete = true }
@@ -86,6 +88,13 @@ struct PresetsView: View {
         state.isConnected && state.activePresetID == nil && !state.presetConfiguration.applicationIncomplete
     }
 
+    private func menuBarBinding(_ id: String) -> Binding<Bool> {
+        Binding(
+            get: { state.presetConfiguration.menuBarPresetIDs.contains(id) },
+            set: { state.setPresetMenuBarVisibility(id: id, visible: $0) }
+        )
+    }
+
     private func summary(_ preset: PicturePreset) -> String {
         let mode = Int(preset.values["picture_mode"] ?? "") ?? -1
         let modeName = RegisterMap.sceneNames[mode] ?? "模式 \(mode)"
@@ -99,6 +108,7 @@ private struct PresetCard<Actions: View>: View {
     let summary: String
     let isCurrent: Bool
     let applicationIncomplete: Bool
+    @Binding var showInMenuBar: Bool
     @ViewBuilder let actions: Actions
 
     var body: some View {
@@ -117,6 +127,8 @@ private struct PresetCard<Actions: View>: View {
             Text(summary).font(.callout).foregroundColor(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
             HStack(spacing: 8) {
+                Toggle("在菜单栏显示", isOn: $showInMenuBar)
+                    .toggleStyle(.switch).controlSize(.small).fixedSize()
                 Spacer(minLength: 0)
                 actions
             }

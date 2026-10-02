@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import MimonitorPresetCore
 
 /// 应用主题（对应工具页的「应用主题」选项）。
 ///
@@ -186,8 +187,8 @@ private struct MenuBarPanel: View {
 
             Divider()
 
-            if state.menuBarItems.isEmpty {
-                Text("还没有添加快捷项。\n去「菜单栏」页挑几个。")
+            if state.menuBarItems.isEmpty && state.presetConfiguration.menuBarPresets.isEmpty {
+                Text("还没有添加快捷项。\n去「菜单栏」或「预设模式」页添加。")
                     .font(.callout)
                     .foregroundColor(.secondary)
                     .multilineTextAlignment(.center)
@@ -196,6 +197,9 @@ private struct MenuBarPanel: View {
             } else {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 14) {
+                        if !state.presetConfiguration.menuBarPresets.isEmpty {
+                            MenuBarPresetPicker()
+                        }
                         ForEach(state.menuBarItems, id: \.self) { id in
                             if let entry = MenuBarCatalog.entry(id) {
                                 MenuBarPanelRow(entry: entry)
@@ -232,6 +236,86 @@ private struct MenuBarPanel: View {
             .padding(.vertical, 10)
         }
         .frame(width: 320)
+    }
+}
+
+/// Native segmented selection, matching the close-behavior control in ToolsView.
+private struct MenuBarPresetPicker: View {
+    @EnvironmentObject var state: AppState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("预设模式").font(.callout).foregroundColor(.secondary)
+                Spacer()
+                Text(state.presetConfiguration.applicationIncomplete ? "应用未完成" : state.activePresetName)
+                    .font(.caption).foregroundColor(.secondary).lineLimit(1)
+            }
+            ScrollView(.horizontal, showsIndicators: true) {
+                PresetSegmentedControl(
+                    presets: state.presetConfiguration.menuBarPresets,
+                    selectedID: state.isConnected && !state.presetConfiguration.applicationIncomplete
+                        ? (state.activePresetID ?? PicturePreset.baselineID) : nil,
+                    isEnabled: state.isConnected && !state.isPresetOperationInFlight,
+                    baselineEnabled: state.activePresetID == nil || state.canRestoreBaseline,
+                    onSelect: { id in
+                        guard id != (state.activePresetID ?? PicturePreset.baselineID)
+                            || state.presetConfiguration.applicationIncomplete else { return }
+                        if id == PicturePreset.baselineID { state.restoreBaseline() }
+                        else { state.applyPreset(id: id) }
+                    }
+                )
+                .accessibilityLabel("预设模式")
+                .fixedSize(horizontal: true, vertical: false)
+                .frame(minWidth: 292)
+            }
+            .frame(height: 32)
+            .disabled(!state.isConnected || state.isPresetOperationInFlight)
+        }
+    }
+}
+
+/// AppKit permits selectedSegment == -1: hidden presets and disconnected displays need no selection.
+private struct PresetSegmentedControl: NSViewRepresentable {
+    let presets: [PicturePreset]
+    let selectedID: String?
+    let isEnabled: Bool
+    let baselineEnabled: Bool
+    let onSelect: (String) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> NSSegmentedControl {
+        let control = NSSegmentedControl()
+        control.trackingMode = .selectOne
+        control.segmentStyle = .automatic
+        control.target = context.coordinator
+        control.action = #selector(Coordinator.selectSegment(_:))
+        return control
+    }
+
+    func updateNSView(_ control: NSSegmentedControl, context: Context) {
+        context.coordinator.ids = presets.map(\.id)
+        context.coordinator.onSelect = onSelect
+        control.segmentCount = presets.count
+        for (index, preset) in presets.enumerated() {
+            control.setLabel(preset.name, forSegment: index)
+            control.setWidth(0, forSegment: index)
+            control.setEnabled(isEnabled && (preset.id != PicturePreset.baselineID || baselineEnabled), forSegment: index)
+        }
+        control.selectedSegment = presets.firstIndex { $0.id == selectedID } ?? -1
+        control.isEnabled = isEnabled
+        control.invalidateIntrinsicContentSize()
+    }
+
+    final class Coordinator: NSObject {
+        var ids: [String] = []
+        var onSelect: ((String) -> Void)?
+        @objc func selectSegment(_ control: NSSegmentedControl) {
+            guard control.isEnabled, ids.indices.contains(control.selectedSegment),
+                  control.isEnabled(forSegment: control.selectedSegment) else { return }
+            onSelect?(ids[control.selectedSegment])
+        }
     }
 }
 

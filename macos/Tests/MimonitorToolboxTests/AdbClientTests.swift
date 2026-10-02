@@ -3,6 +3,39 @@ import XCTest
 @testable import MimonitorToolbox
 
 final class AdbClientTests: XCTestCase {
+    func testScanProbeReadsModelFromExplicitTargetAndLeavesCurrentIpUnchanged() throws {
+        try fake("""
+        case "$1" in
+          connect|disconnect) [ "$2" = "192.168.1.40:5555" ] || exit 2 ;;
+          -s)
+            [ "$2" = "192.168.1.40:5555" ] || exit 2
+            case "$3" in
+              get-state) echo device ;;
+              shell) echo MiTV-Monitor ;;
+            esac ;;
+          *) exit 2 ;;
+        esac
+        """) { client in
+            let device = client.probeScannedDevice(ip: "192.168.1.40")
+            XCTAssertEqual(device, ScannedDevice(ip: "192.168.1.40", model: "MiTV-Monitor"))
+            XCTAssertEqual(client.ip, "192.168.1.20")
+        }
+    }
+
+    func testScanProbeRejectsUnauthorizedAndFailedModelReads() throws {
+        try fake("""
+        case "$3" in
+          get-state) echo unauthorized ;;
+          shell) echo MiTV-Monitor ;;
+        esac
+        """) { client in XCTAssertNil(client.probeScannedDevice(ip: "192.168.1.40")) }
+        try fake("""
+        case "$3" in
+          get-state) echo device ;;
+          shell) echo 'error: device offline'; exit 1 ;;
+        esac
+        """) { client in XCTAssertNil(client.probeScannedDevice(ip: "192.168.1.40")) }
+    }
     private func fake(_ script: String, test: (AdbClient) throws -> Void) throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("preset-adb-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
