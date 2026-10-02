@@ -375,7 +375,7 @@ class ScanForceRuleTests(unittest.TestCase):
         ]
 
     def test_force_by_device_name_substring(self):
-        networks = select_scan_networks(self._both(), force_devices=["wintun"])
+        networks = select_scan_networks(self._both(), force_devices=["contains:wint"])
         self.assertEqual(sorted(item.interface_name for item in networks), ["Wintun", "以太网"])
 
     def test_force_by_interface_index(self):
@@ -426,6 +426,34 @@ class ScanForceRuleTests(unittest.TestCase):
 class ScanBlockRuleTests(unittest.TestCase):
     """「扫描设置」里取消勾选 = 一律不扫描，优先于强制规则和自动回退。"""
 
+    def test_exact_name_rule_only_blocks_the_selected_adapter(self):
+        records = [
+            raw("192.168.5.10", index=3, name="以太网"),
+            raw("10.0.0.2", index=4, name="以太网 2"),
+        ]
+        networks = select_scan_networks(records, block_devices=["name:以太网"])
+        self.assertEqual([item.interface_name for item in networks], ["以太网 2"])
+
+    def test_legacy_full_name_rule_only_blocks_that_adapter(self):
+        records = [
+            raw("192.168.5.10", index=3, name="以太网"),
+            raw("10.0.0.2", index=4, name="以太网 2"),
+        ]
+        networks = select_scan_networks(records, block_devices=["以太网"])
+        self.assertEqual([item.interface_name for item in networks], ["以太网 2"])
+
+        # 目标网卡暂时消失时，规则也不能退化成对子串的匹配。
+        networks = select_scan_networks(records[1:], block_devices=["以太网"])
+        self.assertEqual([item.interface_name for item in networks], ["以太网 2"])
+
+    def test_numeric_index_rule_does_not_match_adapter_name(self):
+        records = [
+            raw("192.168.5.10", index=3, name="以太网"),
+            raw("10.0.0.2", index=4, name="以太网 3"),
+        ]
+        networks = select_scan_networks(records, block_devices=["3"])
+        self.assertEqual([item.interface_name for item in networks], ["以太网 3"])
+
     def test_blocked_adapter_is_not_scanned(self):
         records = [raw("192.168.5.10", index=1, name="以太网")]
         self.assertEqual(select_scan_networks(records, block_devices=["以太网"]), [])
@@ -441,7 +469,7 @@ class ScanBlockRuleTests(unittest.TestCase):
     def test_blocked_virtual_adapter_is_not_used_by_fallback(self):
         records = [raw("192.168.1.5", index=7, name="vEthernet (External)", hardware=False,
                        endpoint_interface=True, description=HYPERV_DESC)]
-        self.assertEqual(select_scan_networks(records, block_devices=["vEthernet"]), [])
+        self.assertEqual(select_scan_networks(records, block_devices=["contains:vEthernet"]), [])
 
     def test_block_wins_over_force(self):
         records = [raw("192.168.5.10", index=1, name="以太网")]

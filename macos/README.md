@@ -44,6 +44,7 @@ ADB 协议层对齐 `mimonitor_toolbox/adb.py`，各页面逐页对齐 `mimonito
 ```bash
 cd macos
 swift build
+swift test                 # 连接状态与 ADB 客户端回归测试
 swift run MimonitorToolbox     # 开发调试
 ```
 
@@ -191,7 +192,7 @@ EDID / FreeSync 这类会改变显示器输入信号格式（可能黑屏或改�
 `.github/workflows/macos.yml`（与原有的 Windows `build.yml` 并存）：
 
 - **触发**：改动 `macos/**` 的 push / PR；打 `v*` 标签（标签不受路径过滤限制）
-- **build**：debug 编译 → 导入签名证书 → 通用二进制打包 → 校验产物 → 上传 artifact
+- **build**：debug 编译 → 单元测试 → 导入签名证书 → 通用二进制打包 → 校验产物 → 上传 artifact
 - **release**：仅标签触发，把 DMG 和 zip 附到 GitHub Release
 
 校验步骤逐项确认：可执行文件存在、内嵌 adb / 两个 jar / 保活 apk 齐全、**确实是

@@ -56,6 +56,9 @@ fileprivate struct GuardianStatus {
 final class AppState: ObservableObject {
     let adb = AdbClient()
     let hotkeyManager = HotkeyManager()
+    private var connectionIntent = ConnectionIntent()
+    private var pageRefreshIntent = PageRefreshIntent()
+    private let connectionQueue = DispatchQueue(label: "com.mimonitor.toolbox.connection")
 
     @Published var connectionStatus: ConnectionStatus = .disconnected
     @Published var currentValues: [String: String] = [:]
@@ -153,7 +156,7 @@ final class AppState: ObservableObject {
         }
 
         // 先把 adb server 预热起来，省得自动连接那一步还要等它冷启动
-        runBackground { self.adb.warmUpServer() }
+        runConnectionTask { self.adb.warmUpServer() }
 
         // 启动后自动连接上次设备（原版延迟 900ms，等窗口先出来）
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
@@ -176,6 +179,7 @@ final class AppState: ObservableObject {
     /// 但设备侧清掉旧 transport 需要时间，所以要反复重试而不是只试一次。
     private func monitorAdbServer() {
         guard !monitorChecking else { return }
+        guard connectionIntent.allowsAutomaticRecovery else { return }
         // 正在连接/扫描时不要插手：监控会重启 adb server，而重启会把
         // 进行中的连接打断，于是「越监控越连不上」。这是之前冷启动很慢的元凶。
         switch connectionStatus {
@@ -190,20 +194,23 @@ final class AppState: ObservableObject {
         guard !target.isEmpty else { return }
 
         let wasConnected = isConnected    // 在主线程序上读，避免后台 sync 主线程
+        let request = connectionIntent.generation
+        if adb.ip.isEmpty { adb.ip = target }
         monitorChecking = true
-        runBackground {
+        runConnectionTask {
             defer { DispatchQueue.main.async { self.monitorChecking = false } }
 
             if wasConnected && self.adb.deviceState() == "device" { return }   // 一切正常
 
-            if self.adb.ip.isEmpty { self.adb.ip = target }
             if !self.adb.isServerAlive() { self.adb.restartServer() }
             let (ok, state) = self.adb.ensureConnected()
+            let model = ok ? self.adb.getModel() : ""
 
             DispatchQueue.main.async {
+                guard self.connectionIntent.isCurrent(request),
+                      self.connectionIntent.allowsAutomaticRecovery else { return }
                 if ok {
-                    let model = self.adb.getModel()
-                    let ip = self.adb.ip
+                    let ip = target
                     self.connectionStatus = .connected(model.isEmpty ? ip : "\(model) · \(ip)")
                     if !wasConnected {
                         // 关键：恢复后必须把连接状态也置回已连接，
@@ -319,6 +326,10 @@ final class AppState: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async(execute: work)
     }
 
+    private func runConnectionTask(_ work: @escaping () -> Void) {
+        connectionQueue.async(execute: work)
+    }
+
     private func setValue(_ key: String, _ value: String) {
         DispatchQueue.main.async { self.currentValues[key] = value }
     }
@@ -327,6 +338,7 @@ final class AppState: ObservableObject {
 
     /// 启动时自动连接上次设备；没记录就扫描内网（对应原版 _auto_connect_on_startup）。
     func autoConnectOnStartup() {
+        guard connectionIntent.allowsStartupAttempt else { return }
         guard !isConnected else { return }
         let saved = (UserDefaults.standard.string(forKey: "saved_ip") ?? "")
             .trimmingCharacters(in: .whitespaces)
@@ -343,12 +355,13 @@ final class AppState: ObservableObject {
     func connect(isAuto: Bool = false) {
         let ip = ipInput.trimmingCharacters(in: .whitespaces)
         guard !ip.isEmpty else { log("请输入显示器 IP 地址"); return }
+        let request = connectionIntent.beginConnection()
         UserDefaults.standard.set(ip, forKey: "saved_ip")
         adb.ip = ip
         connectionStatus = .connecting
         if !isAuto { log("正在连接 \(ip)...") }
 
-        runBackground {
+        runConnectionTask {
             let (ok, state) = self.adb.ensureConnected()
 
             if ok {
@@ -357,9 +370,11 @@ final class AppState: ObservableObject {
                 let model = self.adb.getModel()
                 let detail = model.isEmpty ? ip : "\(model) · \(ip)"
                 DispatchQueue.main.async {
+                    guard self.connectionIntent.isCurrent(request) else { return }
                     self.connectionStatus = .connected(detail)
                     self.log(isAuto ? "启动自动连接成功: \(detail)" : "已连接: \(detail)")
                     self.loadedPages = []
+                    self.loadingPages = []
                     self.activeSource = "未知"
                     self.hdrLastState = nil
                     // scannedDevices 只存在内存里、不持久化：重启后列表是空的，
@@ -382,6 +397,7 @@ final class AppState: ObservableObject {
                 }
             } else {
                 DispatchQueue.main.async {
+                    guard self.connectionIntent.isCurrent(request) else { return }
                     self.connectionStatus = .disconnected
                     if isAuto {
                         self.log("启动自动连接失败: \(state)，开始扫描内网")
@@ -417,20 +433,29 @@ final class AppState: ObservableObject {
 
     func disconnectAdb() {
         let ip = adb.ip
+        connectionIntent.disconnect()
         adb.ip = ""
         connectionStatus = .disconnected
         currentValues = [:]
         loadedPages = []
+        loadingPages = []
         activeSource = "未知"
         hdrLastState = nil
         stopSourcePolling()
         if !ip.isEmpty {
-            runBackground { _ = self.adb.disconnect() }
+            runConnectionTask { _ = self.adb.disconnect(ip: ip) }
         }
         log("已断开连接")
     }
 
     func scanNet() {
+        switch connectionStatus {
+        case .disconnected: break
+        case .connecting: log("正在连接显示器，请等待连接完成或先断开"); return
+        case .connected: log("已连接显示器，请先断开后扫描"); return
+        case .scanning: log("正在扫描内网，请等待扫描完成"); return
+        }
+        let request = connectionIntent.beginScan()
         connectionStatus = .scanning
         log("开始扫描内网...")
         runBackground {
@@ -440,6 +465,7 @@ final class AppState: ObservableObject {
             }
             let found = NetworkScan.scan()
             DispatchQueue.main.async {
+                guard self.connectionIntent.isCurrent(request) else { return }
                 self.scannedDevices = found
                 self.connectionStatus = .disconnected
                 self.log("扫描完成，发现 \(found.count) 台设备")
@@ -544,6 +570,8 @@ final class AppState: ObservableObject {
         guard isConnected else { return }
         guard Self.refreshablePages.contains(page) else { return }
         guard !loadedPages.contains(page) else { return }
+        let connectionRequest = connectionIntent.generation
+        let pageRequest = pageRefreshIntent.begin(page)
         loadedPages.insert(page)
         loadingPages.insert(page)
 
@@ -565,6 +593,9 @@ final class AppState: ObservableObject {
             }
             if !settingsVals.isEmpty {
                 DispatchQueue.main.async {
+                    guard self.isConnected,
+                          self.connectionIntent.isCurrent(connectionRequest),
+                          self.pageRefreshIntent.isCurrent(page, pageRequest) else { return }
                     self.mergeValues(settingsVals)
                     // 首屏数据到手就撤遮罩，不必等慢一档的 JNI
                     self.loadingPages.remove(page)
@@ -596,6 +627,9 @@ final class AppState: ObservableObject {
             }
 
             DispatchQueue.main.async {
+                guard self.isConnected,
+                      self.connectionIntent.isCurrent(connectionRequest),
+                      self.pageRefreshIntent.isCurrent(page, pageRequest) else { return }
                 if !corrections.isEmpty { self.mergeValues(corrections) }
 
                 // 拿到新鲜的 picture_mode + front_sight_index 后按模式纠正准星
@@ -1079,6 +1113,7 @@ final class AppState: ObservableObject {
 
     func stopSourcePolling() {
         sourcePollArmed = false
+        _ = pageRefreshIntent.begin("sourcePoll")
         DispatchQueue.main.async {
             self.sourcePollTimer?.invalidate()
             self.sourcePollTimer = nil
@@ -1087,11 +1122,16 @@ final class AppState: ObservableObject {
 
     private func pollSourceState() {
         guard sourcePollArmed, isConnected else { stopSourcePolling(); return }
+        let connectionRequest = connectionIntent.generation
+        let pollRequest = pageRefreshIntent.begin("sourcePoll")
         runBackground {
             let raw = self.adb.settingsGet("mitv.tvplayer.hdmi.last.source")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             guard let n = Int(raw), let name = RegisterMap.sourceNames[n] else { return }
             DispatchQueue.main.async {
+                guard self.sourcePollArmed, self.isConnected,
+                      self.connectionIntent.isCurrent(connectionRequest),
+                      self.pageRefreshIntent.isCurrent("sourcePoll", pollRequest) else { return }
                 self.currentValues["mitv.tvplayer.hdmi.last.source"] = String(n)
                 if self.activeSource != name {
                     self.activeSource = name

@@ -486,9 +486,11 @@ class ScanSettingsDialogTests(unittest.TestCase):
             [state.text() for _r, _b, state in dialog._rows],
             ["将参与扫描", "不会扫描", "不会扫描"],
         )
-        # 原样保存不该产生任何规则
+        # 保存当前勾选状态时，未勾选的虚拟网卡也必须明确排除。
         self.assertEqual(dialog.force_devices(), [])
-        self.assertEqual(dialog.block_devices(), [])
+        self.assertEqual(dialog.block_devices(), [
+            "name:vEthernet (External)", "name:VMware Network Adapter VMnet1",
+        ])
 
     def test_hyperv_only_setup_is_prechecked_via_fallback(self):
         dialog = self._dialog(self._records()[1:2], {})
@@ -500,30 +502,68 @@ class ScanSettingsDialogTests(unittest.TestCase):
         dialog = self._dialog(self._records()[:1] + self._records()[2:], {})
         dialog._rows[0][1].setChecked(False)
 
-        self.assertEqual(dialog.block_devices(), ["以太网"])
+        self.assertEqual(dialog.block_devices(), [
+            "name:以太网", "name:VMware Network Adapter VMnet1",
+        ])
         self.assertEqual(dialog.force_devices(), [])
 
     def test_checking_a_virtual_adapter_forces_it(self):
         dialog = self._dialog(self._records()[:1] + self._records()[2:], {})
         dialog._rows[1][1].setChecked(True)
 
-        self.assertEqual(dialog.force_devices(), ["VMware Network Adapter VMnet1"])
+        self.assertEqual(dialog.force_devices(), ["name:VMware Network Adapter VMnet1"])
         self.assertEqual(dialog.block_devices(), [])
 
     def test_existing_rules_are_reflected_and_round_trip(self):
         dialog = self._dialog(self._records()[:1] + self._records()[2:],
-                              {"scan_force_devices": ["vmware"]})
+                              {"scan_force_devices": ["contains:vmware"]})
         self.assertEqual(
             self._checked(dialog), {"以太网": True, "VMware Network Adapter VMnet1": True}
         )
-        self.assertEqual(dialog.force_devices(), ["VMware Network Adapter VMnet1"])
+        self.assertEqual(dialog.force_devices(), ["name:VMware Network Adapter VMnet1"])
         self.assertEqual(dialog.block_devices(), [])
+
+    def test_unchecked_virtual_adapter_stays_blocked_after_physical_disappears(self):
+        from mimonitor_toolbox.network_scan import select_scan_networks
+
+        records = self._records()[:2]
+        dialog = self._dialog(records, {})
+        self.assertFalse(dialog._rows[1][1].isChecked())
+
+        networks = select_scan_networks(records[1:], block_devices=dialog.block_devices())
+        self.assertEqual(networks, [])
+
+    def test_unchecked_deduplicated_adapter_stays_blocked_after_metric_change(self):
+        from mimonitor_toolbox.network_scan import select_scan_networks
+
+        records = [
+            self._record("192.168.5.10", "以太网", index=3),
+            self._record("192.168.5.20", "以太网 2", index=4),
+        ]
+        dialog = self._dialog(records, {})
+        self.assertFalse(dialog._rows[1][1].isChecked())
+
+        networks = select_scan_networks(records[1:], block_devices=dialog.block_devices())
+        self.assertEqual(networks, [])
 
     def test_blocked_adapter_opens_unchecked_and_round_trips(self):
         dialog = self._dialog(self._records()[:1], {"scan_block_devices": ["以太网"]})
         self.assertFalse(dialog._rows[0][1].isChecked())
-        self.assertEqual(dialog.block_devices(), ["以太网"])
+        self.assertEqual(dialog.block_devices(), ["name:以太网"])
         self.assertEqual(dialog.force_devices(), [])
+
+    def test_similarly_named_adapters_can_be_selected_independently(self):
+        from mimonitor_toolbox.network_scan import select_scan_networks
+
+        records = [
+            self._record("192.168.5.10", "以太网", index=3),
+            self._record("10.0.0.2", "以太网 2", index=4),
+        ]
+        dialog = self._dialog(records, {})
+        dialog._rows[0][1].setChecked(False)
+
+        networks = select_scan_networks(records, block_devices=dialog.block_devices())
+        self.assertEqual([item.interface_name for item in networks], ["以太网 2"])
 
     def test_state_label_follows_the_checkbox(self):
         dialog = self._dialog(self._records()[:1], {})

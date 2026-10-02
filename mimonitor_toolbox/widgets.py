@@ -1665,7 +1665,7 @@ class ScanSettingsDialog(MessageBoxBase):
     状态反推成两个名单：
 
     * 勾上但默认不会扫的（虚拟网卡）-> ``scan_force_devices``
-    * 取消勾选但默认会扫的（物理网卡）-> ``scan_block_devices``
+    * 所有取消勾选的网卡 -> ``scan_block_devices``，包括以后可能被自动回退选中的网卡
 
     另外，只要用户对当前这些网卡显式表过态，扫描就不再自动回退用虚拟网卡 ——
     否则"取消勾选"会被回退绕过（见 ``select_scan_networks``）。
@@ -1688,9 +1688,9 @@ class ScanSettingsDialog(MessageBoxBase):
         self.viewLayout.addWidget(self.titleLabel)
 
         hint = CaptionLabel(
-            "勾选的网卡参与扫描，取消勾选的一律不扫描。创建 Hyper-V 外部虚拟交换机后，"
-            "IP 会跑到 vEthernet 上、物理网卡没有地址，程序会自动回退使用 vEthernet；"
-            "自动没覆盖到时，在这里勾上它即可。",
+            "勾选的网卡参与扫描，保存后未勾选的网卡不会参与扫描或自动回退。"
+            "创建 Hyper-V 外部虚拟交换机后，IP 会跑到 vEthernet 上；"
+            "需要让它始终参与扫描时，请勾选对应网卡。",
             self,
         )
         hint.setWordWrap(True)
@@ -1778,19 +1778,19 @@ class ScanSettingsDialog(MessageBoxBase):
         if not self._rows:
             return list(self._initial_force)      # 一台都没枚举到：别把已有规则清空
         return [
-            record.interface_name
+            f"name:{record.interface_name}"
             for record, checkbox, _state in self._rows
             if checkbox.isChecked() and record.interface_index not in self._base
         ]
 
     def block_devices(self):
-        """取消勾选、但默认会扫的网卡（物理网卡）。"""
+        """所有取消勾选的网卡；网络变化后也不得通过自动回退参与扫描。"""
         if not self._rows:
             return list(self._initial_block)
         return [
-            record.interface_name
+            f"name:{record.interface_name}"
             for record, checkbox, _state in self._rows
-            if not checkbox.isChecked() and record.interface_index in self._base
+            if not checkbox.isChecked()
         ]
 
     def force_subnets(self):

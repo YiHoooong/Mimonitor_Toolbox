@@ -309,9 +309,10 @@ def adapter_matches_device_rule(
     record: RawAdapterAddress,
     force_devices: Iterable[str] = (),
 ) -> Optional[str]:
-    """网卡是否命中"按网卡"强制规则：接口索引相等，或名字/型号包含该子串。
+    """网卡是否命中规则：名称精确匹配，contains: 子串匹配，数字匹配索引。
 
-    扫描和设置弹窗都用这一个判定，避免"弹窗里勾选状态"和"扫描实际行为"不一致。
+    旧版界面保存的是无前缀的完整网卡名；不能根据当前枚举结果改变其语义，
+    否则目标网卡暂时消失时，规则会误命中同名前缀的其他网卡。
     """
     tokens = [str(item).strip().lower() for item in force_devices or () if str(item).strip()]
     if not tokens:
@@ -321,7 +322,16 @@ def adapter_matches_device_rule(
          str(getattr(record, "adapter_description", "") or ""))
     ).lower()
     for token in tokens:
-        if token == str(record.interface_index) or token in haystack:
+        if token.startswith("name:"):
+            if token[5:] == str(record.interface_name or "").strip().lower():
+                return token
+        elif token.startswith("contains:"):
+            if token[9:] and token[9:] in haystack:
+                return token
+        elif token.isdecimal():
+            if token == str(record.interface_index):
+                return token
+        elif token == str(record.interface_name or "").strip().lower():
             return token
     return None
 
@@ -467,7 +477,7 @@ def select_scan_networks(
 
     设置里有三个覆盖项（「扫描设置」弹窗写的就是它们）：
 
-    * ``scan_force_devices``：勾选的网卡（名字子串或接口索引）始终参与
+    * ``scan_force_devices``：勾选的网卡（精确名称、contains: 子串或接口索引）始终参与
     * ``scan_block_devices``：取消勾选的网卡一律不参与（优先于强制）
     * ``scan_force_subnets``：CIDR，网卡地址落在里面就参与
     """

@@ -10,6 +10,7 @@ final class AdbClient {
     let adbPath: String
     let serverPort: String
     var ip: String = ""
+    private let jniBatchLock = NSLock()
 
     init(adbPath: String = AdbClient.locateAdb(),
          serverPort: String = ProcessInfo.processInfo.environment["MIMONITOR_ADB_SERVER_PORT"] ?? "5038") {
@@ -112,8 +113,9 @@ final class AdbClient {
     }
 
     @discardableResult
-    func disconnect() -> String {
-        run(["disconnect", serial], timeout: 5).output
+    func disconnect(ip: String) -> String {
+        guard !ip.isEmpty else { return "" }
+        return run(["disconnect", "\(ip):5555"], timeout: 5).output
     }
 
     /// 等设备进入 device 状态。
@@ -366,6 +368,9 @@ final class AdbClient {
     func jniBatchGet(keys: [String]) -> [String: String] {
         let safeKeys = keys.filter { !$0.isEmpty && $0.allSatisfy { $0.isLetter || $0.isNumber || $0 == "_" } }
         guard !safeKeys.isEmpty else { return [:] }
+        // batchGet 共用设备端的结果文件；两次调用不能交错删除和读取它。
+        jniBatchLock.lock()
+        defer { jniBatchLock.unlock() }
         let jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
         let batch = buildTvserviceCommand(jar: jar, args: ["MtkDirectTool", "batchGet"] + safeKeys)
         let resultFile = "/sdcard/Download/Mimonitor_Toolbox/.mtk_batch_result.txt"

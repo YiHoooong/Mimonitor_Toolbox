@@ -1305,6 +1305,36 @@ class WindowsResumeReconnectTests(unittest.TestCase):
 class NetworkSignatureTests(unittest.TestCase):
     """网络变化检测（_network_signature）要和扫描同一口径。"""
 
+    def test_legacy_full_name_block_does_not_hide_a_similarly_named_adapter(self):
+        import ipaddress
+
+        from mimonitor_toolbox import device_features
+        from mimonitor_toolbox.network_scan import RawAdapterAddress
+
+        host = device_features.DeviceFeaturesMixin()
+        host.log = lambda message: None
+        records = [
+            RawAdapterAddress(index, name, ipaddress.IPv4Address(ip), 24, 25, 6, 1, True)
+            for index, name, ip in (
+                (3, "以太网", "192.168.5.10"),
+                (4, "以太网 2", "10.0.0.2"),
+            )
+        ]
+        with mock.patch.object(device_features, "enumerate_windows_adapter_addresses",
+                               return_value=records), \
+                mock.patch.object(device_features, "load_settings",
+                                  return_value={"scan_block_devices": ["以太网"]}):
+            signature = host._network_signature()
+
+        self.assertEqual([item[1] for item in signature], ["以太网 2"])
+
+        with mock.patch.object(device_features, "enumerate_windows_adapter_addresses",
+                               return_value=records[1:]), \
+                mock.patch.object(device_features, "load_settings",
+                                  return_value={"scan_block_devices": ["以太网"]}):
+            signature = host._network_signature()
+        self.assertEqual([item[1] for item in signature], ["以太网 2"])
+
     def test_hyperv_switch_adapter_counts_as_a_network(self):
         import ipaddress
 

@@ -8,6 +8,11 @@ let package = Package(
         .executableTarget(
             name: "MimonitorToolbox",
             path: "Sources/MimonitorToolbox"
+        ),
+        .testTarget(
+            name: "MimonitorToolboxTests",
+            dependencies: ["MimonitorToolbox"],
+            path: "Tests/MimonitorToolboxTests"
         )
     ]
 )
