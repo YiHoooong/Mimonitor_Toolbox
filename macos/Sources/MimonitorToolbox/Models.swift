@@ -1,15 +1,16 @@
 import Foundation
+import MimonitorPresetCore
 
 // MARK: - 寄存器映射（移植自 core.py）
 
 enum RegisterMap {
     /// 小米色温 UI 值 -> MTK JNI 值
-    static let colorTempToMtk: [Int: Int] = [0: 1, 1: 2, 2: 3, 3: 0, 4: 4, 5: 5, 8: 6]
+    static let colorTempToMtk = PicturePresetPlan.colorTempToMtk
     /// MTK 值 -> 小米 settings 枚举值（反查表，用于「JNI 覆盖 settings」）
     static let mtkToColorTemp: [Int: Int] = [1: 0, 2: 1, 3: 2, 0: 3, 4: 4, 5: 5, 6: 8]
 
     /// HDR 色调映射 UI 值 -> MTK 值
-    static let hdrToneMappingUIToMtk: [Int: Int] = [0: 5, 1: 0, 2: 2, 3: 1]
+    static let hdrToneMappingUIToMtk = PicturePresetPlan.hdrToneMappingToMtk
 
     /// MTK 值 -> UI 值（反查表）
     static let hdrToneMappingMtkToUI: [Int: Int] = [5: 0, 0: 1, 2: 2, 1: 3]
@@ -200,7 +201,7 @@ enum OptionLists {
 // MARK: - 侧边栏页面
 
 enum Page: String, CaseIterable, Identifiable, Hashable {
-    case home, picture, game, source, light, menuBar, tools, remote
+    case home, picture, presets, autoTasks, game, source, light, menuBar, tools, remote
 
     var id: String { rawValue }
 
@@ -208,6 +209,8 @@ enum Page: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .home: return "主页 & 连接"
         case .picture: return "画面设置"
+        case .presets: return "预设模式"
+        case .autoTasks: return "自动任务"
         case .game: return "游戏模式"
         case .source: return "信号源切换"
         case .light: return "屏幕灯"
@@ -222,6 +225,8 @@ enum Page: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .home: return "house"
         case .picture: return "paintpalette"
+        case .presets: return "square.stack.3d.up"
+        case .autoTasks: return "calendar.badge.clock"
         case .game: return "gamecontroller"
         case .source: return "arrow.triangle.2.circlepath"
         case .light: return "lightbulb"

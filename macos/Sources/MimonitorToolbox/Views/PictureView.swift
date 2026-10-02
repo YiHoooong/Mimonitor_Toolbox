@@ -8,6 +8,21 @@ struct PictureView: View {
             VStack(alignment: .leading, spacing: 16) {
                 PageHeader(title: "画面设置") { state.forceRefreshPage("picture") }
 
+                if state.presetConfiguration.applicationIncomplete {
+                    Text("上次预设未完整应用。请到「预设模式」重新应用或返回无预设，确认前不会自动保存混合参数。")
+                        .font(.callout).foregroundColor(.orange)
+                }
+                if state.activePresetID != nil {
+                    SectionCard(title: "当前预设：\(state.activePresetName)") {
+                        HStack {
+                            Text("调整会自动保存到此预设；HDR/FreeSync 记忆已暂停。")
+                                .font(.callout).foregroundColor(.secondary)
+                            Spacer()
+                            Button("管理预设") { state.requestedPage = .presets }
+                        }
+                    }
+                }
+
                 // 画面模式
                 SectionCard(title: "画面模式") {
                     HStack(spacing: 10) {
@@ -117,6 +132,7 @@ struct PictureView: View {
             }
             .padding(30)
         }
+        .disabled(state.presetConfiguration.applicationIncomplete)
         .onAppear { state.refreshPage("picture") }
         .loadingOverlay(state.loadingPages.contains("picture"))
     }

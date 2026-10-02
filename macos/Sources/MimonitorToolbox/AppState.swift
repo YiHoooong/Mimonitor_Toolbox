@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import AppKit
+import MimonitorPresetCore
 
 enum ConnectionStatus: Equatable {
     case disconnected
@@ -56,9 +57,27 @@ fileprivate struct GuardianStatus {
 final class AppState: ObservableObject {
     let adb = AdbClient()
     let hotkeyManager = HotkeyManager()
-    private var connectionIntent = ConnectionIntent()
+    var connectionIntent = ConnectionIntent()
     private var pageRefreshIntent = PageRefreshIntent()
     private let connectionQueue = DispatchQueue(label: "com.mimonitor.toolbox.connection")
+    let deviceQueue = DispatchQueue(label: "com.mimonitor.toolbox.device", qos: .userInitiated)
+    let presetEngine = PresetEngine(store: PresetStore())
+    @Published var presetConfiguration = PresetConfiguration()
+    @Published var isPresetBusy = false
+    @Published var isPresetOperationInFlight = false
+    @Published var presetOperationText = ""
+    @Published var presetError: String?
+    @Published var automaticTaskStatus = ""
+    @Published var requestedPage: Page?
+    var presetTimer: Timer?
+    var presetWakeObserver: NSObjectProtocol?
+    var pendingPresetSave: DispatchWorkItem?
+    var pendingPresetSaveID: String?
+    var pendingPresetSaveDevice: String?
+    var pictureEditRevision = 0
+    /// Only accessed on deviceQueue; native mode/reset commands may settle after ADB returns.
+    var pictureSettleUntil = Date.distantPast
+    var lastAutomaticTaskError = ""
 
     @Published var connectionStatus: ConnectionStatus = .disconnected
     @Published var currentValues: [String: String] = [:]
@@ -128,6 +147,7 @@ final class AppState: ObservableObject {
     }()
 
     init() {
+        startPresetFeatures()
         log("系统就绪，等待连接...")
         hotkeyManager.onTrigger = { [weak self] id in self?.handleHotkeyTrigger(id) }
         // 诊断默认关闭：每按一个不匹配的键就写一行日志，正常打字会把日志刷满。
@@ -170,6 +190,12 @@ final class AppState: ObservableObject {
             if self.isConnected && self.monitorTick % 5 != 0 { return }
             self.monitorAdbServer()
         }
+    }
+
+    deinit {
+        presetTimer?.invalidate()
+        pendingPresetSave?.cancel()
+        if let observer = presetWakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
     }
 
     /// 探活并自愈。
@@ -220,6 +246,7 @@ final class AppState: ObservableObject {
                         self.refreshPage("picture")
                         self.refreshPage("game")
                         self.pollHdrState(force: true)
+                        self.checkAutomaticTasks()
                     } else {
                         self.log("ADB 链路已恢复")
                     }
@@ -323,7 +350,7 @@ final class AppState: ObservableObject {
     }
 
     private func runBackground(_ work: @escaping () -> Void) {
-        DispatchQueue.global(qos: .userInitiated).async(execute: work)
+        deviceQueue.async(execute: work)
     }
 
     private func runConnectionTask(_ work: @escaping () -> Void) {
@@ -391,6 +418,7 @@ final class AppState: ObservableObject {
                     self.refreshPage("picture")
                     self.refreshPage("game")
                     self.pollHdrState(force: true)
+                    self.checkAutomaticTasks()
                     self.check4KState()
                     // 原版连接后还会检测保活守护状态（QTimer 1800ms）
                     self.checkGuardian()
@@ -427,11 +455,14 @@ final class AppState: ObservableObject {
         switch page {
         case .picture, .game, .source, .light, .remote: return true
         // 菜单栏配置页只改本地配置，没连显示器也能用
-        case .home, .tools, .menuBar: return false
+        case .home, .tools, .menuBar, .presets, .autoTasks: return false
         }
     }
 
     func disconnectAdb() {
+        pendingPresetSave?.cancel()
+        pendingPresetSave = nil
+        // Keep dirty identity; reconnecting this same display can still save the edit safely.
         let ip = adb.ip
         connectionIntent.disconnect()
         adb.ip = ""
@@ -446,6 +477,7 @@ final class AppState: ObservableObject {
             runConnectionTask { _ = self.adb.disconnect(ip: ip) }
         }
         log("已断开连接")
+        updateAutomaticTaskStatus()
     }
 
     func scanNet() {
@@ -568,6 +600,7 @@ final class AppState: ObservableObject {
 
     func refreshPage(_ page: String) {
         guard isConnected else { return }
+        guard !isPresetBusy else { return }
         guard Self.refreshablePages.contains(page) else { return }
         guard !loadedPages.contains(page) else { return }
         let connectionRequest = connectionIntent.generation
@@ -667,15 +700,35 @@ final class AppState: ObservableObject {
         refreshPage(page)
     }
 
+    var hasPendingDeviceControls: Bool { !cyclePending.isEmpty || !adjustPendingWork.isEmpty }
+
+    func invalidatePictureRefreshesForPreset() {
+        for page in ["picture", "game"] {
+            _ = pageRefreshIntent.begin(page)
+            loadedPages.remove(page)
+            loadingPages.remove(page)
+        }
+        pendingRefreshWork?.cancel()
+        pendingRefreshWork = nil
+        // A countdown armed for the previous preset must never land in the new one.
+        for item in cyclePending.values { item.work.cancel() }
+        cyclePending.removeAll()
+        for item in adjustPendingWork.values { item.cancel() }
+        adjustPendingWork.removeAll()
+        adjustPendingValues.removeAll()
+        HUDWindow.shared.endCountdown()
+    }
+
     // MARK: - 画面
 
     func setMode(_ value: Int) {
+        guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
         guard isConnected else { return log("未连接") }
         let name = RegisterMap.modeNames[value] ?? "\(value)"
         currentValues["picture_mode"] = String(value)
         log("模式: \(name)")
         reconcileCrosshairModeState()
-        runBackground {
+        runPictureChange(delay: 1.5) {
             self.adb.settingsPut("picture_mode", String(value))
             DispatchQueue.main.async {
                 self.scheduleCoalescedRefresh(delay: 1.2, pages: ["picture"])
@@ -684,11 +737,12 @@ final class AppState: ObservableObject {
     }
 
     func resetCurrentMode() {
+        guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
         guard isConnected else { return log("未连接") }
         let mode = intValue("picture_mode", default: -1)
         guard let name = RegisterMap.modeNames[mode] else { log("无法获取当前模式"); return }
         log("恢复 \(name) 模式默认设置...")
-        runBackground {
+        runPictureChange(delay: 3.2) {
             self.adb.jniSet(key: "g_fusion_picture__pic_reset_def_bypicmode", value: "0")
             self.adb.refreshPq()
             DispatchQueue.main.async {
@@ -699,9 +753,10 @@ final class AppState: ObservableObject {
 
     /// 通用滑条：写 JNI + settings，然后 refresh_pq。
     func setPictureSlider(title: String, value: Int, jniKey: String?, settingsKeys: [String]) {
+        guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
         guard isConnected else { return log("未连接") }
         log("\(title): \(value)")
-        runBackground {
+        runPictureChange {
             if let jniKey {
                 self.adb.jniSet(key: jniKey, value: String(value))
                 self.adb.refreshPq()
@@ -711,12 +766,13 @@ final class AppState: ObservableObject {
     }
 
     func setColorTemp(_ sv: Int) {
+        guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
         guard isConnected else { return log("未连接") }
         let jv = RegisterMap.colorTempToMtk[sv] ?? 0
         let names: [Int: String] = [0: "冷色", 1: "标准", 2: "暖色", 8: "原色", 3: "自定义"]
         currentValues["picture_color_temperature"] = String(sv)
         log("色温: \(names[sv] ?? "\(sv)")")
-        runBackground {
+        runPictureChange {
             self.adb.jniSet(key: "g_video__clr_temp", value: String(jv))
             self.adb.settingsPut("picture_color_temperature", String(sv))
             self.adb.refreshPq()
@@ -724,6 +780,7 @@ final class AppState: ObservableObject {
     }
 
     func setColorGain(title: String, settingsKey: String, jniKey: String, value: Int) {
+        guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
         guard isConnected else { return log("未连接") }
         func gain(_ key: String) -> Int {
             let v = (settingsKey == key) ? value : intValue(key, default: 1024)
@@ -739,7 +796,7 @@ final class AppState: ObservableObject {
         currentValues["picture_blue_gain"] = String(blue)
         log("\(title): \(value)")
 
-        runBackground {
+        runPictureChange {
             self.adb.jniSet(key: "g_video__clr_temp", value: String(RegisterMap.colorTempToMtk[3] ?? 0))
             self.adb.settingsPut("picture_color_temperature", "3")
             self.adb.setColorGains(red: String(red), green: String(green), blue: String(blue))
@@ -751,15 +808,16 @@ final class AppState: ObservableObject {
     }
 
     func setLocalDimming(_ value: Int) {
+        guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
         guard isConnected else { return log("未连接") }
         currentValues["picture_local_dimming"] = String(value)
         log("精密控光: \(["关", "低", "中", "高"][value])")
-        if hdrMemoryEnabled, let state = hdrLastState {
+        if hdrMemoryEnabled, !memoriesSuspendedByPreset, let state = hdrLastState {
             var m = localDimmingMemory()
             m[state ? "hdr" : "sdr"] = value
             saveLocalDimmingMemory(m)
         }
-        runBackground {
+        runPictureChange {
             self.adb.jniSet(key: "g_video__vid_local_dimming", value: String(value))
             self.adb.settingsPut("picture_local_dimming", String(value))
             self.adb.settingsPut("tv_picture_video_local_dimming", String(value))
@@ -784,11 +842,12 @@ final class AppState: ObservableObject {
     /// 3），这是实测手拨菜单抓到的值；不跟 `refreshPq()`，光感由 ContentObserver
     /// 立即生效，菜单路径里没有这一步。
     func setLightSensor(_ on: Bool) {
+        guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
         guard isConnected else { return log("未连接") }
         let value = on ? 1 : 0
         currentValues["tv_picture_light_sensor"] = String(value)
         log("自动调整亮度: \(on ? "开" : "关")")
-        runBackground {
+        runPictureChange {
             // settings put 必须由 adb shell 执行（shell 持有 WRITE_SECURE_SETTINGS）；
             // 塞进 service call TvService 会被 tvservice 的 uid 静默拒绝 —— 所以这两条
             // 是两次独立调用，不要"优化"成一条 TvService 命令。
@@ -798,12 +857,13 @@ final class AppState: ObservableObject {
     }
 
     func setHdrToneMapping(_ uiValue: Int) {
+        guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
         guard isConnected else { return log("未连接") }
         guard let mtk = RegisterMap.hdrToneMappingUIToMtk[uiValue] else { return }
         let names: [Int: String] = [0: "HGiG", 1: "层次", 2: "动态", 3: "明亮"]
         currentValues["settings_display_hdr_color_tone"] = String(uiValue)
         log("HDR 色调映射: \(names[uiValue] ?? "\(uiValue)")")
-        runBackground {
+        runPictureChange {
             self.adb.hdrToneMapping(String(mtk))
             self.adb.settingsPut("picture_hdr_tone_mapping", String(mtk))
             self.adb.settingsPut("settings_display_hdr_color_tone", String(uiValue))
@@ -812,10 +872,11 @@ final class AppState: ObservableObject {
     }
 
     func setDynamicDefinition(_ value: Int) {
+        guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
         guard isConnected else { return log("未连接") }
         currentValues["picture_dynamic_definition"] = String(value)
         log("动态清晰度: \(["关", "低", "中", "高"][value])")
-        runBackground {
+        runPictureChange {
             self.adb.jniSet(key: "g_video__vid_insert_black", value: String(value))
             self.adb.settingsPut("picture_dynamic_definition", String(value))
             self.adb.refreshPq()
@@ -823,10 +884,11 @@ final class AppState: ObservableObject {
     }
 
     func setResponseTime(_ value: Int) {
+        guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
         guard isConnected else { return log("未连接") }
         currentValues["picture_response_time"] = String(value)
         log("响应时间: \(["", "普通", "快速", "高速"][value])")
-        runBackground {
+        runPictureChange {
             self.adb.jniSet(key: "g_video__vid_od_response_time", value: String(value))
             self.adb.settingsPut("picture_response_time", String(value))
             self.adb.refreshPq()
@@ -834,11 +896,12 @@ final class AppState: ObservableObject {
     }
 
     func setGamut(_ value: Int) {
+        guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
         guard isConnected else { return log("未连接") }
         let names: [Int: String] = [0: "自动", 3: "sRGB", 6: "DCI-P3", 4: "Adobe RGB", 5: "BT2020", 7: "BT709"]
         currentValues["tv_picture_advanced_video_color_space"] = String(value)
         log("色域: \(names[value] ?? "\(value)")")
-        runBackground {
+        runPictureChange {
             self.adb.jniSet(key: "g_video__vid_gamut_mapping_mode", value: String(value))
             self.adb.settingsPut("tv_picture_advanced_video_color_space", String(value))
             self.adb.settingsPut("tv_picture_video_color_space", String(value))
@@ -904,6 +967,7 @@ final class AppState: ObservableObject {
     /// 那个值来自 JNI 回读，读取偶发失败会把它留在 0，于是每次都算出"要开启"，
     /// 表现就是按了没反应。
     func toggleFreesync() {
+        guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
         guard isConnected else { return log("未连接") }
         runBackground {
             let src = self.adb.settingsGet("mitv.tvplayer.hdmi.last.source")
@@ -917,11 +981,13 @@ final class AppState: ObservableObject {
     }
 
     func setFreesync(_ on: Bool) {
+        guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
         guard isConnected else { return log("未连接") }
         currentValues["freesync"] = on ? "1" : "0"
         log("FreeSync: \(on ? "开" : "关")")
 
-        runBackground {
+        let useMemory = freesyncMemoryEnabled && !memoriesSuspendedByPreset
+        runPictureChange(delay: 1.8) {
             // ── 先读设备真实状态，再决定要不要记录 / 还原 ──
             // 不能用缓存里的 currentValues["freesync"]：它来自 JNI 回读，
             // 而 JNI 读取偶发失败会把缓存留在 0。于是「从关到开才记录」会误判成
@@ -936,7 +1002,7 @@ final class AppState: ObservableObject {
             let wasOn = isDP ? (before == 1) : (before == 3)
 
             var restoreMode: Int? = nil
-            if self.freesyncMemoryEnabled {
+            if useMemory {
                 if on && !wasOn {
                     // 画面模式同样现读，避免缓存过期把游戏模式记成"开启前"
                     let mode = Int(self.adb.settingsGet("picture_mode")
@@ -1454,7 +1520,7 @@ final class AppState: ObservableObject {
             schedulePictureRefreshAfterHdrChange()
         }
 
-        guard hdrMemoryEnabled else { return }
+        guard hdrMemoryEnabled, !memoriesSuspendedByPreset else { return }
         if force || changed {
             applyHdrMemory(state: state)
         }
@@ -1469,7 +1535,7 @@ final class AppState: ObservableObject {
     }
 
     private func applyHdrMemory(state: Bool) {
-        guard isConnected else { return }
+        guard isConnected, !memoriesSuspendedByPreset else { return }
         let bucket = state ? "hdr" : "sdr"
         guard let value = localDimmingMemory()[bucket] else { return }
 
@@ -1480,7 +1546,7 @@ final class AppState: ObservableObject {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             guard Int(raw) != value else { return }
             DispatchQueue.main.async {
-                guard self.isConnected else { return }
+                guard self.isConnected, !self.memoriesSuspendedByPreset else { return }
                 let valueName = ["关", "低", "中", "高"][value]
                 self.log("\(state ? "HDR" : "SDR") 精密控光记忆: \(valueName)")
                 // 原版这里也会弹悬浮提示（_apply_hdr_memory_for_current_state）
@@ -1503,13 +1569,14 @@ final class AppState: ObservableObject {
         updateHdrMemoryStatus()
     }
 
-    private func updateHdrMemoryStatus() {
+    func updateHdrMemoryStatus() {
         let stateText = hdrLastState == nil ? "未知" : (hdrLastState! ? "HDR" : "SDR")
         let m = localDimmingMemory()
         let sdrText = m["sdr"].map { ["关", "低", "中", "高"][$0] } ?? "--"
         let hdrText = m["hdr"].map { ["关", "低", "中", "高"][$0] } ?? "--"
         let sourceText = hdrStateSource.isEmpty ? "" : "（\(hdrStateSource)）"
-        let text = "分区控光记忆：\(hdrMemoryEnabled ? "已开启" : "已关闭")，当前信号：\(stateText)\(sourceText)，记忆模式：SDR=\(sdrText) / HDR=\(hdrText)"
+        let pause = memoriesSuspendedByPreset ? "（预设生效或切换中，已暂停）" : ""
+        let text = "分区控光记忆：\(hdrMemoryEnabled ? "已开启" : "已关闭")\(pause)，当前信号：\(stateText)\(sourceText)，记忆模式：SDR=\(sdrText) / HDR=\(hdrText)"
         // 只在内容真的变了才赋值：@Published 每次赋值都会让整个界面重绘，
         // 而 HDR 状态是 3 秒轮询一次，无脑赋值等于每 3 秒全量重绘一次。
         if hdrMemoryStatusText != text { hdrMemoryStatusText = text }
@@ -1524,10 +1591,11 @@ final class AppState: ObservableObject {
         updateFreesyncMemoryStatus()
     }
 
-    private func updateFreesyncMemoryStatus() {
+    func updateFreesyncMemoryStatus() {
         let saved = UserDefaults.standard.integer(forKey: "freesync_previous_mode")
         let savedText = saved == 0 ? "--" : (RegisterMap.sceneNames[saved] ?? "\(saved)")
-        let text = "模式记忆：\(freesyncMemoryEnabled ? "已开启" : "已关闭")，记录模式：\(savedText)"
+        let pause = memoriesSuspendedByPreset ? "（预设生效或切换中，已暂停）" : ""
+        let text = "模式记忆：\(freesyncMemoryEnabled ? "已开启" : "已关闭")\(pause)，记录模式：\(savedText)"
         if freesyncMemoryStatusText != text { freesyncMemoryStatusText = text }
     }
 
@@ -1686,6 +1754,7 @@ final class AppState: ObservableObject {
 
     /// 从菜单栏选中一个取值
     func applyMenuBarOption(_ id: String, value: Int) {
+        guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
         switch id {
         case "picture_mode":        setMode(value)
         case "local_dimming":       setLocalDimming(value)
@@ -1765,6 +1834,7 @@ final class AppState: ObservableObject {
     }
 
     private func handleHotkeyTrigger(_ id: String) {
+        guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
         if id.hasPrefix("adjust:"), let idx = Int(id.dropFirst("adjust:".count)),
            idx >= 0, idx < adjustHotkeys.count {
             let rule = adjustHotkeys[idx]
@@ -1931,6 +2001,7 @@ final class AppState: ObservableObject {
 
     /// 调整可调参数的统一入口。`absolute` 非空时直接采用该值，否则按 `delta` 加减。
     private func applyAdjustment(param: String, delta: Int, absolute: Int?) {
+        guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
         guard isConnected else { return log("未连接") }
 
         /// 暂存一次调整。与 cycleStep 一致：纯尾部，每次改动都重新开始完整倒计时，

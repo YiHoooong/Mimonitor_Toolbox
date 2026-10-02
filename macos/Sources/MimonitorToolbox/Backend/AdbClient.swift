@@ -1,4 +1,5 @@
 import Foundation
+import MimonitorPresetCore
 
 struct ProcessResult {
     let output: String
@@ -10,7 +11,15 @@ final class AdbClient {
     let adbPath: String
     let serverPort: String
     var ip: String = ""
-    private let jniBatchLock = NSLock()
+    private let channelLock = NSRecursiveLock()
+
+    /// All ADB commands participate, including connection/recovery and JNI batch reads.
+    /// A recursive lock permits a whole preset capture/apply to nest existing helpers.
+    func transaction<T>(_ work: () throws -> T) rethrows -> T {
+        channelLock.lock()
+        defer { channelLock.unlock() }
+        return try work()
+    }
 
     init(adbPath: String = AdbClient.locateAdb(),
          serverPort: String = ProcessInfo.processInfo.environment["MIMONITOR_ADB_SERVER_PORT"] ?? "5038") {
@@ -61,6 +70,8 @@ final class AdbClient {
 
     @discardableResult
     func run(_ args: [String], timeout: TimeInterval = 15) -> ProcessResult {
+        channelLock.lock()
+        defer { channelLock.unlock() }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: adbPath)
         process.arguments = args
@@ -104,6 +115,21 @@ final class AdbClient {
     func shell(_ command: String) -> String {
         run(["-s", serial, "shell", command], timeout: 25)
             .output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    @discardableResult
+    func checkedShell(_ command: String, target: String) throws -> String {
+        guard !target.isEmpty else { throw PresetError("未连接显示器") }
+        let result = run(["-s", target, "shell", command], timeout: 25)
+        let output = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = output.lowercased()
+        guard result.exitCode == 0,
+              !lower.contains("exception"), !lower.contains("error:"),
+              !lower.contains("device offline"), !lower.contains("device not found"),
+              !lower.contains("permission denial"), !lower.contains("permission denied") else {
+            throw PresetError(output.isEmpty ? "ADB 命令失败（\(result.exitCode)）" : output)
+        }
+        return output
     }
 
     @discardableResult
@@ -365,18 +391,16 @@ final class AdbClient {
         shell(buildTvserviceCommand(jar: jar, args: ["MtkDirectTool", "setColorGains", red, green, blue]))
     }
 
-    func jniBatchGet(keys: [String]) -> [String: String] {
+    private func jniBatchCommand(keys: [String]) -> String? {
         let safeKeys = keys.filter { !$0.isEmpty && $0.allSatisfy { $0.isLetter || $0.isNumber || $0 == "_" } }
-        guard !safeKeys.isEmpty else { return [:] }
-        // batchGet 共用设备端的结果文件；两次调用不能交错删除和读取它。
-        jniBatchLock.lock()
-        defer { jniBatchLock.unlock() }
+        guard !safeKeys.isEmpty else { return nil }
         let jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
         let batch = buildTvserviceCommand(jar: jar, args: ["MtkDirectTool", "batchGet"] + safeKeys)
         let resultFile = "/sdcard/Download/Mimonitor_Toolbox/.mtk_batch_result.txt"
-        let cmd = "mkdir -p /sdcard/Download/Mimonitor_Toolbox; rm -f \(resultFile); \(batch) >/dev/null; i=0; while [ $i -lt 30 ] && [ ! -f \(resultFile) ]; do sleep 0.1; i=$((i+1)); done; cat \(resultFile) 2>/dev/null"
-        let out = shell(cmd)
+        return "mkdir -p /sdcard/Download/Mimonitor_Toolbox; rm -f \(resultFile); \(batch) >/dev/null; i=0; while [ $i -lt 30 ] && [ ! -f \(resultFile) ]; do sleep 0.1; i=$((i+1)); done; cat \(resultFile) 2>/dev/null"
+    }
 
+    private func parseJniBatch(_ out: String) -> [String: String] {
         var values: [String: String] = [:]
         for line in out.split(separator: "\n") {
             let t = line.trimmingCharacters(in: .whitespaces)
@@ -387,6 +411,23 @@ final class AdbClient {
             values[key] = raw
         }
         return values
+    }
+
+    func jniBatchGet(keys: [String]) -> [String: String] {
+        transaction {
+            guard let command = jniBatchCommand(keys: keys) else { return [:] }
+            return parseJniBatch(shell(command))
+        }
+    }
+
+    func jniBatchGetChecked(keys: [String], target: String) throws -> [String: String] {
+        try transaction {
+            guard let command = jniBatchCommand(keys: keys) else { return [:] }
+            let values = parseJniBatch(try checkedShell(command, target: target))
+            let missing = keys.filter { Int(values[$0] ?? "") == nil }
+            guard missing.isEmpty else { throw PresetError("JNI 参数读取不完整，保留原数据：\(missing.joined(separator: "、"))") }
+            return values
+        }
     }
 
     func colorfulLed(action: String, args: [String] = []) {

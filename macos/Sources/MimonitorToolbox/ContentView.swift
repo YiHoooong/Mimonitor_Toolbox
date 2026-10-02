@@ -51,6 +51,11 @@ struct ContentView: View {
         .onChange(of: scenePhase) { phase in
             if phase == .active { state.refreshAccessibilityStatus() }
         }
+        .onChange(of: state.requestedPage) { page in
+            guard let page else { return }
+            selection = page
+            state.requestedPage = nil
+        }
         .onChange(of: selection) { page in
             guard let page else { return }
             // 未连接时不允许进入需要连接的页面（对应原版 _on_page_changed 的弹回主页）
@@ -61,6 +66,25 @@ struct ContentView: View {
             }
             state.onPageAppear(page)
         }
+        .overlay {
+            if state.isPresetBusy {
+                ZStack {
+                    Color.black.opacity(0.10)
+                    VStack(spacing: 12) {
+                        ProgressView()
+                        Text(state.presetOperationText).font(.callout)
+                    }
+                    .padding(24)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                }
+            }
+        }
+        .alert("预设与自动任务", isPresented: Binding(
+            get: { state.presetError != nil },
+            set: { if !$0 { state.presetError = nil } }
+        )) {
+            Button("好", role: .cancel) { state.presetError = nil }
+        } message: { Text(state.presetError ?? "") }
     }
 
     @ViewBuilder
@@ -68,6 +92,8 @@ struct ContentView: View {
         switch page {
         case .home: HomeView()
         case .picture: PictureView()
+        case .presets: PresetsView()
+        case .autoTasks: AutomaticTasksView()
         case .game: GameView()
         case .source: SourceView()
         case .light: LightView()
