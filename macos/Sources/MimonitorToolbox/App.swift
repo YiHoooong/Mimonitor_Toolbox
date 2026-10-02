@@ -168,6 +168,7 @@ struct MimonitorToolboxApp: App {
 private struct MenuBarPanel: View {
     @EnvironmentObject var state: AppState
     @Environment(\.openWindow) private var openWindow
+    @State private var contentHeight: CGFloat = 64
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -183,7 +184,7 @@ private struct MenuBarPanel: View {
                 Spacer()
             }
             .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .padding(.vertical, 8)
 
             Divider()
 
@@ -193,10 +194,10 @@ private struct MenuBarPanel: View {
                     .foregroundColor(.secondary)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, 24)
+                    .padding(.vertical, 16)
             } else {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 14) {
+                    VStack(alignment: .leading, spacing: 10) {
                         if !state.presetConfiguration.menuBarPresets.isEmpty {
                             MenuBarPresetPicker()
                         }
@@ -207,9 +208,19 @@ private struct MenuBarPanel: View {
                         }
                     }
                     .padding(.horizontal, 14)
-                    .padding(.vertical, 12)
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background {
+                        GeometryReader { geometry in
+                            Color.clear.preference(key: MenuBarContentHeightKey.self, value: geometry.size.height)
+                        }
+                    }
                 }
-                .frame(maxHeight: 420)
+                .frame(height: MenuBarPanelLayout.scrollHeight(contentHeight: contentHeight))
+                .onPreferenceChange(MenuBarContentHeightKey.self) { height in
+                    let measured = height.rounded(.up)
+                    if measured > 0 && measured != contentHeight { contentHeight = measured }
+                }
             }
 
             Divider()
@@ -233,9 +244,17 @@ private struct MenuBarPanel: View {
             .buttonStyle(.bordered)
             .controlSize(.small)
             .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .padding(.vertical, 8)
         }
         .frame(width: 320)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+private struct MenuBarContentHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }
 
@@ -244,14 +263,9 @@ private struct MenuBarPresetPicker: View {
     @EnvironmentObject var state: AppState
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text("预设模式").font(.callout).foregroundColor(.secondary)
-                Spacer()
-                Text(state.presetConfiguration.applicationIncomplete ? "应用未完成" : state.activePresetName)
-                    .font(.caption).foregroundColor(.secondary).lineLimit(1)
-            }
-            ScrollView(.horizontal, showsIndicators: true) {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("预设模式").font(.callout).foregroundColor(.secondary)
+            ScrollView(.horizontal, showsIndicators: false) {
                 PresetSegmentedControl(
                     presets: state.presetConfiguration.menuBarPresets,
                     selectedID: state.isConnected && !state.presetConfiguration.applicationIncomplete
@@ -266,10 +280,9 @@ private struct MenuBarPresetPicker: View {
                     }
                 )
                 .accessibilityLabel("预设模式")
-                .fixedSize(horizontal: true, vertical: false)
-                .frame(minWidth: 292)
+                .frame(width: MenuBarPanelLayout.presetWidth(count: state.presetConfiguration.menuBarPresets.count), height: 24)
             }
-            .frame(height: 32)
+            .frame(height: 24)
             .disabled(!state.isConnected || state.isPresetOperationInFlight)
         }
     }
@@ -289,9 +302,16 @@ private struct PresetSegmentedControl: NSViewRepresentable {
         let control = NSSegmentedControl()
         control.trackingMode = .selectOne
         control.segmentStyle = .automatic
+        control.segmentDistribution = .fillEqually
+        control.setContentHuggingPriority(.defaultLow, for: .horizontal)
         control.target = context.coordinator
         control.action = #selector(Coordinator.selectSegment(_:))
         return control
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSSegmentedControl, context: Context) -> CGSize? {
+        CGSize(width: proposal.width ?? nsView.intrinsicContentSize.width,
+               height: proposal.height ?? nsView.intrinsicContentSize.height)
     }
 
     func updateNSView(_ control: NSSegmentedControl, context: Context) {
