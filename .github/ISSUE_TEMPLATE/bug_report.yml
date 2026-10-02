@@ -1,0 +1,71 @@
+name: Bug 反馈
+description: 报告使用过程中遇到的错误或异常
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！提交前请先搜索是否已有相同 Issue，并确认使用的是较新的版本。
+        截图和日志可以直接粘贴到下方；公开发布前请隐藏 IP、设备序列号等敏感信息。
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 运行平台
+      options:
+        - Windows
+        - macOS
+        - 其他
+    validations:
+      required: true
+  - type: input
+    id: app-version
+    attributes:
+      label: 应用版本
+      description: 可填写版本号、Release 名称或提交号。
+      placeholder: 例如 v2.8.6
+    validations:
+      required: true
+  - type: input
+    id: os-version
+    attributes:
+      label: 系统版本
+      placeholder: 例如 Windows 11 24H2 / macOS 15.7
+    validations:
+      required: true
+  - type: input
+    id: monitor-version
+    attributes:
+      label: 显示器型号与固件版本
+      description: 可选。设备相关问题请尽量填写；纯界面问题可留空。
+      placeholder: 例如 Redmi G Pro 27U 2026 / HyperOS 3.0.x
+  - type: textarea
+    id: actual-behavior
+    attributes:
+      label: 实际发生了什么？
+      description: 请描述异常现象，以及出现频率。
+      placeholder: 简要描述问题，不要只写“无法使用”。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 如何复现？
+      description: 请从启动程序开始，列出能够重现问题的操作步骤。
+      placeholder: |
+        1. 打开……
+        2. 点击……
+        3. 出现……
+    validations:
+      required: true
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: 期望的结果
+      placeholder: 正常情况下应该发生什么？
+    validations:
+      required: true
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: 截图、日志和其他信息
+      description: 可选。可直接粘贴或拖入截图；日志请只截取相关片段并先脱敏。

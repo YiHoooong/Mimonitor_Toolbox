@@ -1,0 +1,43 @@
+name: 功能建议
+description: 提出新功能或现有功能的改进建议
+title: "[Feature] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢建议！提交前请先搜索是否已有相似 Issue，尽量说明使用场景和要解决的问题。
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 适用平台
+      options:
+        - Windows
+        - macOS
+        - Windows 和 macOS
+        - 不限或不确定
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: 使用场景与问题
+      description: 目前在什么情况下遇到困难？
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 期望的功能
+      description: 描述希望实现的效果；不需要先设计技术实现。
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 已尝试的替代办法
+      description: 可选。如果有临时解决办法，也欢迎说明。
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: 补充信息
+      description: 可选。可附示意图、参考链接或其他背景。
