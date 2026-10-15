@@ -13,9 +13,13 @@ enum ConnectionStatus: Equatable {
 // MARK: - ADB 保活守护（AdbGuardian）
 
 fileprivate enum Guardian {
-    static let package = "com.example.adbguardian"
+    static let package = "com.yihoooong.monitorguardian"
     static let mainActivity = "\(package)/.MainActivity"
     static let accessibility = "\(package)/\(package).AdbGuardianAccessibilityService"
+    /// 旧包名：改包名后两者是不同的应用，旧包不会自动消失，并存会互相干扰。
+    static let legacyPackage = "com.example.adbguardian"
+    static let legacyAccessibility =
+        "\(legacyPackage)/\(legacyPackage).AdbGuardianAccessibilityService"
 }
 
 fileprivate struct GuardianStatus {
@@ -29,14 +33,20 @@ fileprivate struct GuardianStatus {
     let adbd: String
     let mask: String
     let stopped: Bool
+    /// 设备上是否还装着旧包名的版本
+    var legacyInstalled: Bool = false
 
     var ok: Bool {
         installed && !pid.isEmpty && adbEnabled && adbWifiEnabled
             && servicePort == "5555" && persistPort == "5555"
             && adbd == "running" && accessibility && mask == "-134250497" && !stopped
+            && !legacyInstalled
     }
 
     var summary: String {
+        if legacyInstalled {
+            return "状态：⚠️ 检测到旧版本 AdbGuardian，需要升级"
+        }
         if ok { return "状态：✅ 正常（已安装 · 保活运行中 · 端口 5555 · 无障碍已授权）" }
         var parts: [String] = []
         if !installed { parts.append("未安装") }
@@ -100,6 +110,8 @@ final class AppState: ObservableObject {
     // 工具页状态
     @Published var logToFileEnabled = false
     @Published var guardianStatus = "状态：未检测"
+    /// 检测到旧包名时置 true，由 UI 弹确认框；用户确认后调用 migrateGuardian()
+    @Published var guardianMigrationPrompt = false
     @Published var hdrMemoryEnabled = UserDefaults.standard.bool(forKey: "hdr_sdr_local_dimming_enabled")
     /// 显示器当前是否处于 4K UI 模式（由 check4KState 检测得到）
     @Published var is4KUI = false
@@ -1531,8 +1543,68 @@ final class AppState: ObservableObject {
                 self.guardianStatus = s.summary
                 // 把结论一起写进日志：只写"检测完成"的话，导出日志看不到守护到底正不正常
                 self.log("ADB 保活守护检测完成 —— \(s.summary)")
+                if s.legacyInstalled {
+                    self.log("检测到旧版本 AdbGuardian（\(Guardian.legacyPackage)），等待用户确认升级")
+                    self.guardianMigrationPrompt = true
+                }
             }
         }
+    }
+
+    /// 检测到旧包名时询问用户是否立即升级（旧包与新包是不同的应用，不会自动替换）。
+    func migrateGuardian() {
+        guard isConnected else { return log("请先连接显示器") }
+        guard let apk = AdbClient.guardianApkPath() else { log("找不到保活 APK（assets/adb_guardian/adbguardian-signed.apk）"); return }
+        guardianStatus = "状态：正在升级..."
+        log("正在把 ADB 保活守护从旧版本（\(Guardian.legacyPackage)）升级到 \(Guardian.package) ...")
+        runBackground {
+            // 顺序必须是先卸旧再装新：两个 guardian 并存会同时写 ADB 设置、互相干扰。
+            // 卸载只能在桌面端做 —— 应用自身无权卸载其他应用。
+            if self.adb.shell("pm path \(Guardian.legacyPackage) 2>/dev/null").contains("package:") {
+                self.cleanLegacyGuardianAccessibility()
+                self.adb.shell("cmd deviceidle whitelist -\(Guardian.legacyPackage) 2>/dev/null || true")
+                let removed = self.adb.uninstallPackage(Guardian.legacyPackage)
+                if !removed.contains("Success") {
+                    DispatchQueue.main.async {
+                        self.guardianStatus = "状态：升级失败"
+                        self.log("卸载旧版本失败: \(removed.trimmingCharacters(in: .whitespacesAndNewlines))")
+                    }
+                    return
+                }
+                DispatchQueue.main.async { self.log("已卸载旧版本 \(Guardian.legacyPackage)") }
+            }
+            let r = self.adb.installApk(apk)
+            if r.contains("Success") {
+                self.adb.shell("pm grant \(Guardian.package) android.permission.WRITE_SECURE_SETTINGS 2>/dev/null || true")
+                self.adb.shell("cmd deviceidle whitelist +\(Guardian.package) 2>/dev/null || true")
+                self.enableGuardianAccessibility()
+                self.startGuardianCommands()
+                Thread.sleep(forTimeInterval: 3)
+                _ = self.adb.reconnect()
+                let s = self.readGuardianStatus()
+                DispatchQueue.main.async {
+                    self.guardianStatus = s.summary
+                    self.log("ADB 保活守护升级完成")
+                }
+            } else {
+                DispatchQueue.main.async {
+                    self.guardianStatus = "状态：升级失败"
+                    self.log("ADB 保活守护升级失败: \(r.trimmingCharacters(in: .whitespacesAndNewlines))")
+                }
+            }
+        }
+    }
+
+    /// 摘掉旧包在无障碍列表里的条目。实测旧包会同时留短形式与全形式，按包名前缀整体过滤。
+    private func cleanLegacyGuardianAccessibility() {
+        let current = adb.shell("settings get secure enabled_accessibility_services 2>/dev/null")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !current.isEmpty, current != "null" else { return }
+        let kept = current.split(separator: ":").map(String.init)
+            .filter { !$0.hasPrefix("\(Guardian.legacyPackage)/") }
+        guard kept.count != current.split(separator: ":").count else { return }
+        adb.shell("settings put secure enabled_accessibility_services '\(kept.joined(separator: ":"))'")
+        log("已清理旧包的辅助功能条目（\(Guardian.legacyPackage)）")
     }
 
     func deployGuardian() {
@@ -1541,6 +1613,13 @@ final class AppState: ObservableObject {
         guardianStatus = "状态：正在部署/修复..."
         log("正在部署 ADB 保活守护...")
         runBackground {
+            // 手动点「部署/修复」时也顺手清掉旧包，避免留下两个守护
+            if self.adb.shell("pm path \(Guardian.legacyPackage) 2>/dev/null").contains("package:") {
+                DispatchQueue.main.async { self.log("检测到旧版本 \(Guardian.legacyPackage)，先清理再部署") }
+                self.cleanLegacyGuardianAccessibility()
+                self.adb.shell("cmd deviceidle whitelist -\(Guardian.legacyPackage) 2>/dev/null || true")
+                _ = self.adb.uninstallPackage(Guardian.legacyPackage)
+            }
             let r = self.adb.installApk(apk)
             if r.contains("Success") {
                 self.adb.shell("pm grant \(Guardian.package) android.permission.WRITE_SECURE_SETTINGS 2>/dev/null || true")
@@ -1618,6 +1697,8 @@ final class AppState: ObservableObject {
         let adbd = adb.shell("getprop init.svc.adbd 2>/dev/null")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let stopped = adb.shell("dumpsys package \(Guardian.package) 2>/dev/null | grep stopped=true | head -n 1").isEmpty == false
+        let legacyPath = adb.shell("pm path \(Guardian.legacyPackage) 2>/dev/null")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         return GuardianStatus(
             installed: !path.isEmpty && path.hasPrefix("package:"),
             pid: pid,
@@ -1628,7 +1709,8 @@ final class AppState: ObservableObject {
             persistPort: persistPort,
             adbd: adbd,
             mask: mask,
-            stopped: stopped
+            stopped: stopped,
+            legacyInstalled: legacyPath.hasPrefix("package:")
         )
     }
 

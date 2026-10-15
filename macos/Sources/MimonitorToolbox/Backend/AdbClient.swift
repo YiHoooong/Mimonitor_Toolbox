@@ -262,6 +262,12 @@ final class AdbClient {
         run(["-s", serial, "install", "-r", "-d", path], timeout: 120).output
     }
 
+    /// 卸载指定包，返回 adb 原始输出（成功时包含 "Success"）。
+    /// 改包名后清理旧版本用：应用自身无权卸载别的应用，只能由桌面端执行。
+    func uninstallPackage(_ package: String) -> String {
+        run(["-s", serial, "uninstall", package], timeout: 120).output
+    }
+
     func deviceState() -> String {
         guard !ip.isEmpty else { return "unknown" }
         return run(["-s", serial, "get-state"], timeout: 3)

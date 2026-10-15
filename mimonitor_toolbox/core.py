@@ -201,9 +201,17 @@ def cleanup_stale_extract_dirs(temp_dir=None):
             except OSError:
                 continue  # DLL 被运行中的实例加载锁定
             shutil.rmtree(path, ignore_errors=True)
-GUARDIAN_PACKAGE = "com.example.adbguardian"
+GUARDIAN_ACCESSIBILITY_CLASS = "AdbGuardianAccessibilityService"
+GUARDIAN_PACKAGE = "com.yihoooong.monitorguardian"
 GUARDIAN_MAIN_ACTIVITY = f"{GUARDIAN_PACKAGE}/.MainActivity"
 GUARDIAN_ACCESSIBILITY = f"{GUARDIAN_PACKAGE}/{GUARDIAN_PACKAGE}.AdbGuardianAccessibilityService"
+# Android 里改包名等于换了一个新应用：旧包不会自动升级也不会消失。两者并存会
+# 同时写 adb_enabled / persist.appcontrol_w_mask、都可能 ctl.restart adbd，互相
+# 打架。所以检测到旧包时提示用户，确认后先清掉旧包再部署新包。
+GUARDIAN_LEGACY_PACKAGE = "com.example.adbguardian"
+GUARDIAN_LEGACY_ACCESSIBILITY = (
+    f"{GUARDIAN_LEGACY_PACKAGE}/{GUARDIAN_LEGACY_PACKAGE}.AdbGuardianAccessibilityService"
+)
 GUARDIAN_APK_NAME = "adbguardian-signed.apk"
 MTK_DIRECT_TOOL_NAME = "MtkDirectTool.jar"
 COLORFUL_LED_TOOL_NAME = "ColorfulLedTool.jar"
@@ -337,6 +345,26 @@ def is_hdr_tone_mapping_picture_mode(mode):
 
 def get_guardian_apk_path():
     return bundled_resource_path("assets", "adb_guardian", GUARDIAN_APK_NAME) or os.path.join(get_app_base_dir(), "assets", "adb_guardian", GUARDIAN_APK_NAME)
+
+def _guardian_accessibility_aliases(package):
+    """同一个组件在设备上可能以短形式（pkg/.Class）或全形式（pkg/pkg.Class）存在。
+
+    实测旧包在 ``enabled_accessibility_services`` 里同时留了这两种写法，所以清理
+    时要按包名整体过滤，不能只删一条。
+    """
+    return (f"{package}/.{GUARDIAN_ACCESSIBILITY_CLASS}",
+            f"{package}/{package}.{GUARDIAN_ACCESSIBILITY_CLASS}")
+
+def strip_guardian_package_from_accessibility(services, package):
+    """从 accessibility 列表里剔除某个包的条目，返回 ``(新列表, 是否发生变化)``。"""
+    if not services or services == "null":
+        return services, False
+    entries = [e for e in services.split(":") if e]
+    kept = [e for e in entries if not e.startswith(f"{package}/")]
+    if len(kept) == len(entries):
+        return services, False
+    return ":".join(kept), True
+
 
 def get_mtk_direct_tool_path():
     return bundled_resource_path("assets", "runtime", MTK_DIRECT_TOOL_NAME)

@@ -238,6 +238,11 @@ struct ToolsView: View {
                  ? "将设置 wm size 3840x2160 / density 640 并重启显示器。"
                  : "将恢复 wm size 1920x1080 / density 320 并重启显示器。")
         }
+        .alert("升级 ADB 保活守护", isPresented: $state.guardianMigrationPrompt) {
+            Button("立即升级") { state.migrateGuardian() }
+        } message: {
+            Text("检测到旧版本的 AdbGuardian，需要卸载后重新部署。\n\n升级过程会重启显示器的 ADB 连接，约 10 秒。")
+        }
         .fileImporter(isPresented: $showApkImporter,
                       allowedContentTypes: [UTType(filenameExtension: "apk") ?? .item]) { result in
             if case .success(let url) = result {

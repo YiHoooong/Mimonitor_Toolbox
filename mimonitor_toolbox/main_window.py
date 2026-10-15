@@ -85,6 +85,7 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
     message_signal = pyqtSignal(str, str, str) # type, title, text
     apk_install_finished = pyqtSignal(bool, str, str)
     guardian_status_signal = pyqtSignal(dict)
+    guardian_migration_prompt_signal = pyqtSignal()
     auto_scan_signal = pyqtSignal()
     page_refresh_finished = pyqtSignal(str, bool)
     adb_action_finished = pyqtSignal(object, bool, str)
@@ -128,6 +129,7 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
         self.message_signal.connect(self._show_message_box)
         self.apk_install_finished.connect(self._on_apk_install_finished)
         self.guardian_status_signal.connect(self._apply_guardian_status)
+        self.guardian_migration_prompt_signal.connect(self._prompt_guardian_migration)
         self.auto_scan_signal.connect(lambda: self.scan_net(auto=True))
         self.page_refresh_finished.connect(self._finish_page_refresh)
         self.adb_action_finished.connect(self._finish_adb_action)
@@ -815,8 +817,39 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
 
     def _show_message_box(self, mtype, title, text):
         w = MessageBox(title, text, self)
+        w.yesButton.setText("知道了")
+        w.cancelButton.hide()
         w.exec()
         w.deleteLater()
+
+    def _prompt_guardian_migration(self):
+        """检测到旧包名时提示升级。
+
+        旧包（``GUARDIAN_LEGACY_PACKAGE``）与新包是两个不同的应用，不会自动互相
+        替换；两者并存会同时写 ADB 相关设置、都可能重启 adbd，所以由桌面端卸载旧
+        包并重新部署。
+
+        这里是**单按钮提示而非询问**：卸载旧包是升级的必经步骤，用户没有第二个
+        选择，"取消"只会留下一个持续干扰新版本的旧守护。所以隐藏 cancelButton，
+        点掉即开始升级。
+        """
+        if getattr(self, "_guardian_migration_dialog_open", False):
+            return
+        self._guardian_migration_dialog_open = True
+        try:
+            box = MessageBox(
+                "升级 ADB 保活守护",
+                "检测到旧版本的 AdbGuardian，需要卸载后重新部署。\n\n"
+                "升级过程会重启显示器的 ADB 连接，约 10 秒。",
+                self,
+            )
+            box.yesButton.setText("立即升级")
+            box.cancelButton.hide()
+            box.exec()
+            box.deleteLater()
+        finally:
+            self._guardian_migration_dialog_open = False
+        self._migrate_guardian()
 
 
     def log(self, m):

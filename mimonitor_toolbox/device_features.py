@@ -30,12 +30,14 @@ from .adb import (
 from .core import (
     GAME_FEATURE_KEYS,
     GUARDIAN_ACCESSIBILITY,
+    GUARDIAN_LEGACY_PACKAGE,
     GUARDIAN_MAIN_ACTIVITY,
     GUARDIAN_PACKAGE,
     HDR_TONE_MAPPING_MTK_TO_UI,
     MTK_TO_XIAOMI_COLOR_TEMP,
     get_guardian_apk_path,
     load_settings,
+    strip_guardian_package_from_accessibility,
     update_settings,
 )
 from .network_scan import (
@@ -1115,6 +1117,7 @@ class DeviceFeaturesMixin:
         with self.adb.transaction():
             services = self._guardian_shell("settings get secure enabled_accessibility_services 2>/dev/null")
             user_state = self._guardian_shell(f'dumpsys package {GUARDIAN_PACKAGE} 2>/dev/null | grep "User 0:" | head -n 1')
+            legacy_path = self._guardian_shell(f"pm path {GUARDIAN_LEGACY_PACKAGE} 2>/dev/null")
             status = {
                 "installed": bool(self._guardian_shell(f"pm path {GUARDIAN_PACKAGE} 2>/dev/null")),
                 "pid": self._guardian_shell(f"pidof {GUARDIAN_PACKAGE} 2>/dev/null || true"),
@@ -1126,13 +1129,15 @@ class DeviceFeaturesMixin:
                 "adbd": self._guardian_shell("getprop init.svc.adbd"),
                 "accessibility": GUARDIAN_ACCESSIBILITY in services,
                 "stopped": "stopped=false" in user_state,
+                "legacy_installed": "package:" in legacy_path,
             }
         status["ok"] = (
             status["installed"] and status["pid"] and
             status["adb_enabled"] == "1" and status["adb_wifi_enabled"] == "1" and
             status["service_port"] == "5555" and status["persist_port"] == "5555" and
             status["adbd"] == "running" and status["accessibility"] and
-            status["mask"] == "-134250497" and status["stopped"]
+            status["mask"] == "-134250497" and status["stopped"] and
+            not status["legacy_installed"]
         )
         return status
 
@@ -1157,7 +1162,12 @@ class DeviceFeaturesMixin:
             label.setStyleSheet("color: #d89614; font-size: 13px;")
             return
 
-        if status.get("ok"):
+        if status.get("legacy_installed"):
+            # 旧包还在时先报"需要升级"，不要显示成"正常运行"——两个 guardian 并存
+            # 会互相打架，而新包是否健康在这一刻并不重要。
+            text = "状态：检测到旧版本 AdbGuardian，需要升级"
+            color = "#d89614"
+        elif status.get("ok"):
             text = "状态：正常运行，ADB 保活已启用"
             color = "#20c46b"
         elif not status.get("installed"):
@@ -1190,11 +1200,27 @@ class DeviceFeaturesMixin:
                 status = self._read_guardian_status()
                 self.guardian_status_signal.emit(status)
                 self.log("ADB 保活守护状态检测完成")
+                if status.get("legacy_installed"):
+                    self.log(f"检测到旧版本 AdbGuardian（{GUARDIAN_LEGACY_PACKAGE}），等待用户确认升级")
+                    self.guardian_migration_prompt_signal.emit()
             except Exception as e:
                 self.guardian_status_signal.emit({"error": str(e)})
                 self.log(f"ADB 保活守护状态检测失败: {e}")
 
         async_run(do)
+
+    def _clean_legacy_guardian_accessibility(self):
+        """摘掉旧包在 accessibility 列表里的条目（短形式与全形式都要清）。
+
+        必须在卸载旧包之前做：卸载后残留条目仍留在列表里，会指向一个不存在的
+        组件。用包名前缀整体过滤，比逐条匹配更稳。
+        """
+        current = self._guardian_shell("settings get secure enabled_accessibility_services 2>/dev/null")
+        updated, changed = strip_guardian_package_from_accessibility(current, GUARDIAN_LEGACY_PACKAGE)
+        if changed:
+            self.adb.shell(f"settings put secure enabled_accessibility_services '{updated}'")
+            self.log(f"已清理旧包的辅助功能条目（{GUARDIAN_LEGACY_PACKAGE}）")
+        return changed
 
     def _enable_guardian_accessibility(self):
         with self.adb.transaction():
@@ -1231,6 +1257,62 @@ class DeviceFeaturesMixin:
 
         async_run(do)
 
+    def _guardian_install_and_configure(self, apk_path):
+        """安装/覆盖安装 APK 并完成授权、白名单、辅助功能、启动。"""
+        serial = format_adb_serial(self.adb.ip)
+        r = adb_run(["-s", serial, "install", "-r", "-d", apk_path], timeout=90)
+        if "Success" not in r:
+            raise RuntimeError(r or "adb install 没有返回成功")
+        self.adb.shell(f"pm grant {GUARDIAN_PACKAGE} android.permission.WRITE_SECURE_SETTINGS 2>/dev/null || true")
+        self.adb.shell(f"cmd deviceidle whitelist +{GUARDIAN_PACKAGE} 2>/dev/null || true")
+        self._enable_guardian_accessibility()
+        self._start_guardian_commands()
+
+    def _migrate_guardian(self):
+        """从旧包名迁移到新包名。
+
+        Android 里改包名等于换了一个新应用，旧包不会自动消失，两个 guardian
+        并存会互相干扰，所以顺序是「先卸旧、再装新」。卸载只能在这里做——应用
+        自身无权卸载别的应用（需要用户弹窗确认），而桌面端有 adb 权限。
+        """
+        if not self.check_connection():
+            return
+        apk_path = get_guardian_apk_path()
+        if not os.path.exists(apk_path):
+            self._show_message_box("error", "缺少 APK", f"找不到保活 APK：{apk_path}")
+            return
+        self.guardian_status_signal.emit({"deploying": True})
+        self.log(f"正在把 ADB 保活守护从 {GUARDIAN_LEGACY_PACKAGE} 升级到 {GUARDIAN_PACKAGE} ...")
+
+        def do():
+            try:
+                with self.adb.transaction():
+                    legacy = self._guardian_shell(f"pm path {GUARDIAN_LEGACY_PACKAGE} 2>/dev/null")
+                    if "package:" in legacy:
+                        self._clean_legacy_guardian_accessibility()
+                        self.adb.shell(f"cmd deviceidle whitelist -{GUARDIAN_LEGACY_PACKAGE} 2>/dev/null || true")
+                        removed = adb_run(["-s", format_adb_serial(self.adb.ip),
+                                           "uninstall", GUARDIAN_LEGACY_PACKAGE], timeout=90)
+                        if "Success" not in removed:
+                            raise RuntimeError(removed or f"卸载 {GUARDIAN_LEGACY_PACKAGE} 失败")
+                        self.log(f"已卸载旧版本 {GUARDIAN_LEGACY_PACKAGE}")
+                    self._guardian_install_and_configure(apk_path)
+                    time.sleep(3)
+                    self.adb.reconnect()
+                    status = self._read_guardian_status()
+                self.guardian_status_signal.emit(status)
+                if status.get("ok"):
+                    self.message_signal.emit("info", "升级完成", "ADB 保活守护已升级并正常运行。")
+                else:
+                    self.message_signal.emit("warn", "升级完成", "新版本已部署，部分状态需要复检。")
+                self.log("ADB 保活守护升级完成")
+            except Exception as e:
+                self.guardian_status_signal.emit({"error": str(e)})
+                self.message_signal.emit("error", "升级失败", f"ADB 保活守护升级失败: {e}")
+                self.log(f"ADB 保活守护升级失败: {e}")
+
+        async_run(do)
+
     def _deploy_guardian(self):
         if not self.check_connection():
             return
@@ -1244,14 +1326,14 @@ class DeviceFeaturesMixin:
         def do():
             try:
                 with self.adb.transaction():
-                    serial = format_adb_serial(self.adb.ip)
-                    r = adb_run(["-s", serial, "install", "-r", "-d", apk_path], timeout=90)
-                    if "Success" not in r:
-                        raise RuntimeError(r or "adb install 没有返回成功")
-                    self.adb.shell(f"pm grant {GUARDIAN_PACKAGE} android.permission.WRITE_SECURE_SETTINGS 2>/dev/null || true")
-                    self.adb.shell(f"cmd deviceidle whitelist +{GUARDIAN_PACKAGE} 2>/dev/null || true")
-                    self._enable_guardian_accessibility()
-                    self._start_guardian_commands()
+                    # 手动点「部署/修复」时也要顺手清掉旧包，否则会留下两个守护。
+                    if "package:" in self._guardian_shell(f"pm path {GUARDIAN_LEGACY_PACKAGE} 2>/dev/null"):
+                        self.log(f"检测到旧版本 {GUARDIAN_LEGACY_PACKAGE}，先清理再部署")
+                        self._clean_legacy_guardian_accessibility()
+                        self.adb.shell(f"cmd deviceidle whitelist -{GUARDIAN_LEGACY_PACKAGE} 2>/dev/null || true")
+                        adb_run(["-s", format_adb_serial(self.adb.ip),
+                                 "uninstall", GUARDIAN_LEGACY_PACKAGE], timeout=90)
+                    self._guardian_install_and_configure(apk_path)
                     time.sleep(3)
                     self.adb.reconnect()
                     status = self._read_guardian_status()
