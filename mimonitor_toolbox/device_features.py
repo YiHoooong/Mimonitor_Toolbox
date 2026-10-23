@@ -33,6 +33,7 @@ from .core import (
     GUARDIAN_MAIN_ACTIVITY,
     GUARDIAN_PACKAGE,
     HDR_TONE_MAPPING_MTK_TO_UI,
+    INPUT_SOURCE_OPTIONS,
     MTK_TO_XIAOMI_COLOR_TEMP,
     get_guardian_apk_path,
     load_settings,
@@ -184,10 +185,13 @@ class DeviceFeaturesMixin:
     def initialize_device_features(self):
         """初始化设备连接、扫描和页面加载所需的共享状态。"""
         self.adb = Adb("")
+        # 读回来的值有时是字符串（"23"），两形态都要能对上名字
         self._source_names = {
-            23: "HDMI 1", 24: "HDMI 2", 29: "DP", 30: "USBC",
-            "23": "HDMI 1", "24": "HDMI 2", "29": "DP", "30": "USBC",
+            value: name for value, name in INPUT_SOURCE_OPTIONS
         }
+        self._source_names.update(
+            {str(value): name for value, name in INPUT_SOURCE_OPTIONS}
+        )
         self.source_var_text = "未知"
         self._page_loaded = set()
         self._page_loading = set()

@@ -217,6 +217,19 @@ HOTKEY_MODIFIERS = ["无", "Ctrl + Alt", "Ctrl + Shift", "Alt + Shift", "Win + S
 HOTKEY_KEYS = ["无"] + [f"F{i}" for i in range(1, 13)] + [str(i) for i in range(0, 10)] + list("ABCDEFGHIJKLMNOPQRSTUVWXYZ") + ["+", "-", "PageUp", "PageDown", "↑", "↓", "←", "→"]
 HOTKEY_EXTRA_VK = {"+": 0xBB, "-": 0xBD, "PageUp": 0x21, "PageDown": 0x22, "↑": 0x26, "↓": 0x28, "←": 0x25, "→": 0x27}
 LOCAL_DIMMING_NAMES = {0: "关", 1: "低", 2: "中", 3: "高"}
+# 信号源的唯一来源：页面按钮、循环快捷键、直切快捷键、托盘菜单都从这里取，
+# 加接口只改这一处。
+INPUT_SOURCE_SETTING_KEY = "mitv.tvplayer.hdmi.last.source"
+INPUT_SOURCE_OPTIONS = [(23, "HDMI 1"), (24, "HDMI 2"), (29, "DP"), (30, "USBC")]
+INPUT_SOURCE_NAMES = {value: name for value, name in INPUT_SOURCE_OPTIONS}
+# 直切信号源的快捷键动作：动作 id -> 目标值。与「循环切换」不同，这些是直接
+# 跳到指定接口，不按顺序往前推。
+INPUT_SOURCE_DIRECT_ACTIONS = {
+    "input_source_hdmi1": 23,
+    "input_source_hdmi2": 24,
+    "input_source_dp": 29,
+    "input_source_usbc": 30,
+}
 ADJUSTABLE_HOTKEY_PARAMS = {
     "backlight": {
         "label": "背光", "setting": "picture_backlight", "settings": ["picture_backlight", "xiaomi_picture_backlight"],

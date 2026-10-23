@@ -376,6 +376,83 @@ class HotkeyCountdownTests(unittest.TestCase):
         self.assertEqual(stage.call_args.args[2], 55, "50 + 5")
 
 
+class DirectSourceHotkeyTests(unittest.TestCase):
+    """直切信号源快捷键：一键跳到指定接口，而不是一路循环过去。"""
+
+    def _host(self, current=23, osd=None):
+        from PyQt6.QtCore import QObject
+
+        from mimonitor_toolbox.display_features import DisplayFeaturesMixin
+
+        class Host(DisplayFeaturesMixin, QObject):
+            def __init__(self):
+                super().__init__()
+                self.current_vals = {"mitv.tvplayer.hdmi.last.source": current}
+                self._cycle_hotkey_pending = {}
+                self._cycle_hotkey_timers = {}
+                self._control_rollback_values = {}
+                self.adb_connected = True
+                self.osd = osd
+                self.values_signal = mock.Mock()
+
+            def log(self, message):
+                pass
+
+            def _highlight_mode(self, _value):
+                pass
+
+        return Host()
+
+    def test_direct_action_targets_the_named_source(self):
+        from mimonitor_toolbox import display_features
+
+        osd = mock.Mock()
+        host = self._host(osd=osd)
+        settings = {"hotkey_countdown_enabled": False}
+
+        with mock.patch.object(display_features, "load_settings", side_effect=lambda: dict(settings)), \
+                mock.patch.object(host, "_set") as set_call:
+            host.trigger_hotkey_action("input_source_dp")
+
+        set_call.assert_called_once_with(
+            "mitv.tvplayer.hdmi.last.source", 29, "信号源: DP"
+        )
+        osd.show_hud.assert_called_once_with("信号源", "DP", countdown=None)
+
+    def test_direct_action_does_not_advance_on_repeat(self):
+        """连按同一个直切键仍是同一个目标 —— 推进是循环键的事。"""
+        from mimonitor_toolbox import display_features
+
+        host = self._host()
+        settings = {"hotkey_countdown_enabled": True, "hotkey_countdown_seconds": 0.8}
+
+        with mock.patch.object(display_features, "load_settings", side_effect=lambda: dict(settings)), \
+                mock.patch.object(host, "_set") as set_call:
+            host.trigger_hotkey_action("input_source_usbc")
+            host.trigger_hotkey_action("input_source_usbc")
+            self.assertEqual(host._cycle_hotkey_pending["input_source_usbc"]["value"], 30)
+            host._commit_cycle_hotkey_action("input_source_usbc")
+
+        set_call.assert_called_once_with(
+            "mitv.tvplayer.hdmi.last.source", 30, "信号源: USBC"
+        )
+
+    def test_cycle_action_still_advances(self):
+        """回归：加了直切之后，循环键仍然是「当前值 → 下一个」。"""
+        from mimonitor_toolbox import display_features
+
+        host = self._host(current=23)
+        settings = {"hotkey_countdown_enabled": False}
+
+        with mock.patch.object(display_features, "load_settings", side_effect=lambda: dict(settings)), \
+                mock.patch.object(host, "_set") as set_call:
+            host.trigger_hotkey_action("input_source_cycle")
+
+        set_call.assert_called_once_with(
+            "mitv.tvplayer.hdmi.last.source", 24, "信号源: HDMI 2"
+        )
+
+
 class PresetOrchestrationTests(unittest.TestCase):
     """预设的应用 / 恢复 / 自动任务调度。
 

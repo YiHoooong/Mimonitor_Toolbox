@@ -54,6 +54,10 @@ from .core import (
     ADJUSTABLE_HOTKEY_PARAMS,
     HOTKEY_KEYS,
     HOTKEY_MODIFIERS,
+    INPUT_SOURCE_DIRECT_ACTIONS,
+    INPUT_SOURCE_NAMES,
+    INPUT_SOURCE_OPTIONS,
+    INPUT_SOURCE_SETTING_KEY,
     bundled_resource_path,
     load_settings,
     update_settings,
@@ -491,16 +495,16 @@ class PagesMixin:
         btn_layout.setSpacing(12)
         btn_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        if "mitv.tvplayer.hdmi.last.source" not in self.state_buttons:
-            self.state_buttons["mitv.tvplayer.hdmi.last.source"] = {}
+        if INPUT_SOURCE_SETTING_KEY not in self.state_buttons:
+            self.state_buttons[INPUT_SOURCE_SETTING_KEY] = {}
 
-        for v, n in [(23, "HDMI 1"), (24, "HDMI 2"), (29, "DP"), (30, "USBC")]:
+        for v, n in INPUT_SOURCE_OPTIONS:
             b = ToggleButton(n, card)
             b.setCheckable(True)
             b.setFixedSize(120, 45)
-            b.clicked.connect(lambda checked=False, val=v, name=n: self._set("mitv.tvplayer.hdmi.last.source", val, name))
+            b.clicked.connect(lambda checked=False, val=v, name=n: self._switch_input_source(val, name))
             btn_layout.addWidget(b)
-            self.state_buttons["mitv.tvplayer.hdmi.last.source"][v] = b
+            self.state_buttons[INPUT_SOURCE_SETTING_KEY][v] = b
 
         card_layout.addLayout(btn_layout)
         layout.addWidget(card)
@@ -1551,6 +1555,12 @@ class PagesMixin:
             ("freesync_toggle", "FreeSync 开关切换"),
             ("input_source_cycle", "信号源 循环切换")
         ]
+
+        # 直切信号源：一键跳到指定接口，不用一路循环过去
+        for act_id, src_val in INPUT_SOURCE_DIRECT_ACTIONS.items():
+            actions_list.append(
+                (act_id, f"信号源 切到 {INPUT_SOURCE_NAMES.get(src_val, src_val)}")
+            )
         
         def add_hotkey_row(row_layout_parent, label_text, action_name):
             row_layout = QHBoxLayout()
