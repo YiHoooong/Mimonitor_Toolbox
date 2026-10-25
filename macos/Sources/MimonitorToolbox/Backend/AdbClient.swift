@@ -249,6 +249,11 @@ final class AdbClient {
         process.arguments = args
         var env = ProcessInfo.processInfo.environment
         env["ANDROID_ADB_SERVER_PORT"] = serverPort
+        // 内嵌的 platform-tools 37.x 在 macOS 26 上 mDNS zero-config 会偶发 panic
+        // （SIGABRT，crash 栈是 libadbmdns_zero_config_driver → FQServiceName::try_from），
+        // 直接把 adb server 带走：表现为 install 只回一句空错误、保活守护部署失败。
+        // 本 App 全程按 IP:5555 连接，不需要 mDNS 发现，关掉即可；外部显式设置优先。
+        if env["ADB_MDNS"] == nil { env["ADB_MDNS"] = "0" }
         process.environment = env
 
         let stdout = Pipe()
