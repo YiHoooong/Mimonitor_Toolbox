@@ -86,6 +86,10 @@ def get_adb_path():
 
 ADB = get_adb_path()
 ADB_SERVER_PORT = os.environ.get("MIMONITOR_ADB_SERVER_PORT", "5038")
+# 内嵌 platform-tools 37.x 的 mDNS zero-config 在 macOS 26 上会偶发 panic，
+# adb server 被 SIGABRT 带走后 install 只返回空错误（保活守护部署失败）。
+# 本工具全程按 IP:5555 直连，不需要 mDNS 发现；外部显式设置优先。
+os.environ.setdefault("ADB_MDNS", "0")
 ADB_DEVICE_PORT = 5555
 ADB_DISCONNECTED_MARKERS = (
     "offline", "unauthorized", "no devices", "not found",
