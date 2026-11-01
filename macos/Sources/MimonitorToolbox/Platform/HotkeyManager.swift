@@ -157,6 +157,17 @@ final class HotkeyManager {
         let id: String
         let modifiers: CGEventFlags
         let keyCode: CGKeyCode
+        /// 「功能键当标准功能键」时的媒体键兜底绑定。按住 fn 时这类绑定必须让路，
+        /// 否则 fn+F10 会被当成静音键、fn+F1 会被当成调暗键。
+        let isMediaFallback: Bool
+
+        init(id: String, modifiers: CGEventFlags, keyCode: CGKeyCode,
+             isMediaFallback: Bool = false) {
+            self.id = id
+            self.modifiers = modifiers
+            self.keyCode = keyCode
+            self.isMediaFallback = isMediaFallback
+        }
     }
 
     /// 亮度调节键绑定。这类键不在普通 keyDown 的常见键码表里，单独存一份，
@@ -215,6 +226,16 @@ final class HotkeyManager {
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
 
+    /// 物理 fn 键是否按下。
+    ///
+    /// **不能用事件自带的 `.maskSecondaryFn` 判断**：macOS 会给所有功能键的
+    /// keyDown 都带上这一位，即使没按 fn（实测 F10 的 flags 是 0x20800000 / 0x800100，
+    /// 两种都带 fn）。只有 `CGEventSource.flagsState` 才反映真实的修饰键状态，
+    /// 不会带这个“幽灵”位。
+    var isFunctionKeyDown: Bool {
+        CGEventSource.flagsState(.combinedSessionState).contains(.maskSecondaryFn)
+    }
+
     /// 触发回调：参数为绑定 id（cycle 用 action 名，adjust 用 "adjust:<index>"）。
     var onTrigger: ((String) -> Void)?
 
@@ -252,11 +273,12 @@ final class HotkeyManager {
         mediaBindings.append(MediaBinding(id: id, keyType: keyType))
     }
 
-    /// 注册一个不带修饰键的普通按键。给硬件亮度键做兼容：
-    /// 系统若把 F1/F2 当标准功能键，就只会发 keyDown，不会发 NX_SYSDEFINED。
+    /// 注册一个不带修饰键的普通按键。给硬件亮度/音量键做兼容：
+    /// 系统若把 F1/F2、F10~F12 当标准功能键，就只会发 keyDown，不会发 NX_SYSDEFINED。
     func registerRaw(id: String, keyCode: CGKeyCode) {
         bindings.removeAll { $0.id == id }
-        bindings.append(Binding(id: id, modifiers: [], keyCode: keyCode))
+        bindings.append(Binding(id: id, modifiers: [], keyCode: keyCode,
+                                isMediaFallback: true))
     }
 
     func clear() {
@@ -294,13 +316,15 @@ final class HotkeyManager {
                 if type == .keyDown {
                     manager.receivedKeyEvents += 1
                     manager.onKeyEvent?(event)
-                    // 亮度调节键若以普通 keyDown 到达（keyCode 144/145），先拦下并吞掉，
-                    // 否则内置屏会跟着变亮度。
-                    if manager.handleMediaKeyDown(event) { return nil }
-                    manager.handle(event)
+                    // fn 组合键是标准功能键（fn+F10 就是 F10），不能按媒体键处理。
+                    let functionKeyDown = manager.isFunctionKeyDown
+                    // 媒体键若以普通 keyDown 到达（keyCode 72/73/74、144/145），先拦下并吞掉，
+                    // 否则内置屏/系统音量会跟着变。
+                    if manager.handleMediaKeyDown(event, functionKeyDown: functionKeyDown) { return nil }
+                    manager.handle(event, functionKeyDown: functionKeyDown)
                 } else if type.rawValue == nxSystemDefinedEventType {
-                    // 命中我们注册的亮度键就吞掉（返回 nil），内置屏幕不再改亮度。
-                    if manager.handleSystemDefined(event) { return nil }
+                    // 命中我们注册的媒体键就吞掉（返回 nil）；按住 fn 时原样放行。
+                    if manager.handleSystemDefined(event, functionKeyDown: manager.isFunctionKeyDown) { return nil }
                 }
                 return Unmanaged.passUnretained(event)
             },
@@ -331,10 +355,14 @@ final class HotkeyManager {
         eventTap = nil
     }
 
-    private func handle(_ event: CGEvent) {
+    /// `functionKeyDown` 必须来自 `isFunctionKeyDown`（flagsState），不能看事件 flags：
+    /// 功能键 keyDown 自带 `.maskSecondaryFn`，直接看会误判。
+    func handle(_ event: CGEvent, functionKeyDown: Bool) {
         let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
         let flags = event.flags.intersection(Self.combinedMask)
         for binding in bindings where binding.keyCode == keyCode {
+            // 按住 fn 时 F1/F2、F10~F12 是标准功能键，不能触发媒体键兜底。
+            if functionKeyDown && binding.isMediaFallback { continue }
             let expected = binding.modifiers.intersection(Self.combinedMask)
             if expected == flags {
                 onTrigger?(binding.id)
@@ -346,10 +374,11 @@ final class HotkeyManager {
         }
     }
 
-    /// 处理「亮度调节键被当作普通 keyDown」的情况（keyCode 144/145）。
-    /// 命中已注册的亮度绑定就触发并返回 true，让回调吞掉事件。
-    private func handleMediaKeyDown(_ event: CGEvent) -> Bool {
-        guard !mediaBindings.isEmpty else { return false }
+    /// 处理「媒体键被当作普通 keyDown」的情况（keyCode 72/73/74、144/145）。
+    /// 命中已注册的媒体键就触发并返回 true，让回调吞掉事件。
+    /// 按住 fn 时不处理：此时系统发的是标准功能键，应该透传给前台应用。
+    func handleMediaKeyDown(_ event: CGEvent, functionKeyDown: Bool) -> Bool {
+        guard !mediaBindings.isEmpty, !functionKeyDown else { return false }
         let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
         guard let keyType = Self.mediaKeyType(forKeyCode: keyCode) else { return false }
         guard shouldHandleMediaKey?(keyType) ?? true else { return false }
@@ -372,9 +401,10 @@ final class HotkeyManager {
         }
     }
 
-    /// 处理 NX_SYSDEFINED 事件。返回 true 表示这是已注册的亮度调节键，
-    /// 调用方应返回 nil 把事件吞掉。
-    private func handleSystemDefined(_ event: CGEvent) -> Bool {
+    /// 处理 NX_SYSDEFINED 事件。返回 true 表示这是已注册的媒体键，
+    /// 调用方应返回 nil 把事件吞掉。按住 fn 时原样放行。
+    func handleSystemDefined(_ event: CGEvent, functionKeyDown: Bool) -> Bool {
+        guard !functionKeyDown else { return false }
         guard let nsEvent = NSEvent(cgEvent: event) else { return false }
         guard nsEvent.subtype.rawValue == Self.auxControlButtonSubtype else { return false }
         let (keyType, isDown) = Self.parseMediaKey(data1: nsEvent.data1)
