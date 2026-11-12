@@ -191,7 +191,7 @@ final class AdbClient {
         lastServerRestart = Date()
         _ = run(["kill-server"], timeout: 5)
         Thread.sleep(forTimeInterval: 0.8)
-        _ = run(["start-server"], timeout: 10)
+        spawnStartServerDetached()
         // 等 server 真正开始监听再往下走：紧接着就 connect 的话很容易落到 offline
         for _ in 0..<10 {
             if isServerAlive() { break }
@@ -234,9 +234,14 @@ final class AdbClient {
         return (state == "device" && transportWorks(), state)
     }
 
-    /// server 是否还活着（能响应 version 查询）。
+    /// 探监听端口而非 `adb version`（纯客户端命令，server 没起也返回 0，假阳性）。
     func isServerAlive() -> Bool {
-        run(["version"], timeout: 3).exitCode == 0
+        NetworkScan.isTcpOpen(host: "127.0.0.1", port: Int(serverPort) ?? 5038, timeout: 1.0)
+    }
+
+    /// 退出时清理本应用独占的 adb server，避免 fork-server 残留持续重连（issue #25）。
+    func killServer() {
+        _ = run(["kill-server"], timeout: 5)
     }
 
     /// 预热：提前把 adb server 拉起来。
@@ -244,10 +249,26 @@ final class AdbClient {
     /// 冷启动时第一条 adb 命令要顺带等 server 起来，紧接着 connect 很容易落到 offline。
     /// 启动时先预热，自动连接那一步就能快好几秒。
     func warmUpServer() {
-        // start-server 本身幂等：已有 server 时直接返回，没有才拉起。
-        // 不要先 isServerAlive() 再 start-server —— 那会连做两次启动操作，
-        // 和随后的自动连接撞在一起。
-        _ = run(["start-server"], timeout: 10)
+        if isServerAlive() { return }
+        spawnStartServerDetached()
+        let deadline = Date().addingTimeInterval(12)
+        while Date() < deadline {
+            if isServerAlive() { return }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+    }
+
+    /// detached 拉起 start-server：bootstrap 客户端不能被超时 kill（会连带杀死 daemon）。
+    private func spawnStartServerDetached() {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: adbPath)
+        process.arguments = ["start-server"]
+        var env = ProcessInfo.processInfo.environment
+        env["ANDROID_ADB_SERVER_PORT"] = serverPort
+        process.environment = env
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        try? process.run()
     }
 
     /// 硬重连（保活守护部署后、设备重启后调用）。

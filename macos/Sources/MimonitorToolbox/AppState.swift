@@ -209,6 +209,7 @@ final class AppState: ObservableObject {
     private var sourcePollArmed = false
     private var monitorChecking = false
     private var monitorTick = 0
+    private var shuttingDown = false
     private var lastMonitorFailState = ""
     /// 切页时刻，用于统计刷新耗时
     private var pageAppearTimes: [String: Date] = [:]
@@ -290,6 +291,21 @@ final class AppState: ObservableObject {
             if self.isConnected && self.monitorTick % 5 != 0 { return }
             self.monitorAdbServer()
         }
+        // 退出时清理独占 adb server（issue #25）：否则 fork-server 残留并持续重连离线设备。
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.cleanupOnExit()
+        }
+    }
+
+    /// 退出清理：停自愈/定时器并 kill 本应用独占的 adb server。
+    private func cleanupOnExit() {
+        shuttingDown = true
+        connectionIntent.disconnect()
+        sourcePollTimer?.invalidate()
+        presetTimer?.invalidate()
+        adb.killServer()
     }
 
     deinit {
@@ -304,7 +320,7 @@ final class AppState: ObservableObject {
     /// 以及 adb connect 后卡在 offline 不翻转。两者都靠 kill-server + start-server 治，
     /// 但设备侧清掉旧 transport 需要时间，所以要反复重试而不是只试一次。
     private func monitorAdbServer() {
-        guard !monitorChecking else { return }
+        guard !shuttingDown, !monitorChecking else { return }
         guard connectionIntent.allowsAutomaticRecovery else { return }
         // 正在连接/扫描时不要插手：监控会重启 adb server，而重启会把
         // 进行中的连接打断，于是「越监控越连不上」。这是之前冷启动很慢的元凶。
@@ -454,6 +470,7 @@ final class AppState: ObservableObject {
     }
 
     private func runConnectionTask(_ work: @escaping () -> Void) {
+        guard !shuttingDown else { return }
         connectionQueue.async(execute: work)
     }
 
