@@ -45,6 +45,8 @@ final class PresetEngineTests: XCTestCase {
         let engine = PresetEngine(store: store())
         let monitor = Monitor()
         let preset = try engine.create(name: "游戏", device: monitor)
+        // create 会顺手把新预设置为当前；先退回无预设，才能检验"延迟期间不套用"。
+        try engine.restore(device: monitor)
         let task = ScheduledPresetTask(presetID: preset.id, start: "09:00", end: "10:00",
                                        deferWhileHDR: true)
         try engine.saveTask(task)
