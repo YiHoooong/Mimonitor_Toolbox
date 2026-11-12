@@ -230,7 +230,7 @@ class AdbRuntimeTests(unittest.TestCase):
         fake_socket = mock.Mock()
         with mock.patch.object(adb_runtime.socket, "create_connection", return_value=fake_socket) as connect:
             self.assertTrue(adb_runtime.is_adb_server_alive())
-        connect.assert_called_once_with(("127.0.0.1", int(adb_runtime.ADB_SERVER_PORT)), timeout=0.2)
+        connect.assert_called_once_with(("127.0.0.1", int(adb_runtime.ADB_SERVER_PORT)), timeout=1.0)
         fake_socket.close.assert_called_once_with()
 
         with mock.patch.object(adb_runtime.socket, "create_connection", side_effect=ConnectionRefusedError):
@@ -267,6 +267,7 @@ class AdbRuntimeTests(unittest.TestCase):
 
         fake = FakeApp()
         with mock.patch.object(device_features, "is_adb_server_alive", side_effect=[False, True]), \
+                mock.patch.object(device_features, "ensure_adb_server", return_value=True), \
                 mock.patch.object(device_features, "adb_run", side_effect=fake_adb_run), \
                 mock.patch.object(device_features, "async_run", side_effect=lambda fn: fn()):
             app.App._monitor_adb_server(fake)
@@ -276,8 +277,7 @@ class AdbRuntimeTests(unittest.TestCase):
             ("restarting", ""),
             ("recovered", "connected to 192.168.5.205:5555"),
         ])
-        self.assertEqual(commands[0], (["start-server"], 5, True))
-        self.assertEqual(commands[1], (["connect", "192.168.5.205:5555"], 5, False))
+        self.assertEqual(commands[0], (["connect", "192.168.5.205:5555"], 5, False))
 
     def test_adb_restart_notification_is_not_repeated(self):
         messages = []
@@ -427,6 +427,7 @@ class AdbRuntimeTests(unittest.TestCase):
         with mock.patch.object(adb_runtime, "get_windows_scan_networks", return_value=[object()]), \
                 mock.patch.object(adb_runtime, "build_probe_targets", return_value=[object()]), \
                 mock.patch.object(adb_runtime, "probe_tcp_targets", return_value=probe_results), \
+                mock.patch.object(adb_runtime, "ensure_adb_server", return_value=True), \
                 mock.patch.object(adb_runtime, "adb_run", side_effect=fake_adb_run), \
                 mock.patch.object(adb_runtime, "adb_device_state", side_effect=lambda serial, timeout=3: states[serial]):
             found = adb_runtime.scan_adb(
@@ -1455,6 +1456,77 @@ class StateMachineTests(unittest.TestCase):
 
         app.App._check_adb_when_restored(FakeApp())
         self.assertEqual(calls, [])
+
+
+class ColdStartTests(unittest.TestCase):
+    """ADB server 冷启动：bootstrap 客户端不能被 kill；从没连上也要能自愈。"""
+
+    def test_ensure_server_warm_is_noop(self):
+        with mock.patch.object(adb_runtime, "is_adb_server_alive", return_value=True), \
+                mock.patch.object(adb_runtime.subprocess, "Popen") as popen:
+            self.assertTrue(adb_runtime.ensure_adb_server())
+        popen.assert_not_called()
+
+    def test_ensure_server_cold_spawns_without_killing_bootstrap(self):
+        proc = mock.Mock()
+        with mock.patch.object(adb_runtime, "is_adb_server_alive", side_effect=[False, False, True]), \
+                mock.patch.object(adb_runtime.subprocess, "Popen", return_value=proc) as popen, \
+                mock.patch.object(adb_runtime.time, "sleep"):
+            self.assertTrue(adb_runtime.ensure_adb_server(timeout=5))
+        popen.assert_called_once()
+        self.assertIn("start-server", popen.call_args[0][0])
+        proc.kill.assert_not_called()
+
+    def test_ensure_server_respects_shutdown_block(self):
+        adb_runtime.block_adb_spawns()
+        try:
+            with mock.patch.object(adb_runtime, "is_adb_server_alive", return_value=False), \
+                    mock.patch.object(adb_runtime.subprocess, "Popen") as popen:
+                self.assertFalse(adb_runtime.ensure_adb_server())
+            popen.assert_not_called()
+        finally:
+            adb_runtime.unblock_adb_spawns()
+
+    def test_monitor_runs_when_never_connected_but_ip_configured(self):
+        events = []
+
+        class FakeSignal:
+            def emit(self, *args):
+                events.append(args)
+
+        class FakeApp:
+            _cleanup_done = False
+            _windows_session_ending = False
+            adb_connected = False
+            adb = SimpleNamespace(ip="192.168.5.205")
+            _adb_server_monitor_checking = False
+            _adb_server_retry_after = 0.0
+            adb_server_event = FakeSignal()
+
+        with mock.patch.object(device_features, "is_adb_server_alive", return_value=True), \
+                mock.patch.object(device_features, "async_run", side_effect=lambda fn: fn()):
+            app.App._monitor_adb_server(FakeApp())
+        self.assertEqual(events, [("healthy", "")])
+
+    def test_keepalive_runs_when_never_connected_but_ip_configured(self):
+        class FakeApp:
+            _cleanup_done = False
+            _windows_session_ending = False
+            adb_connected = False
+            adb = SimpleNamespace(ip="192.168.5.205", transaction=staticmethod(nullcontext))
+            _adb_keepalive_checking = False
+            _adb_busy_until = 0.0
+            _connection_intent_generation = 0
+            _connection_intent_is_current = (
+                device_features.DeviceFeaturesMixin._connection_intent_is_current
+            )
+            status_signal = mock.Mock()
+            connection_recovery_requested = mock.Mock()
+
+        with mock.patch.object(device_features, "adb_device_state", return_value="device") as state, \
+                mock.patch.object(device_features, "async_run", side_effect=lambda fn: fn()):
+            app.App._keep_adb_alive(FakeApp())
+        state.assert_called()
 
 
 if __name__ == "__main__":

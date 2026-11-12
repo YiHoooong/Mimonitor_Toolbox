@@ -22,6 +22,7 @@ from .adb import (
     adb_text_has_disconnected_marker,
     async_run,
     disconnected_status_text,
+    ensure_adb_server,
     format_adb_serial,
     is_adb_server_alive,
     is_mitv_model,
@@ -607,7 +608,7 @@ class DeviceFeaturesMixin:
     def _monitor_adb_server(self):
         if getattr(self, "_cleanup_done", False) or getattr(self, "_windows_session_ending", False):
             return
-        if not getattr(self, "adb_connected", False) or not self.adb.ip:
+        if not self.adb.ip:
             return
         if self._adb_server_monitor_checking or time.monotonic() < self._adb_server_retry_after:
             return
@@ -627,8 +628,7 @@ class DeviceFeaturesMixin:
                     if not self._connection_intent_is_current(intent_generation, ip):
                         self.adb_server_event.emit("cancelled", "")
                         return
-                    adb_run(["start-server"], timeout=5, check=True)
-                    if not is_adb_server_alive(timeout=0.5):
+                    if not ensure_adb_server():
                         raise RuntimeError("ADB Server 启动后未监听端口")
                     if not self._connection_intent_is_current(intent_generation, ip):
                         self.adb_server_event.emit("cancelled", "")
@@ -702,7 +702,7 @@ class DeviceFeaturesMixin:
     def _keep_adb_alive(self):
         if getattr(self, "_cleanup_done", False) or getattr(self, "_windows_session_ending", False):
             return
-        if not getattr(self, "adb_connected", False) or not self.adb.ip:
+        if not self.adb.ip:
             return
         if getattr(self, "_adb_keepalive_checking", False):
             return
@@ -864,6 +864,7 @@ class DeviceFeaturesMixin:
                 with self.adb.transaction():
                     if not self._connection_intent_is_current(intent_generation, saved_ip):
                         return
+                    ensure_adb_server()
                     ok = self.adb.connect()
                     if not self._connection_intent_is_current(intent_generation, saved_ip):
                         return
@@ -1131,9 +1132,10 @@ class DeviceFeaturesMixin:
                 "stopped": "stopped=false" in user_state,
                 "legacy_installed": "package:" in legacy_path,
             }
+        # adb_wifi_enabled 由固件按 BSSID 管理、5G 下会反复置 0，不影响 5555 TCP ADB，故不参与健康判定。
         status["ok"] = (
             status["installed"] and status["pid"] and
-            status["adb_enabled"] == "1" and status["adb_wifi_enabled"] == "1" and
+            status["adb_enabled"] == "1" and
             status["service_port"] == "5555" and status["persist_port"] == "5555" and
             status["adbd"] == "running" and status["accessibility"] and
             status["mask"] == "-134250497" and status["stopped"] and
@@ -1181,7 +1183,7 @@ class DeviceFeaturesMixin:
                 missing.append("辅助功能未启用")
             if status.get("mask") != "-134250497":
                 missing.append("休眠保护未写入")
-            if status.get("adb_enabled") != "1" or status.get("adb_wifi_enabled") != "1":
+            if status.get("adb_enabled") != "1":
                 missing.append("ADB 开关异常")
             if status.get("service_port") != "5555" or status.get("persist_port") != "5555":
                 missing.append("端口异常")

@@ -227,6 +227,7 @@ class ConnectByDeviceStateTests(unittest.TestCase):
         with mock.patch.object(adb_runtime, "get_windows_scan_networks", return_value=networks), \
                 mock.patch.object(adb_runtime, "build_probe_targets", return_value=probe_results), \
                 mock.patch.object(adb_runtime, "probe_tcp_targets", return_value=probe_results), \
+                mock.patch.object(adb_runtime, "ensure_adb_server", return_value=True), \
                 mock.patch.object(adb_runtime, "adb_run", side_effect=fake_adb_run):
             return adb_runtime.scan_adb()
 

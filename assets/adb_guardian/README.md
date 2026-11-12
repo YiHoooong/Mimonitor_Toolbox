@@ -20,12 +20,13 @@ adbguardian-signed.apk
 Bundled version:
 
 ```text
-versionCode 5 / versionName 3.2
+versionCode 7 / versionName 3.4
 ```
 
 Notes:
 
 - ADB repair checks no longer restart `adbd` on a timer. The guardian only restarts
-  `adbd` when ADB settings or TCP port state are wrong.
+  `adbd` when it is not running or the service TCP port is wrong. `adb_wifi_enabled`
+  drift (firmware-managed, flaps on 5GHz) never triggers a restart.
 - Generic accessibility events do not trigger ADB repair checks, so Android's ADB
   authorization dialog is not interrupted by the guardian.

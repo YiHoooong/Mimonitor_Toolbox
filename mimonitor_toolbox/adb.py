@@ -135,8 +135,9 @@ def parse_jni_batch_output(output):
     return values
 
 
-def is_adb_server_alive(timeout=0.2):
+def is_adb_server_alive(timeout=1.0):
     """检查本软件独立 ADB Server 的监听端口，不触发 ADB 自动拉起。"""
+    # 默认 timeout 不能太小：慢 loopback 上握手可能 >0.2s，会假阴性。
     sock = None
     try:
         port = int(ADB_SERVER_PORT)
@@ -150,6 +151,31 @@ def is_adb_server_alive(timeout=0.2):
                 sock.close()
             except OSError:
                 pass
+
+def ensure_adb_server(timeout=12.0):
+    """Cold-start the private ADB server and wait until it listens; never kill the bootstrap client."""
+    if is_adb_server_alive():
+        return True
+    with _adb_process_lock:
+        if _adb_spawn_blocked:
+            return False
+    try:
+        subprocess.Popen(
+            adb_command(["start-server"]),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            creationflags=NO_WINDOW,
+        )
+    except Exception as exc:
+        _adb_log(f"start-server spawn failed: {exc}")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if is_adb_server_alive():
+            return True
+        time.sleep(0.2)
+    return is_adb_server_alive()
+
 
 def adb_text_has_disconnected_marker(text):
     lower = str(text or "").lower()
@@ -532,6 +558,7 @@ def scan_adb(cb=None, log=None, cancel_event=None):
     )
     if not networks:
         raise WindowsAdapterError("未找到可扫描的物理网卡")
+    ensure_adb_server()
     targets = build_probe_targets(networks, log=log)
     probe_results = probe_tcp_targets(targets, cancel_event, log=log)
     probe_results.sort(key=lambda item: int(item.ip))

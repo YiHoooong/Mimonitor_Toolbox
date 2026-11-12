@@ -27,6 +27,12 @@ __pycache__/
 /tools/fake_device/
 /tests/test_fake_device.py
 
+# ── 本地脚本：临时改动脚本（不入库）──
+/script/
+
+# ── 本地参考工作区：guardian 源码/反编译/工具链（不入库）──
+/mitv/
+
 # ── 其它 ──
 *.log
 *.Zone.Identifier

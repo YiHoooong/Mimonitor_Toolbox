@@ -1,0 +1,5 @@
+# 统一 LF：仓库与 Windows 工作区都保持 LF，避免 core.autocrlf 把 LF 转成 CRLF。
+* text=auto eol=lf
+# Windows 批处理 / Inno 语言文件保持原样（CRLF，不做归一化）。
+*.bat -text
+*.isl -text

@@ -1166,6 +1166,7 @@ class WindowsResumeReconnectTests(unittest.TestCase):
             return ""
 
         with mock.patch.object(device_features, "is_adb_server_alive", side_effect=fake_server_alive), \
+                mock.patch.object(device_features, "ensure_adb_server", return_value=True), \
                 mock.patch.object(device_features, "adb_run", side_effect=fake_adb_run), \
                 mock.patch.object(device_features, "async_run", side_effect=fake_async_run):
             host._monitor_adb_server()
@@ -1365,6 +1366,61 @@ class NetworkSignatureTests(unittest.TestCase):
 
         self.assertEqual(len(signature), 1)
         self.assertEqual(signature[0][1], "vEthernet (External)")
+
+
+class GuardianHealthTests(unittest.TestCase):
+    """issue #22：5G 下 adb_wifi_enabled 被固件置 0 时，5555 TCP ADB 仍正常，保活判定不应失败。"""
+
+    def _status(self, *, wifi="0", adb_enabled="1"):
+        accessibility = device_features.GUARDIAN_ACCESSIBILITY
+        package = device_features.GUARDIAN_PACKAGE
+        legacy = device_features.GUARDIAN_LEGACY_PACKAGE
+
+        def shell(cmd):
+            if "enabled_accessibility_services" in cmd:
+                return accessibility
+            if "dumpsys package" in cmd:
+                return "User 0: installed=true stopped=false"
+            if cmd.startswith(f"pm path {legacy}"):
+                return ""
+            if cmd.startswith(f"pm path {package}"):
+                return "package:/data/app/guardian.apk"
+            if "pidof" in cmd:
+                return "4321"
+            if "persist.appcontrol_w_mask" in cmd:
+                return "-134250497"
+            if "adb_wifi_enabled" in cmd:
+                return wifi
+            if "adb_enabled" in cmd:
+                return adb_enabled
+            if "service.adb.tcp.port" in cmd:
+                return "5555"
+            if "persist.adb.tcp.port" in cmd:
+                return "5555"
+            if "init.svc.adbd" in cmd:
+                return "running"
+            return ""
+
+        class FakeAdb:
+            def transaction(self):
+                return nullcontext()
+
+            def shell(self, cmd):
+                return shell(cmd)
+
+        class Host(device_features.DeviceFeaturesMixin):
+            adb = FakeAdb()
+
+        return device_features.DeviceFeaturesMixin._read_guardian_status(Host())
+
+    def test_wifi_disabled_on_5g_still_healthy(self):
+        status = self._status(wifi="0")
+        self.assertEqual(status["adb_wifi_enabled"], "0")
+        self.assertTrue(status["ok"])
+
+    def test_adb_disabled_is_unhealthy(self):
+        status = self._status(adb_enabled="0")
+        self.assertFalse(status["ok"])
 
 
 if __name__ == "__main__":

@@ -37,7 +37,8 @@ fileprivate struct GuardianStatus {
     var legacyInstalled: Bool = false
 
     var ok: Bool {
-        installed && !pid.isEmpty && adbEnabled && adbWifiEnabled
+        // adb_wifi_enabled 由固件按 BSSID 管理、5G 下会反复置 0，不影响 5555 TCP ADB，故不参与健康判定。
+        installed && !pid.isEmpty && adbEnabled
             && servicePort == "5555" && persistPort == "5555"
             && adbd == "running" && accessibility && mask == "-134250497" && !stopped
             && !legacyInstalled
@@ -52,7 +53,6 @@ fileprivate struct GuardianStatus {
         if !installed { parts.append("未安装") }
         else if pid.isEmpty { parts.append("未运行") }
         if !adbEnabled { parts.append("adb_enabled≠1") }
-        if !adbWifiEnabled { parts.append("adb_wifi≠1") }
         if servicePort != "5555" || persistPort != "5555" { parts.append("端口≠5555") }
         if adbd != "running" { parts.append("adbd 未运行") }
         if !accessibility { parts.append("无障碍未授权") }
