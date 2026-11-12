@@ -25,22 +25,33 @@ struct PictureView: View {
 
                 // 画面模式
                 SectionCard(title: "画面模式") {
-                    HStack(spacing: 10) {
-                        ForEach([14, 10, 9], id: \.self) { v in
-                            SelectableButton(title: RegisterMap.modeNames[v] ?? "\(v)",
-                                             isSelected: state.intValue("picture_mode", default: -1) == v) {
-                                state.setMode(v)
-                            }
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(spacing: 10) {
+                            SegmentedOptionPicker(
+                                options: modeOptions,
+                                selectedValue: state.intValue("picture_mode", default: -1),
+                                onSelect: { value in
+                                    // 不匹配时的占位项只用来显示当前 id，点了不写设备
+                                    guard [14, 10, 9].contains(value) else { return }
+                                    state.setMode(value)
+                                }
+                            )
+                            .frame(maxWidth: .infinity)
+                            Button("恢复默认") { state.resetCurrentMode() }
                         }
-                        Button("恢复默认") { state.resetCurrentMode() }
-                        Text(state.pictureModeHint).font(.callout).foregroundColor(.secondary)
-                        Spacer()
-                        // 自动调整亮度（光感）：状态以 MTK 侧回读为准（见 applyJniOverrides）
-                        Toggle("自动调整亮度", isOn: Binding(
-                            get: { state.intValue("tv_picture_light_sensor", default: 0) == 1 },
-                            set: { state.setLightSensor($0) }
-                        ))
-                        .toggleStyle(.switch)
+
+                        HStack(spacing: 10) {
+                            Text(state.pictureModeHint)
+                                .font(.callout)
+                                .foregroundColor(.secondary)
+                            Spacer(minLength: 0)
+                            // 自动调整亮度（光感）：状态以 MTK 侧回读为准（见 applyJniOverrides）
+                            Toggle("自动调整亮度", isOn: Binding(
+                                get: { state.intValue("tv_picture_light_sensor", default: 0) == 1 },
+                                set: { state.setLightSensor($0) }
+                            ))
+                            .toggleStyle(.switch)
+                        }
                     }
                 }
 
@@ -135,5 +146,18 @@ struct PictureView: View {
         .disabled(state.presetConfiguration.applicationIncomplete)
         .onAppear { state.refreshPage("picture") }
         .loadingOverlay(state.loadingPages.contains("picture"))
+    }
+
+    /// 标准 / 游戏 / 电影，外加一个「当前模式不在列表里」的占位项。
+    /// 占位项只用于把设备当前 id 显示出来，不参与写回。
+    private var modeOptions: [Option] {
+        var options = [14, 10, 9].map {
+            Option(label: RegisterMap.modeNames[$0] ?? "\($0)", value: $0)
+        }
+        let current = state.intValue("picture_mode", default: -1)
+        if current > 0 && !options.contains(where: { $0.value == current }) {
+            options.append(Option(label: "\(current)（不匹配）", value: current))
+        }
+        return options
     }
 }

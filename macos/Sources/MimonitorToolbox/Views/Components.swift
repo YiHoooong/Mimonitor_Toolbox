@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 // MARK: - 主题色
 //
@@ -103,15 +104,88 @@ struct ButtonGroupSection: View {
 
     var body: some View {
         SectionCard(title: title) {
-            HStack(spacing: 8) {
-                ForEach(options) { opt in
-                    SelectableButton(title: opt.label,
-                                     isSelected: opt.value == selectedValue) {
-                        onSelect(opt.value)
+            if options.count == 2 {
+                // 两项铺满整行会变成一根很宽的分段条，改回原来的两个按钮。
+                HStack(spacing: 8) {
+                    ForEach(options) { option in
+                        SelectableButton(title: option.label,
+                                         isSelected: option.value == selectedValue) {
+                            onSelect(option.value)
+                        }
                     }
+                    Spacer(minLength: 0)
                 }
-                Spacer(minLength: 0)
+            } else {
+                // 三项及以上：用系统分段控件铺满卡片，和滑条一样占满整行。
+                SegmentedOptionPicker(options: options,
+                                      selectedValue: selectedValue,
+                                      onSelect: onSelect)
+                    .frame(maxWidth: .infinity)
             }
+        }
+    }
+}
+
+// MARK: - 系统分段控件（NSSegmentedControl）
+//
+// SwiftUI 的 `.segmented` Picker 底层也是它，但没有暴露 `segmentDistribution`；
+// 放到卡片里时各段按内容宽度缩在中间，左右留一大片空白。
+// 包一层 AppKit 控件，把 `segmentDistribution` 设为 `.fillEqually`，各段等宽铺满。
+
+struct SegmentedOptionPicker: NSViewRepresentable {
+    let options: [Option]
+    let selectedValue: Int
+    /// 选项组用等宽；设置页的两段式控件用按内容分配，长标签才不会被截断。
+    var distribution: NSSegmentedControl.Distribution = .fillEqually
+    var controlSize: NSControl.ControlSize = .large
+    let onSelect: (Int) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> NSSegmentedControl {
+        let control = NSSegmentedControl(
+            labels: options.map(\.label),
+            trackingMode: .selectOne,
+            target: context.coordinator,
+            action: #selector(Coordinator.selectionChanged(_:))
+        )
+        control.segmentDistribution = distribution
+        control.controlSize = controlSize
+        control.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        control.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        updateSelection(control)
+        return control
+    }
+
+    func updateNSView(_ control: NSSegmentedControl, context: Context) {
+        context.coordinator.parent = self
+        control.segmentDistribution = distribution
+        control.controlSize = controlSize
+        if control.segmentCount != options.count {
+            control.segmentCount = options.count
+        }
+        for (index, option) in options.enumerated()
+        where control.label(forSegment: index) != option.label {
+            control.setLabel(option.label, forSegment: index)
+        }
+        updateSelection(control)
+    }
+
+    private func updateSelection(_ control: NSSegmentedControl) {
+        control.selectedSegment = options.firstIndex { $0.value == selectedValue } ?? -1
+    }
+
+    final class Coordinator: NSObject {
+        var parent: SegmentedOptionPicker
+
+        init(_ parent: SegmentedOptionPicker) {
+            self.parent = parent
+        }
+
+        @objc func selectionChanged(_ sender: NSSegmentedControl) {
+            let index = sender.selectedSegment
+            guard index >= 0, index < parent.options.count else { return }
+            parent.onSelect(parent.options[index].value)
         }
     }
 }

@@ -17,6 +17,14 @@ struct ToolsView: View {
             + state.adjustHotkeys.filter { $0.isEnabled }.count
     }
 
+    private var themeIndex: Int {
+        switch theme {
+        case "dark": return 1
+        case "light": return 2
+        default: return 0
+        }
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
@@ -28,23 +36,41 @@ struct ToolsView: View {
                         Text("窗口关闭行为:").frame(width: 120, alignment: .leading)
                         // 对应 AppDelegate.applicationShouldTerminateAfterLastWindowClosed。
                         // macOS 上没有 Windows 那种"托盘"，等价物是菜单栏图标。
-                        Picker("", selection: $closeBehavior) {
-                            Text("隐藏窗口（继续在菜单栏运行）").tag("tray")
-                            Text("退出应用").tag("exit")
-                        }
-                        .pickerStyle(.segmented)
-                        .frame(width: 260)
+                        //
+                        // 用 NSSegmentedControl 而不是 SwiftUI 的 segmented Picker：
+                        // 后者会把按内容宽度绘制的分段在 frame 里居中，两行标签长度不同时
+                        // 左边缘就错开了。fillProportionally + 固定宽度才能两行齐平。
+                        SegmentedOptionPicker(
+                            options: [
+                                Option(label: "隐藏窗口（继续在菜单栏运行）", value: 0),
+                                Option(label: "退出应用", value: 1),
+                            ],
+                            selectedValue: closeBehavior == "exit" ? 1 : 0,
+                            distribution: .fillProportionally,
+                            controlSize: .regular,
+                            onSelect: { closeBehavior = $0 == 1 ? "exit" : "tray" }
+                        )
+                        .frame(width: 360)
                         Spacer()
                     }
                     HStack(spacing: 16) {
                         Text("应用主题:").frame(width: 120, alignment: .leading)
-                        Picker("", selection: $theme) {
-                            Text("跟随系统").tag("auto")
-                            Text("深色模式").tag("dark")
-                            Text("浅色模式").tag("light")
-                        }
-                        .frame(width: 220)
-                        .onChange(of: theme) { AppTheme.apply($0) }
+                        SegmentedOptionPicker(
+                            options: [
+                                Option(label: "跟随系统", value: 0),
+                                Option(label: "深色模式", value: 1),
+                                Option(label: "浅色模式", value: 2),
+                            ],
+                            selectedValue: themeIndex,
+                            distribution: .fillProportionally,
+                            controlSize: .regular,
+                            onSelect: { index in
+                                let value = ["auto", "dark", "light"][index]
+                                theme = value
+                                AppTheme.apply(value)
+                            }
+                        )
+                        .frame(width: 360)
                         Spacer()
                     }
                     Toggle("开机自动启动并隐藏窗口（仅菜单栏）", isOn: $autostart)

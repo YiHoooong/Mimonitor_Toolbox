@@ -5,36 +5,24 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var selection: Page? = .home
 
-    /// 侧边栏固定宽度。
-    ///
-    /// 不用 `NavigationSplitView`：它的分隔条天生可拖，
-    /// `navigationSplitViewColumnWidth(min:ideal:max:)` 把 min/max 设成相等也拦不住
-    /// （实测仍然能拖）。干脆用 HStack 自己排，从根上没有分隔条。
-    /// 侧边栏视觉仍靠 `List` + `.listStyle(.sidebar)`，和原生一致。
-    private let sidebarWidth: CGFloat = 220
-
     var body: some View {
-        HStack(spacing: 0) {
-            List(Page.allCases, selection: $selection) { page in
-                Label(page.title, systemImage: page.icon)
-                    .tag(page)
+        NavigationSplitView {
+            // 全部交给系统：List + .sidebar 提供原生选中态、悬停、拖拽和键盘导航，
+            // NavigationSplitView 则让侧边栏用上系统材质，并自动延伸到标题栏下方。
+            List(selection: $selection) {
+                Section("显示器") {
+                    pageRows([.home, .picture, .game, .source, .light, .remote])
+                }
+                Section("自动化") {
+                    pageRows([.presets, .autoTasks])
+                }
+                Section("设置") {
+                    pageRows([.menuBar, .tools])
+                }
             }
             .listStyle(.sidebar)
-            // 关键：脱离 NavigationSplitView 之后，`.sidebar` 样式的那层半透明材质
-            // 会去采样**桌面壁纸**而不是窗口背景 —— 壁纸偏暗时，浅色模式下的边栏
-            // 会被染成暗色，和右边内容区对不上。
-            // 盖一层不透明的 `.background`（语义色，随外观自适应）挡住它。
-            // 再叠极淡的一层 primary，保留一点"这是边栏"的层次感。
-            .scrollContentBackground(.hidden)
-            .background {
-                Rectangle()
-                    .fill(.background)
-                    .overlay(Color.primary.opacity(0.03))
-            }
-            .frame(width: sidebarWidth)
-
-            Divider()
-
+            .navigationSplitViewColumnWidth(min: 210, ideal: 228, max: 280)
+        } detail: {
             Group {
                 if let selection {
                     detailView(for: selection)
@@ -47,6 +35,7 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(.background)
         }
+        .navigationSplitViewStyle(.balanced)
         // 用户去系统设置授权后切回来，权限状态要自动刷新
         .onChange(of: scenePhase) { phase in
             if phase == .active { state.refreshAccessibilityStatus() }
@@ -85,6 +74,14 @@ struct ContentView: View {
         )) {
             Button("好", role: .cancel) { state.presetError = nil }
         } message: { Text(state.presetError ?? "") }
+    }
+
+    @ViewBuilder
+    private func pageRows(_ pages: [Page]) -> some View {
+        ForEach(pages) { page in
+            Label(page.title, systemImage: page.icon)
+                .tag(page)
+        }
     }
 
     @ViewBuilder

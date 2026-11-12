@@ -196,7 +196,7 @@ private struct MenuBarPanel: View {
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 16)
             } else {
-                ScrollView {
+                ScrollView(.vertical, showsIndicators: false) {
                     VStack(alignment: .leading, spacing: 10) {
                         if !state.presetConfiguration.menuBarPresets.isEmpty {
                             MenuBarPresetPicker()
@@ -352,17 +352,15 @@ private struct MenuBarPanelRow: View {
         VStack(alignment: .leading, spacing: 6) {
             switch entry.kind {
             case .options(let options):
+                let display = displayOptions(options)
                 Text(entry.label).font(.callout).foregroundColor(.secondary)
-                Picker("", selection: Binding(
-                    get: { state.menuBarValue(for: entry.id) ?? -1 },
-                    set: { state.applyMenuBarOption(entry.id, value: $0) }
-                )) {
-                    ForEach(options) { opt in
-                        Text(opt.label).tag(opt.value)
-                    }
+                MenuBarPopupPicker(
+                    options: display.options,
+                    selectedValue: state.menuBarValue(for: entry.id) ?? -1,
+                    disabledValues: display.disabled
+                ) { value in
+                    state.applyMenuBarOption(entry.id, value: value)
                 }
-                .pickerStyle(.menu)
-                .labelsHidden()
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             case .stepper(let lo, let hi, _):
@@ -393,6 +391,77 @@ private struct MenuBarPanelRow: View {
         }
         .disabled(!state.isConnected)
         .opacity(state.isConnected ? 1 : 0.5)
+    }
+
+    /// 画面模式不在 标准/游戏/电影 里时补一个占位项。
+    /// 占位项被禁用：它只负责把当前 id 显示出来，选中它不会写设备。
+    private func displayOptions(_ options: [Option]) -> (options: [Option], disabled: Set<Int>) {
+        guard entry.id == "picture_mode" else { return (options, []) }
+        let current = state.menuBarValue(for: entry.id) ?? -1
+        if options.contains(where: { $0.value == current }) { return (options, []) }
+        let label = current > 0 ? "\(current)（不匹配）" : "未读取"
+        return (options + [Option(label: label, value: current)], [current])
+    }
+}
+
+/// 面板里的选项下拉。SwiftUI 的 `.menu` Picker 只按内容宽度绘制，
+/// 放在 320 宽的面板里右边会空一截；这里用原生 NSPopUpButton，
+/// 把横向 hugging 调低，让它像旧版一样铺满整行。
+private struct MenuBarPopupPicker: NSViewRepresentable {
+    let options: [Option]
+    let selectedValue: Int
+    let disabledValues: Set<Int>
+    let onSelect: (Int) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> NSPopUpButton {
+        let button = NSPopUpButton(frame: .zero, pullsDown: false)
+        button.bezelStyle = .rounded
+        button.controlSize = .large
+        button.target = context.coordinator
+        button.action = #selector(Coordinator.selectionChanged(_:))
+        button.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        button.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return button
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSPopUpButton,
+                      context: Context) -> CGSize? {
+        CGSize(width: proposal.width ?? nsView.intrinsicContentSize.width,
+               height: proposal.height ?? nsView.intrinsicContentSize.height)
+    }
+
+    func updateNSView(_ button: NSPopUpButton, context: Context) {
+        context.coordinator.parent = self
+        let titles = options.map(\.label)
+        if button.itemTitles != titles {
+            button.removeAllItems()
+            button.addItems(withTitles: titles)
+        }
+        for (index, option) in options.enumerated() where index < button.numberOfItems {
+            button.item(at: index)?.tag = option.value
+            button.item(at: index)?.isEnabled = !disabledValues.contains(option.value)
+        }
+        if let index = options.firstIndex(where: { $0.value == selectedValue }) {
+            button.selectItem(at: index)
+        } else if !options.isEmpty {
+            button.selectItem(at: 0)
+        }
+    }
+
+    final class Coordinator: NSObject {
+        var parent: MenuBarPopupPicker
+
+        init(_ parent: MenuBarPopupPicker) {
+            self.parent = parent
+        }
+
+        @objc func selectionChanged(_ sender: NSPopUpButton) {
+            let index = sender.indexOfSelectedItem
+            guard index >= 0, index < parent.options.count else { return }
+            parent.onSelect(parent.options[index].value)
+        }
     }
 }
 

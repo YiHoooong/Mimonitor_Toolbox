@@ -34,7 +34,10 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-14
+    # 必须是 macOS 26 的 runner + SDK：SwiftUI 的 Liquid Glass（26 外观）
+    # 由**链接时的 SDK** 决定，不是代码里能开关的。macos-14/15 的 SDK
+    # 打出来的包在 26 上也是旧版（15）外观。macos-14 镜像 2026-11-02 退役。
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
 
@@ -62,6 +65,13 @@ jobs:
       - name: 工具链版本
         run: |
           swift --version
+          xcodebuild -version
+          SDK=$(xcrun --show-sdk-version)
+          echo "macOS SDK: $SDK"
+          case "$SDK" in
+            26.*) ;;
+            *) echo "::warning::当前 SDK 不是 26.x，构建出的界面会是 macOS 15 外观" ;;
+          esac
           sw_vers
 
       - name: 编译（debug，先过一遍语法检查）
@@ -101,7 +111,7 @@ jobs:
           # 注意 base64 --decode 而不是 -d：macOS 的 base64 把 -d 当别的东西
           printf '%s' "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
           security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PW" \
-              -T /usr/bin/codesign -T /usr/bin/security >/dev/null
+              -T /usr/bin/codesign -T /usr/bin/security
 
           # 省了这条 codesign 会弹 GUI 授权框，在 CI 上等于永久挂起
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
@@ -110,8 +120,15 @@ jobs:
           # 自签名证书默认「不受信任」，而不受信任就不算有效签名身份 ——
           # `security find-identity -v` 里看不到它，build_app.sh 照样回退 ad-hoc。
           # runner 是一次性的，加进系统钥匙串即可，不用清理。
-          openssl pkcs12 -in "$RUNNER_TEMP/cert.p12" -clcerts -nokeys \
-              -passin "pass:$CERT_PW" -out "$RUNNER_TEMP/cert.pem" 2>/dev/null
+          #
+          # 不要用 openssl 解 p12：macos-26 runner 自带 LibreSSL 3.3，
+          # 读不了 security 导出的新格式 PKCS#12，而且原来的 `2>/dev/null`
+          # 会把错误吞掉，整步直接 exit 1。证书已经导入 keychain，直接导 PEM。
+          security find-certificate -a -p "$KEYCHAIN" > "$RUNNER_TEMP/cert.pem"
+          test -s "$RUNNER_TEMP/cert.pem" || {
+            echo "::error::从 keychain 导出的证书为空"
+            exit 1
+          }
           sudo security add-trusted-cert -d -r trustRoot \
               -k /Library/Keychains/System.keychain "$RUNNER_TEMP/cert.pem"
 
@@ -119,7 +136,13 @@ jobs:
           rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/cert.pem"
 
           echo "已导入的签名身份："
-          security find-identity -v -p codesigning | grep "MimonitorToolbox" | sed 's/^/  /'
+          IDENTITY="$(security find-identity -v -p codesigning | grep "MimonitorToolbox" || true)"
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::证书已导入，但 find-identity 里没有 MimonitorToolbox 身份"
+            security find-identity -v -p codesigning | sed 's/^/  /'
+            exit 1
+          fi
+          printf '%s\n' "$IDENTITY" | sed 's/^/  /'
           echo "SIGNED_WITH_CERT=1" >> "$GITHUB_ENV"
 
       - name: 打包 .app（通用二进制）

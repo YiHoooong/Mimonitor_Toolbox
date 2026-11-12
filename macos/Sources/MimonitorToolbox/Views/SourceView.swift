@@ -9,15 +9,12 @@ struct SourceView: View {
                 PageHeader(title: "信号源切换") { state.forceRefreshPage("source") }
 
                 SectionCard(title: "选择信号源") {
-                    HStack(spacing: 12) {
-                        ForEach(OptionLists.source) { opt in
-                            SelectableButton(title: opt.label,
-                                             isSelected: state.intValue("mitv.tvplayer.hdmi.last.source", default: -1) == opt.value) {
-                                state.setSource(opt.value)
-                            }
-                        }
-                        Spacer()
-                    }
+                    SegmentedOptionPicker(
+                        options: OptionLists.source,
+                        selectedValue: state.intValue("mitv.tvplayer.hdmi.last.source", default: -1),
+                        onSelect: { state.setSource($0) }
+                    )
+                    .frame(maxWidth: .infinity)
                 }
 
                 SectionCard(title: "当前活跃信号源") {

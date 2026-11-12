@@ -62,8 +62,24 @@ final class AdbClient {
            FileManager.default.isExecutableFile(atPath: bundled) {
             return bundled
         }
-        // 回退到 PATH 上的 adb（brew install android-platform-tools）
-        return "/opt/homebrew/bin/adb"
+        // 开发态（swift run）没有 .app 的内嵌资源：
+        // 1) build_app.sh 下载的缓存 —— 跑过一次打包就有，最省事
+        // 2) Homebrew / Android SDK 的常见位置
+        // 之前只认 /opt/homebrew/bin/adb，Intel Mac 上是 /usr/local/bin/adb，
+        // 开发构建于是静默地一条 adb 命令都执行失败。
+        let cache = repoRootURL()
+            .appendingPathComponent("macos/.cache/platform-tools/adb").path
+        let candidates = [
+            cache,
+            "/opt/homebrew/bin/adb",                                  // Apple Silicon Homebrew
+            "/usr/local/bin/adb",                                     // Intel Homebrew
+            NSHomeDirectory() + "/Library/Android/sdk/platform-tools/adb",
+        ]
+        if let found = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
+            return found
+        }
+        // 都不存在：返回缓存路径，让调用方在日志里给出可操作的提示
+        return cache
     }
 
     // MARK: - 进程执行
