@@ -377,6 +377,19 @@ class TaskSelectionTests(unittest.TestCase):
         active = presets.find_active_task(tasks, presets.parse_hhmm("09:00"))
         self.assertEqual(active["preset_id"], "B")
 
+    def test_disabled_task_is_skipped(self):
+        from mimonitor_toolbox import presets
+
+        tasks = [
+            self._task("off", "08:00", "12:00", preset_id="A"),
+            self._task("on", "08:00", "12:00", preset_id="B"),
+        ]
+        tasks[0]["enabled"] = False
+        active = presets.find_active_task(tasks, presets.parse_hhmm("09:00"))
+        self.assertEqual(active["preset_id"], "B")
+        tasks[1]["enabled"] = False
+        self.assertIsNone(presets.find_active_task(tasks, presets.parse_hhmm("09:00")))
+
 
 class ReadPipelineCoverageTests(unittest.TestCase):
     """预设采集的键必须都在页面读取管线里，否则快照会缺项。

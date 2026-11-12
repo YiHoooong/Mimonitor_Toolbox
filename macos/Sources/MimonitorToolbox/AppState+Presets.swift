@@ -72,12 +72,15 @@ extension AppState {
                presetConfiguration.session?.occurrenceStart == PresetSchedule.occurrenceStart(wanted, minute: minute),
                !presetConfiguration.applicationIncomplete { return }
         } else if presetConfiguration.session == nil { return }
+        if let wanted, wanted.deferWhileHDR,
+           HDRDetector.isHDR(pictureMode: currentValues["picture_mode"]) { return }
         let targetID = wanted?.presetID ?? presetConfiguration.session?.previousPresetID
         let targetName = presetConfiguration.presets.first { $0.id == targetID }?.name ?? "无预设"
         runPresetOperation("自动任务切换", automatic: true, refresh: true,
                            switchHUDTitle: "预设：\(targetName)") { engine, device in
             // The device queue may have been busy. Do not execute a window that already ended.
-            try engine.reconcile(minute: self.currentMinute(), device: device)
+            try engine.reconcile(minute: self.currentMinute(), device: device,
+                                 isHDR: HDRDetector.isHDR(pictureMode: self.currentValues["picture_mode"]))
         }
     }
 

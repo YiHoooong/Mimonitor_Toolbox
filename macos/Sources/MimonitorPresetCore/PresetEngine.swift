@@ -168,7 +168,8 @@ public final class PresetEngine {
 
     /// An uninterrupted chain of overlapping tasks shares ONE original preset identity.
     /// Offline transitions do not discard it; reconnect/wake/app restart can finish the return.
-    public func reconcile(minute: Int, device: PresetDevice?, now: Date = Date(), calendar: Calendar = .current) throws {
+    public func reconcile(minute: Int, device: PresetDevice?, now: Date = Date(), calendar: Calendar = .current,
+                          isHDR: Bool = false) throws {
         try checkStorage()
         let tasks = configuration.tasks.filter { task in
             task.presetID == PicturePreset.baselineID || configuration.presets.contains { $0.id == task.presetID }
@@ -179,6 +180,8 @@ public final class PresetEngine {
             throw PresetError("自动任务等待连接原显示器，未向当前设备写入")
         }
         if let wanted {
+            // 杜比/HDR 场景延迟：本次不套用，等状态变化后的下一轮 reconcile 再生效。
+            if wanted.deferWhileHDR && isHDR { return }
             let occurrence = PresetSchedule.occurrenceStart(wanted, minute: minute, now: now, calendar: calendar)
             var config = configuration
             if let session = config.session, session.taskID == wanted.id,

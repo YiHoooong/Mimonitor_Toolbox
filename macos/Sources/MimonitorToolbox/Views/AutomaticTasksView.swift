@@ -98,6 +98,7 @@ private struct AutomaticTaskSheet: View {
                 DatePicker("开始时间", selection: timeBinding(start: true), displayedComponents: .hourAndMinute)
                 DatePicker("结束时间", selection: timeBinding(start: false), displayedComponents: .hourAndMinute)
                 Toggle("启用任务", isOn: $task.enabled)
+                Toggle("杜比/HDR 时延迟至状态变化后生效", isOn: $task.deferWhileHDR)
             }
             Text("每天按所选时间执行，支持跨午夜，例如 23:00–02:00。开始时间包含在时段内，结束时间不包含；两者不能相同。")
                 .font(.callout).foregroundColor(.secondary)

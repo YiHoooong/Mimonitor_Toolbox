@@ -66,7 +66,9 @@ from .widgets import (
     AddPresetCard,
     AddTaskCard,
     AutoTaskCard,
+    AutoTaskOptionsDialog,
     FlowContainer,
+    NoWheelSlider,
     PageScrollSlider,
     PresetCard,
     PresetNameDialog,
@@ -799,16 +801,25 @@ class PagesMixin:
         self._clear_task_cards(layout)
         options = self._auto_task_preset_options()
         editing_id = getattr(self, "_auto_task_editing_id", None)
+        cards = []
         for task in self._auto_task_list():
             card = AutoTaskCard(task.get("id"),
                                 self._task_time(task, "start", "08:00"),
                                 self._task_time(task, "end", "10:00"),
-                                task.get("preset_id"), options, host)
+                                task.get("preset_id"), options,
+                                enabled=task.get("enabled", True),
+                                options=task.get("options"), parent=host)
             card.saved.connect(self._auto_task_save)
             card.deleted.connect(self._auto_task_delete)
-            if task.get("id") == editing_id:
-                card.set_editing(True)      # 刚新建的那条直接进编辑态
+            card.enabled_changed.connect(self._auto_task_set_enabled)
+            card.options_requested.connect(self._auto_task_options)
+            card.editing_changed.connect(self._auto_task_editing_changed)
             layout.addWidget(card)
+            cards.append(card)
+        self._auto_task_cards = cards
+        for card in cards:
+            if card.task_id == editing_id:
+                card.set_editing(True)      # 刚新建的那条直接进编辑态
         add_card = AddTaskCard(host)
         add_card.clicked.connect(self._auto_task_add)
         layout.addWidget(add_card)
@@ -1004,6 +1015,36 @@ class PagesMixin:
         self._auto_task_editing_id = None
         self.log(f"已保存自动任务 {start}–{end}")
         self._auto_task_sync()
+
+    def _auto_task_editing_changed(self, task_id, editing):
+        """同一时刻只允许一条任务在编辑：其余卡片的编辑按钮置灰。"""
+        if editing:
+            self._auto_task_editing_id = task_id
+        for card in getattr(self, "_auto_task_cards", []):
+            if card.task_id != task_id:
+                card.action_button.setEnabled(not editing)
+
+    def _auto_task_set_enabled(self, task_id, enabled):
+        tasks = self._auto_task_list()
+        for task in tasks:
+            if task.get("id") == task_id:
+                task["enabled"] = bool(enabled)
+        update_settings({"auto_tasks": tasks})
+        self.log(f"自动任务{'启用' if enabled else '停用'}: {task_id}")
+
+    def _auto_task_options(self, task_id):
+        task = next((t for t in self._auto_task_list() if t.get("id") == task_id), None)
+        if task is None:
+            return
+        dialog = AutoTaskOptionsDialog(task.get("options"), self)
+        if not dialog.exec():
+            return
+        tasks = self._auto_task_list()
+        for item in tasks:
+            if item.get("id") == task_id:
+                item["options"] = dialog.options()
+        update_settings({"auto_tasks": tasks})
+        self.log("自动任务选项已保存")
 
     def _auto_task_delete(self, task_id):
         task = next((t for t in self._auto_task_list() if t.get("id") == task_id), None)
@@ -1368,7 +1409,7 @@ class PagesMixin:
         seconds_layout.setSpacing(12)
         seconds_layout.addWidget(BodyLabel("倒计时时长", self.countdown_seconds_row))
 
-        self.countdown_seconds_slider = Slider(
+        self.countdown_seconds_slider = NoWheelSlider(
             Qt.Orientation.Horizontal, self.countdown_seconds_row)
         self.countdown_seconds_slider.setRange(2, 30)
         self.countdown_seconds_slider.setSingleStep(1)

@@ -799,6 +799,7 @@ class DisplayFeaturesMixin:
         self._auto_task_checking = False
         self._auto_task_active_id = None
         self._auto_task_waiting_id = None
+        self._auto_task_deferred_id = None
         self._auto_task_timer = _QTimer(self)
         self._auto_task_timer.setInterval(15000)
         self._auto_task_timer.timeout.connect(self._auto_task_tick)
@@ -834,6 +835,7 @@ class DisplayFeaturesMixin:
                 finished = self._auto_task_active_id
                 self._auto_task_active_id = None
                 self._auto_task_waiting_id = None
+                self._auto_task_deferred_id = None
                 if finished:
                     self._end_auto_task(finished)
                 return
@@ -844,7 +846,14 @@ class DisplayFeaturesMixin:
                     self.log("自动任务的时段已到，但显示器未连接，等连上后再看是否仍在时段内")
                 return
 
+            if (active.get("options") or {}).get("defer_while_hdr") and self._scene_is_hdr():
+                if self._auto_task_deferred_id != active_id:
+                    self._auto_task_deferred_id = active_id
+                    self.log("自动任务时段已到，但当前为杜比/HDR 场景，延迟至状态变化后生效")
+                return
+
             self._auto_task_waiting_id = None
+            self._auto_task_deferred_id = None
             self._auto_task_active_id = active_id
             self._start_auto_task(active)
         finally:
@@ -855,6 +864,13 @@ class DisplayFeaturesMixin:
             if isinstance(task, dict) and task.get("id") == task_id:
                 return task
         return None
+
+    def _scene_is_hdr(self):
+        """当前是否杜比/HDR 场景：Windows HDR 开着或面板处于 HDR/Dolby 模式。"""
+        if getattr(self, "_hdr_windows_state", None) is True:
+            return True
+        return is_hdr_tone_mapping_picture_mode(
+            getattr(self, "current_vals", {}).get("picture_mode"))
 
     def _start_auto_task(self, task):
         preset_id = task.get("preset_id")
@@ -886,7 +902,9 @@ class DisplayFeaturesMixin:
             tasks = load_settings().get("auto_tasks") or []
             for item in tasks:
                 if isinstance(item, dict) and item.get("id") == task_id:
-                    item["snapshot"] = {"values": snapshot, "at": time.strftime("%Y-%m-%d %H:%M:%S")}
+                    item["snapshot"] = {"values": snapshot,
+                                        "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                        "active_preset_id": self.active_preset_id()}
             update_settings({"auto_tasks": tasks})
 
         def finished(result):
@@ -916,8 +934,18 @@ class DisplayFeaturesMixin:
             return
         self.log("自动任务时段结束，正在还原之前的设置")
         self._clear_task_snapshot(task_id)
+        prior_active = snapshot.get("active_preset_id")
+
+        def finished(result):
+            if result is None:
+                return
+            # 还原快照的同时还原"当前预设"，否则记忆挂起会残留到时段之外。
+            update_settings({"active_preset_id": prior_active})
+            self._refresh_preset_views()
+
         # 不动 preset_snapshot —— 那是"手动应用预设"的撤销槽，自动任务不该覆盖它。
-        self._apply_picture_values(values, "自动任务结束：还原设置", quiet=True)
+        self._apply_picture_values(values, "自动任务结束：还原设置", quiet=True,
+                                   on_finished=finished)
 
     def trigger_adjust_hotkey(self, rule):
         if not getattr(self, "adb_connected", False):

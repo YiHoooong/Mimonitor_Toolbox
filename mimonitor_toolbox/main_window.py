@@ -117,7 +117,13 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
 
         # Window properties
         self.setWindowTitle("红米 G Pro 27U Toolbox")
-        self.resize(1000, 750)
+        # 自动任务卡片一行（原尺寸控件 + 启用开关 + 选项按钮）实测约 926px；
+        # 默认收起侧栏时 1100 宽约剩 991px 可放下。展开侧栏会更紧，属小窗口的取舍。
+        self.setMinimumSize(1100, 700)
+        self.resize(1100, 740)
+        # qfluentwidgets 默认窗口宽 ≥1008 就把侧栏自动展开(322px)挤占内容；
+        # 旧版 1000 宽在阈值下所以侧栏不挤。抬高阈值禁用自动展开，恢复旧版观感。
+        self.navigationInterface.panel.setMinimumExpandWidth(1 << 30)
 
         # Connect signals
         self.log_signal.connect(self._on_log)

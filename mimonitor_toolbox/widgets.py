@@ -64,6 +64,7 @@ from qfluentwidgets import (
     SimpleCardWidget,
     Slider,
     SubtitleLabel,
+    SwitchButton,
     SystemTrayMenu,
     TimePicker,
     TransparentToolButton,
@@ -1507,6 +1508,13 @@ def pick_time(button, current, on_change=None):
     return chosen["value"]
 
 
+class NoWheelSlider(Slider):
+    """忽略滚轮的滑竿：滚页面时不误改数值（如倒计时时长）。"""
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
 class AutoTaskCard(SimpleCardWidget):
     """一条自动任务：一行排开「开始时间 / 结束时间 / 套用预设」+ 编辑·保存 / 删除。
 
@@ -1518,11 +1526,16 @@ class AutoTaskCard(SimpleCardWidget):
 
     saved = pyqtSignal(str, dict)      # task_id, {start, end, preset_id}
     deleted = pyqtSignal(str)
+    enabled_changed = pyqtSignal(str, bool)
+    options_requested = pyqtSignal(str)
+    editing_changed = pyqtSignal(str, bool)
 
-    def __init__(self, task_id, start, end, preset_id, preset_options, parent=None):
+    def __init__(self, task_id, start, end, preset_id, preset_options,
+                 enabled=True, options=None, parent=None):
         super().__init__(parent)
         self.task_id = task_id
         self._editing = False
+        self._options = dict(options or {})
 
         self.setFixedHeight(AUTO_TASK_CARD_HEIGHT)
         row = QHBoxLayout(self)
@@ -1559,19 +1572,31 @@ class AutoTaskCard(SimpleCardWidget):
         row.addWidget(self.preset_combo)
         row.addStretch(1)
 
+        self.enabled_switch = SwitchButton(self)
+        self.enabled_switch.setOnText("开")
+        self.enabled_switch.setOffText("关")
+        self.enabled_switch.setChecked(bool(enabled))
+        self.enabled_switch.setToolTip("启用 / 停用该自动任务")
+        self.enabled_switch.checkedChanged.connect(
+            lambda on: self.enabled_changed.emit(self.task_id, bool(on)))
         self.action_button = PrimaryPushButton("编辑", self)
         self.action_button.setFixedWidth(72)
         self.action_button.clicked.connect(self._on_action)
         self.delete_button = PushButton("删除", self)
         self.delete_button.setFixedWidth(72)
         self.delete_button.clicked.connect(lambda: self.deleted.emit(self.task_id))
+        self.options_button = TransparentToolButton(FIF.SETTING, self)
+        self.options_button.setToolTip("任务选项")
+        self.options_button.clicked.connect(lambda: self.options_requested.emit(self.task_id))
 
         # 横排：卡片是整行宽的，横向空间足够；竖排会把按钮压到最小高度以下、
         # 文字被裁掉（76px 卡片减去上下边距只剩 56px，两个按钮各分不到 25px）。
         buttons = QHBoxLayout()
         buttons.setSpacing(8)
+        buttons.addWidget(self.enabled_switch)
         buttons.addWidget(self.action_button)
         buttons.addWidget(self.delete_button)
+        buttons.addWidget(self.options_button)
         row.addLayout(buttons)
 
         self.set_editing(False)
@@ -1585,6 +1610,7 @@ class AutoTaskCard(SimpleCardWidget):
         for widget in (self.start_button, self.end_button, self.preset_combo):
             widget.setEnabled(self._editing)
         self.action_button.setText("保存" if self._editing else "编辑")
+        self.editing_changed.emit(self.task_id, self._editing)
 
     def set_time(self, which, value):
         """设定开始 / 结束时间。
@@ -1656,6 +1682,40 @@ class AddTaskCard(QWidget):
         if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.position().toPoint()):
             self.clicked.emit()
         super().mouseReleaseEvent(event)
+
+
+class AutoTaskOptionsDialog(MessageBoxBase):
+    """自动任务选项弹窗：一行说明 + 一个开关。
+
+    后续新选项往 ``_OPTION_ROWS`` 追加 (key, 文案) 即可，不用改布局代码。
+    """
+
+    _OPTION_ROWS = (
+        ("defer_while_hdr", "如果执行任务时场景为杜比（HDR）下延迟至状态变化后生效"),
+    )
+
+    def __init__(self, options, parent=None):
+        super().__init__(parent)
+        self._switches = {}
+        self.titleLabel = SubtitleLabel("任务选项", self)
+        self.viewLayout.addWidget(self.titleLabel)
+        for key, text in self._OPTION_ROWS:
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            label = BodyLabel(text, self)
+            label.setWordWrap(True)
+            switch = SwitchButton(self)
+            switch.setChecked(bool((options or {}).get(key, False)))
+            row.addWidget(label, 1)
+            row.addWidget(switch)
+            self.viewLayout.addLayout(row)
+            self._switches[key] = switch
+        self.widget.setMinimumWidth(460)
+        self.yesButton.setText("保存")
+        self.cancelButton.setText("取消")
+
+    def options(self):
+        return {key: switch.isChecked() for key, switch in self._switches.items()}
 
 
 class ScanSettingsDialog(MessageBoxBase):

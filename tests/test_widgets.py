@@ -592,6 +592,42 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class AutoTaskCardTests(unittest.TestCase):
+    """自动任务卡片：启用开关 / 选项按钮 / 选项弹窗（issue #24 延迟选项）。"""
+
+    def _card(self, **kw):
+        from PyQt6.QtCore import QTime
+
+        from mimonitor_toolbox.widgets import AutoTaskCard
+        return AutoTaskCard("t1", QTime(8, 0), QTime(10, 0), "p1",
+                            [("预设", "p1")], **kw)
+
+    def test_enable_switch_emits_and_reflects_state(self):
+        card = self._card(enabled=True)
+        self.assertTrue(card.enabled_switch.isChecked())
+        got = []
+        card.enabled_changed.connect(lambda tid, on: got.append((tid, on)))
+        card.enabled_switch.setChecked(False)
+        self.assertEqual(got, [("t1", False)])
+
+    def test_options_button_emits_request(self):
+        card = self._card()
+        got = []
+        card.options_requested.connect(got.append)
+        card.options_button.click()
+        self.assertEqual(got, ["t1"])
+
+    def test_options_dialog_round_trip_and_default(self):
+        from PyQt6.QtWidgets import QWidget
+
+        from mimonitor_toolbox.widgets import AutoTaskOptionsDialog
+        parent = QWidget()
+        on = AutoTaskOptionsDialog({"defer_while_hdr": True}, parent)
+        self.assertEqual(on.options(), {"defer_while_hdr": True})
+        off = AutoTaskOptionsDialog(None, parent)
+        self.assertEqual(off.options(), {"defer_while_hdr": False})
+
+
 class FlowContainerTests(unittest.TestCase):
     """预设卡片网格的容器：换行与高度透传。
 

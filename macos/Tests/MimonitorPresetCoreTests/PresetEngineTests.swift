@@ -41,6 +41,23 @@ final class PresetEngineTests: XCTestCase {
         XCTAssertNil(engine.configuration.activePresetID)
     }
 
+    func testDeferWhileHDRSkipsApplyUntilHDROff() throws {
+        let engine = PresetEngine(store: store())
+        let monitor = Monitor()
+        let preset = try engine.create(name: "游戏", device: monitor)
+        let task = ScheduledPresetTask(presetID: preset.id, start: "09:00", end: "10:00",
+                                       deferWhileHDR: true)
+        try engine.saveTask(task)
+        // HDR/杜比 开着：到点不套用，也不建立 session
+        try engine.reconcile(minute: 550, device: monitor, isHDR: true)
+        XCTAssertNil(engine.configuration.session)
+        XCTAssertNil(engine.configuration.activePresetID)
+        // HDR 关掉：下一轮 reconcile 生效
+        try engine.reconcile(minute: 551, device: monitor, isHDR: false)
+        XCTAssertEqual(engine.configuration.session?.appliedTargetID, preset.id)
+        XCTAssertEqual(engine.configuration.activePresetID, preset.id)
+    }
+
     func testCreateAndRenameAvoidDuplicateNamesWithoutBreakingTaskReference() throws {
         let engine = PresetEngine(store: store())
         let monitor = Monitor()

@@ -23,6 +23,21 @@ final class PresetScheduleTests: XCTestCase {
         XCTAssertFalse(disabled.contains(minute: 550))
     }
 
+    func testDeferWhileHDRDecodesWithBackwardCompat() throws {
+        let old = #"{"id":"t","presetID":"p","start":"08:00","end":"10:00","enabled":true}"#
+        let legacy = try JSONDecoder().decode(ScheduledPresetTask.self, from: Data(old.utf8))
+        XCTAssertFalse(legacy.deferWhileHDR)
+        let new = #"{"id":"t","presetID":"p","start":"08:00","end":"10:00","enabled":true,"deferWhileHDR":true}"#
+        let modern = try JSONDecoder().decode(ScheduledPresetTask.self, from: Data(new.utf8))
+        XCTAssertTrue(modern.deferWhileHDR)
+    }
+
+    func testDeferWhileHDRDoesNotChangePeriodMatching() {
+        let task = ScheduledPresetTask(presetID: "p", start: "09:00", end: "10:00", deferWhileHDR: true)
+        XCTAssertTrue(task.contains(minute: 550))
+        XCTAssertEqual(PresetSchedule.activeTask([task], minute: 550)?.id, task.id)
+    }
+
     func testLastMatchingTaskWins() {
         let a = ScheduledPresetTask(presetID: "a", start: "09:00", end: "11:00")
         let b = ScheduledPresetTask(presetID: "b", start: "10:00", end: "12:00")

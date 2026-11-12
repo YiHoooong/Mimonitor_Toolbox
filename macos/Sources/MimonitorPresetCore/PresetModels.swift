@@ -16,10 +16,24 @@ public struct ScheduledPresetTask: Codable, Equatable, Identifiable {
     public var start: String
     public var end: String
     public var enabled: Bool
+    /// 杜比/HDR 场景下延迟至状态变化后生效（issue #24）。旧配置无此键时默认 false。
+    public var deferWhileHDR: Bool
     public init(id: String = UUID().uuidString, presetID: String, start: String, end: String,
-                enabled: Bool = true) {
+                enabled: Bool = true, deferWhileHDR: Bool = false) {
         self.id = id; self.presetID = presetID; self.start = start; self.end = end
-        self.enabled = enabled
+        self.enabled = enabled; self.deferWhileHDR = deferWhileHDR
+    }
+    private enum CodingKeys: String, CodingKey {
+        case id, presetID, start, end, enabled, deferWhileHDR
+    }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        presetID = try c.decode(String.self, forKey: .presetID)
+        start = try c.decode(String.self, forKey: .start)
+        end = try c.decode(String.self, forKey: .end)
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        deferWhileHDR = try c.decodeIfPresent(Bool.self, forKey: .deferWhileHDR) ?? false
     }
     public var isValid: Bool {
         guard !id.isEmpty, !presetID.isEmpty,

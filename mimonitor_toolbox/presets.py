@@ -412,6 +412,8 @@ def find_active_task(tasks, now_minutes):
     for task in tasks or ():
         if not valid_task(task):
             continue
+        if not task.get("enabled", True):
+            continue
         start = parse_hhmm(task["start"])
         end = parse_hhmm(task["end"])
         if is_in_period(now_minutes, start, end):
