@@ -6,6 +6,16 @@ from unittest import mock
 class AdbModuleTests(unittest.TestCase):
     """捕获私有 server 端口丢失和 MiTV 型号识别失效。"""
 
+    def setUp(self):
+        from mimonitor_toolbox import adb as adb_runtime
+
+        adb_runtime.clear_ignored_scan_ips()
+
+    def tearDown(self):
+        from mimonitor_toolbox import adb as adb_runtime
+
+        adb_runtime.clear_ignored_scan_ips()
+
     def test_adb_command_uses_private_server_port(self):
         from mimonitor_toolbox import adb as adb_runtime
 
@@ -239,6 +249,85 @@ class ConnectByDeviceStateTests(unittest.TestCase):
 
     def test_scan_skips_device_with_empty_output_and_offline_state(self):
         self.assertEqual(self._scan_with("offline", ""), [])
+
+    def test_scan_adb_caches_unauthorized_and_non_mitv_ips_until_cleared(self):
+        import ipaddress
+        from mimonitor_toolbox import adb as adb_runtime
+
+        networks = [mock.Mock(ip=ipaddress.ip_address("192.168.1.0"), netmask="255.255.255.0")]
+        ip_unauth = ipaddress.ip_address("192.168.1.50")
+        ip_phone = ipaddress.ip_address("192.168.1.60")
+        ip_mitv = ipaddress.ip_address("192.168.1.70")
+        all_targets = [
+            mock.Mock(ip=ip_unauth),
+            mock.Mock(ip=ip_phone),
+            mock.Mock(ip=ip_mitv),
+        ]
+        probe_target_batches = []
+        connect_calls = []
+        connected_serials = set()
+
+        def fake_probe_tcp_targets(targets, _cancel_event, log=None):
+            batch = list(targets)
+            probe_target_batches.append([str(t.ip) for t in batch])
+            return batch
+
+        def fake_adb_run(args, timeout=10, check=False):
+            if args[0] == "connect":
+                connect_calls.append(args[1])
+                connected_serials.add(args[1])
+                return f"connected to {args[1]}"
+            if "get-state" in args:
+                serial = args[1]
+                if serial not in connected_serials:
+                    return f"error: device '{serial}' not found"
+                if serial.startswith("192.168.1.50"):
+                    return "unauthorized"
+                return "device"
+            if "getprop ro.product.model" in args:
+                serial = args[1]
+                if serial.startswith("192.168.1.60"):
+                    return "Pixel 8"
+                if serial.startswith("192.168.1.70"):
+                    return "MiTV-MFFU1"
+            return ""
+
+        with mock.patch.object(adb_runtime, "get_windows_scan_networks", return_value=networks), \
+                mock.patch.object(adb_runtime, "build_probe_targets", return_value=list(all_targets)), \
+                mock.patch.object(adb_runtime, "probe_tcp_targets", side_effect=fake_probe_tcp_targets), \
+                mock.patch.object(adb_runtime, "ensure_adb_server", return_value=True), \
+                mock.patch.object(adb_runtime, "adb_run", side_effect=fake_adb_run):
+            first = adb_runtime.scan_adb()
+            self.assertEqual(first, [("192.168.1.60", "Pixel 8"), ("192.168.1.70", "MiTV-MFFU1")])
+            self.assertEqual(
+                adb_runtime.get_ignored_scan_ips(),
+                {"192.168.1.50", "192.168.1.60"},
+            )
+            self.assertEqual(
+                connect_calls,
+                ["192.168.1.50:5555", "192.168.1.60:5555", "192.168.1.70:5555"],
+            )
+
+            connect_calls.clear()
+            connected_serials.clear()
+            second = adb_runtime.scan_adb()
+            self.assertEqual(second, [("192.168.1.70", "MiTV-MFFU1")])
+            self.assertEqual(probe_target_batches[-1], ["192.168.1.70"])
+            self.assertEqual(connect_calls, ["192.168.1.70:5555"])
+
+            adb_runtime.clear_ignored_scan_ips()
+            connect_calls.clear()
+            connected_serials.clear()
+            third = adb_runtime.scan_adb()
+            self.assertEqual(len(third), 2)
+            self.assertEqual(
+                probe_target_batches[-1],
+                ["192.168.1.50", "192.168.1.60", "192.168.1.70"],
+            )
+            self.assertEqual(
+                connect_calls,
+                ["192.168.1.50:5555", "192.168.1.60:5555", "192.168.1.70:5555"],
+            )
 
     def test_reconnect_disconnects_then_ensures_device_state(self):
         from mimonitor_toolbox import adb as adb_runtime

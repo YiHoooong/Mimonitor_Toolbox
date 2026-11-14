@@ -143,4 +143,41 @@ final class AdbClientTests: XCTestCase {
             XCTAssertTrue(client.setMediaVolume(42, showUI: true))
         }
     }
+
+    func testScanProbeCachesUnauthorizedAndNonMitvIPsUntilCleared() throws {
+        let logFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("adb-scan-cache-\(UUID().uuidString).log")
+        defer { try? FileManager.default.removeItem(at: logFile) }
+
+        try fake("""
+        echo "$*" >> "\(logFile.path)"
+        case "$1" in
+          connect|disconnect) exit 0 ;;
+          -s)
+            case "$2:$3" in
+              "192.168.1.50:5555:get-state") echo unauthorized ;;
+              "192.168.1.60:5555:get-state") echo device ;;
+              "192.168.1.60:5555:shell") echo "Pixel 8" ;;
+              "192.168.1.70:5555:get-state") echo device ;;
+              "192.168.1.70:5555:shell") echo "MiTV-MFFU1" ;;
+            esac ;;
+        esac
+        """) { client in
+            XCTAssertNil(client.probeScannedDevice(ip: "192.168.1.50"))
+            XCTAssertEqual(client.probeScannedDevice(ip: "192.168.1.60")?.model, "Pixel 8")
+            XCTAssertEqual(client.probeScannedDevice(ip: "192.168.1.70")?.model, "MiTV-MFFU1")
+
+            let firstCount = (try? String(contentsOf: logFile))?.split(separator: "\n").count ?? 0
+            // Repeat auto probes skip unauthorized / non-MiTV IPs without invoking adb connect
+            XCTAssertNil(client.probeScannedDevice(ip: "192.168.1.50"))
+            XCTAssertNil(client.probeScannedDevice(ip: "192.168.1.60"))
+            let afterSkippedCount = (try? String(contentsOf: logFile))?.split(separator: "\n").count ?? 0
+            XCTAssertEqual(firstCount, afterSkippedCount)
+
+            client.clearIgnoredScanIPs()
+            XCTAssertEqual(client.probeScannedDevice(ip: "192.168.1.60")?.model, "Pixel 8")
+            let afterClearedCount = (try? String(contentsOf: logFile))?.split(separator: "\n").count ?? 0
+            XCTAssertGreaterThan(afterClearedCount, afterSkippedCount)
+        }
+    }
 }

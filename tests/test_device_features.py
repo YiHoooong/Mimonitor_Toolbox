@@ -71,6 +71,8 @@ class ReconnectHost(device_features.DeviceFeaturesMixin):
         self._resume_target_available = None
         self._resume_discovery_checking = False
         self._resume_discovery_cancel_event = None
+        self._resume_discovery_exhausted = False
+        self._connected_on_current_network = False
         self._resume_next_discovery_at = 0.0
         self._resume_manual_selection_required = False
         self._resume_retry_timer = FakeTimer()
@@ -557,7 +559,7 @@ class WindowsResumeReconnectTests(unittest.TestCase):
         save_settings.assert_called_once_with({"saved_ip": "192.168.5.5"})
         self.assertEqual(reconnect_reasons, ["局域网发现显示器"])
 
-    def test_waiting_recovery_throttles_full_network_discovery_to_thirty_seconds(self):
+    def test_waiting_recovery_stops_background_scan_after_one_pass_and_resets_on_network_change(self):
         host = ReconnectHost()
         host._resume_reconnect_generation = 4
         host._resume_waiting_for_network = True
@@ -570,12 +572,12 @@ class WindowsResumeReconnectTests(unittest.TestCase):
         with mock.patch.object(
             device_features.time,
             "monotonic",
-            side_effect=[129.0, 130.0, 130.0, 130.0],
+            side_effect=[129.0, 130.0, 160.0],
         ), mock.patch.object(
             device_features,
             "is_tcp_endpoint_open",
             return_value=False,
-        ), mock.patch.object(
+        ) as tcp_probe, mock.patch.object(
             device_features,
             "scan_adb",
             return_value=[],
@@ -586,9 +588,62 @@ class WindowsResumeReconnectTests(unittest.TestCase):
         ):
             host._check_resume_network_change()
             host._check_resume_network_change()
+            # 此后即使再次进入周期检查，也不再重复扫描全网段，而改为单点探测旧 IP
+            host._check_resume_network_change()
 
         scan.assert_called_once()
-        self.assertEqual(host._resume_next_discovery_at, 160.0)
+        self.assertTrue(host._resume_discovery_exhausted)
+        self.assertEqual(host._resume_next_discovery_at, 0.0)
+        self.assertEqual(tcp_probe.call_count, 2)
+
+    def test_previously_connected_monitor_skips_subnet_scan_and_uses_fast_single_ip_probe(self):
+        from mimonitor_toolbox import adb as adb_runtime
+
+        host = ReconnectHost()
+        host._resume_reconnect_generation = 4
+        host._resume_target_available = True
+        host._network_signature = lambda: ((7, "192.168.5.8", "192.168.5.0/24"),)
+        host.resume_discovery_finished.callback = host._finish_resume_discovery
+        host.reconnect_target_probe_finished.callback = host._finish_reconnect_target_probe
+        adb_runtime.ignore_scan_ip(host.adb.ip)
+        try:
+            # 先经历一次连接成功：记录当前网段已验证过显示器，并清空端口缓存状态
+            host._finish_resume_reconnect_attempt(4, 1, True, "MiTV-MFFU1")
+            self.assertTrue(host._connected_on_current_network)
+            self.assertIsNone(host._resume_target_available)
+            self.assertNotIn(host.adb.ip, adb_runtime.get_ignored_scan_ips())
+
+            # 后续显示器关机断连 5 次后，不应扫全网段，只启动 2 秒单点监听
+            with mock.patch.object(device_features, "scan_adb") as scan, \
+                    mock.patch.object(device_features, "async_run", side_effect=lambda fn: fn()), \
+                    mock.patch.object(device_features, "is_tcp_endpoint_open", return_value=True):
+                host._finish_resume_reconnect_attempt(4, 5, False, "offline")
+                self.assertEqual(host._resume_network_timer.start_calls[-1], 2000)
+                scan.assert_not_called()
+
+                # 显示器重新开机打开 5555 端口：单点探测立刻触发重连（因为 _resume_target_available 已被重置为 None）
+                attempts = []
+                host._run_resume_reconnect_attempt = lambda: attempts.append("reconnect")
+                host._check_resume_network_change()
+                self.assertEqual(attempts, ["reconnect"])
+        finally:
+            adb_runtime.clear_ignored_scan_ips()
+
+        # 若主机网络变化（如切 Wi-Fi / 网段变更），重置状态并清理忽略缓存
+        host._resume_waiting_for_network = True
+        host._connected_on_current_network = True
+        host._resume_discovery_exhausted = True
+        host._resume_network_signature = ((7, "192.168.5.8", "192.168.5.0/24"),)
+        host._network_signature = lambda: ((9, "10.0.0.8", "10.0.0.0/24"),)
+        host._run_resume_reconnect_attempt = lambda: None
+        adb_runtime.ignore_scan_ip("192.168.1.50")
+        try:
+            host._check_resume_network_change()
+            self.assertFalse(host._connected_on_current_network)
+            self.assertFalse(host._resume_discovery_exhausted)
+            self.assertEqual(adb_runtime.get_ignored_scan_ips(), set())
+        finally:
+            adb_runtime.clear_ignored_scan_ips()
 
     def test_fresh_old_ip_retry_cycle_preserves_existing_full_scan_deadline(self):
         host = ReconnectHost()

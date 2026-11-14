@@ -500,7 +500,7 @@ final class AppState: ObservableObject {
             .trimmingCharacters(in: .whitespaces)
         if saved.isEmpty {
             log("启动自动连接: 未找到上次设备，开始扫描内网")
-            scanNet()
+            scanNet(isAuto: true)
             return
         }
         ipInput = saved
@@ -521,6 +521,7 @@ final class AppState: ObservableObject {
             let (ok, state) = self.adb.ensureConnected()
 
             if ok {
+                self.adb.unignoreScanIP(ip)
                 // 连接后先确保 JNI 依赖的 jar 已部署到设备（原版 check_and_heal_jar）
                 self.adb.ensureJars()
                 let model = self.adb.getModel()
@@ -562,7 +563,7 @@ final class AppState: ObservableObject {
                     self.connectionStatus = .disconnected
                     if isAuto {
                         self.log("启动自动连接失败: \(state)，开始扫描内网")
-                        self.scanNet()
+                        self.scanNet(isAuto: true)
                     } else {
                         self.log("连接失败: \(state)")
                     }
@@ -618,12 +619,15 @@ final class AppState: ObservableObject {
         updateAutomaticTaskStatus()
     }
 
-    func scanNet() {
+    func scanNet(isAuto: Bool = false) {
         switch connectionStatus {
         case .disconnected: break
         case .connecting: log("正在连接显示器，请等待连接完成或先断开"); return
         case .connected: log("已连接显示器，请先断开后扫描"); return
         case .scanning: log("正在扫描内网，请等待扫描完成"); return
+        }
+        if !isAuto {
+            adb.clearIgnoredScanIPs()
         }
         let request = connectionIntent.beginScan()
         connectionStatus = .scanning

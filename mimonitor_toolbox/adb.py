@@ -691,7 +691,37 @@ def is_mitv_model(model):
     return "mitv" in str(model or "").lower()
 
 
-def scan_adb(cb=None, log=None, cancel_event=None):
+_ignored_scan_ips_lock = threading.Lock()
+_ignored_scan_ips: set[str] = set()
+
+
+def ignore_scan_ip(ip):
+    text = str(ip or "").strip()
+    if not text:
+        return
+    with _ignored_scan_ips_lock:
+        _ignored_scan_ips.add(text)
+
+
+def unignore_scan_ip(ip):
+    text = str(ip or "").strip()
+    if not text:
+        return
+    with _ignored_scan_ips_lock:
+        _ignored_scan_ips.discard(text)
+
+
+def clear_ignored_scan_ips():
+    with _ignored_scan_ips_lock:
+        _ignored_scan_ips.clear()
+
+
+def get_ignored_scan_ips():
+    with _ignored_scan_ips_lock:
+        return set(_ignored_scan_ips)
+
+
+def scan_adb(cb=None, log=None, cancel_event=None, *, skip_ignored=True):
     """扫描全部有效物理网卡，并通过临时 ADB 连接读取设备型号。"""
 
     cancel_event = cancel_event or threading.Event()
@@ -706,6 +736,10 @@ def scan_adb(cb=None, log=None, cancel_event=None):
         raise WindowsAdapterError("未找到可扫描的物理网卡")
     ensure_adb_server()
     targets = build_probe_targets(networks, log=log)
+    if skip_ignored:
+        ignored_ips = get_ignored_scan_ips()
+        if ignored_ips:
+            targets = [item for item in targets if str(item.ip) not in ignored_ips]
     probe_results = probe_tcp_targets(targets, cancel_event, log=log)
     probe_results.sort(key=lambda item: int(item.ip))
 
@@ -714,6 +748,8 @@ def scan_adb(cb=None, log=None, cancel_event=None):
         if cancel_event.is_set():
             break
         ip = str(result.ip)
+        if skip_ignored and ip in get_ignored_scan_ips():
+            continue
         target = Adb(ip)
         try:
             if log:
@@ -724,6 +760,8 @@ def scan_adb(cb=None, log=None, cancel_event=None):
                 continue
             state = target.ensure_connected()[1]
             if state != "device":
+                if "unauthorized" in str(state or "").lower():
+                    ignore_scan_ip(ip)
                 if log:
                     log(f"[扫描] {ip} 状态为 {state}，跳过")
                 continue
@@ -732,6 +770,10 @@ def scan_adb(cb=None, log=None, cancel_event=None):
             model = target.shell("getprop ro.product.model", check=False).strip()
             if not model or adb_text_has_disconnected_marker(model):
                 continue
+            if is_mitv_model(model):
+                unignore_scan_ip(ip)
+            else:
+                ignore_scan_ip(ip)
             found.append((ip, model))
             if cb:
                 cb(ip, model)

@@ -12,6 +12,37 @@ final class AdbClient {
     let serverPort: String
     var ip: String = ""
     private let channelLock = NSRecursiveLock()
+    private let ignoredScanLock = NSLock()
+    private var ignoredScanIPs: Set<String> = []
+
+    func clearIgnoredScanIPs() {
+        ignoredScanLock.lock()
+        ignoredScanIPs.removeAll()
+        ignoredScanLock.unlock()
+    }
+
+    func unignoreScanIP(_ targetIP: String) {
+        let trimmed = targetIP.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        ignoredScanLock.lock()
+        ignoredScanIPs.remove(trimmed)
+        ignoredScanLock.unlock()
+    }
+
+    private func ignoreScanIP(_ targetIP: String) {
+        let trimmed = targetIP.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        ignoredScanLock.lock()
+        ignoredScanIPs.insert(trimmed)
+        ignoredScanLock.unlock()
+    }
+
+    private func isScanIPIgnored(_ targetIP: String) -> Bool {
+        let trimmed = targetIP.trimmingCharacters(in: .whitespacesAndNewlines)
+        ignoredScanLock.lock()
+        defer { ignoredScanLock.unlock() }
+        return ignoredScanIPs.contains(trimmed)
+    }
 
     /// All ADB commands participate, including connection/recovery and JNI batch reads.
     /// A recursive lock permits a whole preset capture/apply to nest existing helpers.
@@ -128,8 +159,9 @@ final class AdbClient {
     // MARK: - 基础命令
 
     /// Temporary, target-pinned validation. Never changes the active display or restarts its server.
-    func probeScannedDevice(ip targetIP: String) -> ScannedDevice? {
+    func probeScannedDevice(ip targetIP: String, skipIgnored: Bool = true) -> ScannedDevice? {
         guard !targetIP.isEmpty else { return nil }
+        if skipIgnored && isScanIPIgnored(targetIP) { return nil }
         return transaction {
             let target = "\(targetIP):5555"
             defer { _ = run(["disconnect", target], timeout: 3) }
@@ -139,10 +171,19 @@ final class AdbClient {
                 let result = run(["-s", target, "get-state"], timeout: 2)
                 let state = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
                 if result.exitCode == 0 && state == "device" { break }
-                if state.contains("unauthorized") || Date() >= deadline { return nil }
+                if state.contains("unauthorized") {
+                    ignoreScanIP(targetIP)
+                    return nil
+                }
+                if Date() >= deadline { return nil }
                 Thread.sleep(forTimeInterval: 0.25)
             }
             guard let model = try? checkedShell("getprop ro.product.model", target: target), !model.isEmpty else { return nil }
+            if model.lowercased().contains("mitv") {
+                unignoreScanIP(targetIP)
+            } else {
+                ignoreScanIP(targetIP)
+            }
             return ScannedDevice(ip: targetIP, model: model)
         }
     }

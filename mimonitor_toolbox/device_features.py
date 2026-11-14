@@ -21,12 +21,14 @@ from .adb import (
     adb_run,
     adb_text_has_disconnected_marker,
     async_run,
+    clear_ignored_scan_ips,
     disconnected_status_text,
     ensure_adb_server,
     format_adb_serial,
     is_adb_server_alive,
     is_mitv_model,
     scan_adb,
+    unignore_scan_ip,
 )
 from .core import (
     GAME_FEATURE_KEYS,
@@ -302,6 +304,8 @@ class DeviceFeaturesMixin:
         self._resume_target_available = None
         self._resume_discovery_checking = False
         self._resume_discovery_cancel_event = None
+        self._resume_discovery_exhausted = False
+        self._connected_on_current_network = False
         self._resume_next_discovery_at = 0.0
         self._resume_manual_selection_required = False
         self._last_windows_resume_at = None
@@ -474,9 +478,13 @@ class DeviceFeaturesMixin:
         if ok:
             self._resume_reconnect_active = False
             self._resume_waiting_for_network = False
+            self._resume_target_available = None
+            self._resume_discovery_exhausted = False
+            self._connected_on_current_network = True
             self._resume_manual_selection_required = False
             self._resume_retry_timer.stop()
             self._resume_network_timer.stop()
+            unignore_scan_ip(getattr(self.adb, "ip", ""))
             self.status_signal.emit(f"已连接: {detail}")
             self.log(f"唤醒后连接已恢复: {detail}")
             return
@@ -490,12 +498,19 @@ class DeviceFeaturesMixin:
         self._resume_waiting_for_network = True
         self._resume_network_signature = self._network_signature()
         self.status_signal.emit("未连接（重连 5 次失败，等待显示器或网络恢复）")
-        self.log("重连 5 次仍失败，等待显示器 ADB 端口或 Windows 网络恢复")
         self._resume_network_timer.start(2000)
+        if getattr(self, "_connected_on_current_network", False) or getattr(
+            self, "_resume_discovery_exhausted", False
+        ):
+            self.log("重连 5 次仍失败，持续监听原地址端口等待显示器唤醒")
+            return
+        self.log("重连 5 次仍失败，等待显示器 ADB 端口或 Windows 网络恢复")
         self._start_resume_discovery()
 
     def _start_resume_discovery(self):
         if not getattr(self, "_resume_waiting_for_network", False):
+            return
+        if getattr(self, "_resume_discovery_exhausted", False):
             return
         if getattr(self, "_resume_discovery_checking", False):
             return
@@ -541,9 +556,9 @@ class DeviceFeaturesMixin:
             return
         if getattr(self, "_resume_manual_selection_required", False):
             return
-        self._resume_next_discovery_at = (
-            time.monotonic() + RESUME_DISCOVERY_INTERVAL_SECONDS
-        )
+        # 每轮网络周期只做一次后台全网段扫描，避免持续弹出无线调试授权弹窗
+        self._resume_discovery_exhausted = True
+        self._resume_next_discovery_at = 0.0
         if detail:
             self.log(f"显示器地址扫描失败: {detail}")
             return
@@ -597,7 +612,10 @@ class DeviceFeaturesMixin:
                 self._resume_network_signature = signature
             elif signature != self._resume_network_signature:
                 self.log("检测到 Windows 网络状态变化，重新尝试连接显示器")
+                self._connected_on_current_network = False
+                self._resume_discovery_exhausted = False
                 self._resume_next_discovery_at = 0.0
+                clear_ignored_scan_ips()
                 self._start_resume_reconnect("网络状态变化")
                 return
 
@@ -645,6 +663,7 @@ class DeviceFeaturesMixin:
         self._resume_target_available = None
         self._resume_discovery_checking = False
         self._resume_discovery_cancel_event = None
+        self._resume_discovery_exhausted = False
         self._resume_next_discovery_at = 0.0
         self._resume_manual_selection_required = False
         retry_timer = getattr(self, "_resume_retry_timer", None)
@@ -891,6 +910,7 @@ class DeviceFeaturesMixin:
     def disconnect_adb(self):
         self._invalidate_connection_intent()
         self._cancel_resume_reconnect()
+        self._connected_on_current_network = False
         self._stop_source_polling()
         if self.adb.ip:
             self.log(f"正在断开与 {self.adb.ip} 的连接...")
@@ -949,6 +969,10 @@ class DeviceFeaturesMixin:
                             self.status_signal.emit(disconnected_status_text(m))
                             self.log(f"启动自动连接后设备状态异常: {m}")
                             return
+                        unignore_scan_ip(saved_ip)
+                        self._connected_on_current_network = True
+                        self._resume_target_available = None
+                        self._resume_discovery_exhausted = False
                         self.status_signal.emit(f"已连接: {m or saved_ip}")
                     else:
                         self.log(f"启动自动连接失败: {saved_ip}，开始扫描内网")
@@ -997,6 +1021,10 @@ class DeviceFeaturesMixin:
                             self.status_signal.emit(disconnected_status_text(m))
                             self.log(f"连接后设备状态异常: {m}")
                             return
+                        unignore_scan_ip(ip)
+                        self._connected_on_current_network = True
+                        self._resume_target_available = None
+                        self._resume_discovery_exhausted = False
                         self.status_signal.emit(f"已连接: {m or ip}")
                     else:
                         self.status_signal.emit("连接失败")
@@ -1037,6 +1065,10 @@ class DeviceFeaturesMixin:
         if getattr(self, "_scan_running", False):
             self.log("内网扫描已在进行中，忽略重复请求")
             return
+
+        auto = bool(auto)
+        if not auto:
+            clear_ignored_scan_ips()
 
         self._scan_id = getattr(self, "_scan_id", 0) + 1
         scan_id = self._scan_id
