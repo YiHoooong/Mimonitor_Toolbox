@@ -128,6 +128,21 @@ class PageContractTests(unittest.TestCase):
         window.deleteLater()
         _qt_application.processEvents()
 
+    def test_tools_page_offers_direct_source_hotkeys(self):
+        """设置页要为四个信号源各留一行直切快捷键。"""
+        from mimonitor_toolbox.main_window import App
+
+        with mock.patch.object(App, "register_global_hotkeys"), \
+                mock.patch.object(App, "setup_tray"):
+            window = App()
+
+        for action in ("input_source_hdmi1", "input_source_hdmi2",
+                       "input_source_dp", "input_source_usbc"):
+            self.assertIn(action, window.hotkey_combos)
+        window._cleanup_done = True
+        window.deleteLater()
+        _qt_application.processEvents()
+
     def test_adb_cmd_and_shell_buttons_share_one_tool_card(self):
         from mimonitor_toolbox.main_window import App
 

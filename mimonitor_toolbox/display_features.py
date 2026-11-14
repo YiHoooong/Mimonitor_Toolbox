@@ -12,6 +12,10 @@ from .core import (
     ADJUSTABLE_HOTKEY_PARAMS,
     CUSTOM_COLOR_TEMP_VALUE,
     HDR_TONE_MAPPING_UI_TO_MTK,
+    INPUT_SOURCE_DIRECT_ACTIONS,
+    INPUT_SOURCE_NAMES,
+    INPUT_SOURCE_OPTIONS,
+    INPUT_SOURCE_SETTING_KEY,
     LOCAL_DIMMING_NAMES,
     PICTURE_MODE_GROUPS,
     PICTURE_SCENE_NAMES,
@@ -141,12 +145,31 @@ class DisplayFeaturesMixin:
                 lambda val, name: self._fsync(val == 1)
             ),
             "input_source": (
-                "mitv.tvplayer.hdmi.last.source",
-                [(23, "HDMI 1"), (24, "HDMI 2"), (29, "DP"), (30, "USBC")],
+                INPUT_SOURCE_SETTING_KEY,
+                list(INPUT_SOURCE_OPTIONS),
                 "信号源切换",
-                lambda val, name: self._set("mitv.tvplayer.hdmi.last.source", val, f"信号源: {name}")
+                lambda val, name: self._switch_input_source(val, name)
             )
         }
+
+    def _direct_action_catalog(self):
+        """定值型动作目录：直接切到某个信号源，不按顺序循环。
+
+        每项为 (取值键, 目标值, 目标显示名, 显示名, 执行函数)。
+        """
+        catalog = {}
+        for action_id, value in INPUT_SOURCE_DIRECT_ACTIONS.items():
+            catalog[action_id] = (
+                INPUT_SOURCE_SETTING_KEY,
+                value,
+                INPUT_SOURCE_NAMES.get(value, str(value)),
+                "信号源",
+                lambda val, name: self._switch_input_source(val, name),
+            )
+        return catalog
+
+    def _switch_input_source(self, value, name):
+        self._set(INPUT_SOURCE_SETTING_KEY, value, f"信号源: {name}")
 
     def tray_entry_catalog(self):
         """托盘右键菜单可选的条目目录。
@@ -225,6 +248,11 @@ class DisplayFeaturesMixin:
             self._toggle_local_dimming_off_hotkey()
             return
 
+        direct_map = self._direct_action_catalog()
+        if action in direct_map:
+            self._stage_direct_hotkey_action(action, *direct_map[action])
+            return
+
         catalog = self._cycle_action_catalog()
         actions_map = {
             "picture_mode_cycle": catalog["picture_mode"],
@@ -254,21 +282,38 @@ class DisplayFeaturesMixin:
 
         next_idx = (curr_idx + 1) % len(state_tuples)
         next_val, next_name = state_tuples[next_idx]
+        self._stage_hotkey_value(
+            action, sk, next_val, next_name, label_name, exec_fn, original_value
+        )
 
+    def _stage_direct_hotkey_action(self, action, sk, value, name, label_name, exec_fn):
+        """定值型动作（直切到某个信号源）：目标值由动作本身定死，不走循环。
+
+        其余流程与循环型完全一致 —— 同样先预览、同样等倒计时结束再下发，
+        所以连按不同信号源时只有最后一次生效。
+        """
+        pending = self._cycle_hotkey_pending.get(action)
+        original_value = pending.get("original") if pending else getattr(self, "current_vals", {}).get(sk)
+        self._stage_hotkey_value(
+            action, sk, value, name, label_name, exec_fn, original_value
+        )
+
+    def _stage_hotkey_value(self, action, sk, value, name, label_name, exec_fn, original_value=None):
+        """循环型与定值型共用的「记录待下发值 → 预览 → 倒计时 → 提交」流程。"""
         self._cycle_hotkey_pending[action] = {
             "sk": sk,
             "label": label_name,
-            "name": next_name,
-            "value": next_val,
+            "name": name,
+            "value": value,
             "original": original_value,
             "exec": exec_fn,
         }
-        self._preview_cycle_hotkey_value(sk, next_val)
+        self._preview_cycle_hotkey_value(sk, value)
 
         delay = self.effective_hotkey_delay()
         if getattr(self, "osd", None):
             # 等待期间显示倒计时进度条；关闭倒计时则不带进度条
-            self.osd.show_hud(label_name, next_name, countdown=delay or None)
+            self.osd.show_hud(label_name, name, countdown=delay or None)
 
         timer = self._cycle_hotkey_timers.get(action)
         if timer is None:
