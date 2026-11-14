@@ -1,4 +1,6 @@
 import unittest
+from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -1694,6 +1696,432 @@ class SoundOutputTests(unittest.TestCase):
             host.restore_preset_snapshot()
             self.assertIn(("set_sound_output", 0), calls)
             self.assertIn(("put", core.SOUND_OUTPUT_SETTINGS_KEY, "0"), calls)
+
+
+class MonitorVolumeFeatureTests(unittest.TestCase):
+    def _make_host(self, volume=15, muted=0, should_fail=False):
+        from mimonitor_toolbox import display_features
+
+        calls = []
+        logs = []
+        emitted = []
+        hud = []
+
+        class FakeAdb:
+            def transaction(self):
+                return nullcontext()
+
+            def media_volume(self, check=False):
+                calls.append(("media_volume", check))
+                return volume
+
+            def media_muted(self, check=False):
+                calls.append(("media_muted", check))
+                return bool(muted)
+
+            def set_media_volume(self, value, unmute_first=False, show_ui=False, check=False):
+                calls.append(("set_media_volume", value, unmute_first, show_ui, check))
+                if should_fail:
+                    raise RuntimeError("adb failed")
+
+            def set_media_muted(self, target_muted, show_ui=False, check=False):
+                calls.append(("set_media_muted", target_muted, show_ui, check))
+                if should_fail:
+                    raise RuntimeError("adb failed")
+
+        class Host(display_features.DisplayFeaturesMixin):
+            adb_connected = True
+            adb = FakeAdb()
+            current_vals = {
+                "volume_music_speaker": volume,
+                "media_muted": muted,
+            }
+            sliders = {}
+            osd = SimpleNamespace(
+                show_hud=lambda title, value, countdown=None: hud.append((title, value, countdown)),
+                end_countdown=lambda: None,
+            )
+            _adjust_hotkey_pending = {}
+            _adjust_hotkey_timers = {
+                "volume": SimpleNamespace(
+                    stop=lambda: None,
+                    setInterval=lambda _ms: None,
+                    start=lambda: None,
+                )
+            }
+            _adjust_hotkey_resolving = set()
+            _control_rollback_values = {}
+            values_signal = SimpleNamespace(emit=lambda d: emitted.append(dict(d)))
+
+            def check_connection(self):
+                return self.adb_connected
+
+            def _mark_adb_busy(self, seconds=2.0):
+                pass
+
+            def log(self, msg):
+                logs.append(msg)
+
+            def effective_hotkey_delay(self):
+                return 0.0
+
+            def _run_adb_action(self, label, operation, on_success=None, on_failure=None):
+                try:
+                    operation()
+                except Exception:
+                    if on_failure:
+                        on_failure()
+                    return
+                if on_success:
+                    on_success()
+
+        return Host(), calls, logs, emitted, hud
+
+    def test_tray_volume_entry_and_set_value(self):
+        host, calls, _, emitted, _ = self._make_host(volume=15, muted=1)
+        entry = host.tray_entry("volume")
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["kind"], "stepper")
+        self.assertEqual((entry["min"], entry["max"], entry["step"]), (0, 100, 5))
+        self.assertEqual(host.tray_entry_value("volume"), 15)
+
+        host.tray_set_value("volume", 42)
+        self.assertEqual(host.current_vals["volume_music_speaker"], 42)
+        self.assertEqual(host.current_vals["media_muted"], 0)
+        self.assertIn(("set_media_volume", 42, True, False, True), calls)
+        self.assertEqual(emitted[-1], {"volume_music_speaker": 42, "media_muted": 0})
+
+    def test_set_media_volume_failure_rolls_back(self):
+        host, _, _, emitted, _ = self._make_host(volume=20, muted=1, should_fail=True)
+        host.set_media_volume(55)
+        self.assertEqual(host.current_vals["volume_music_speaker"], 20)
+        self.assertEqual(host.current_vals["media_muted"], 1)
+        self.assertEqual(emitted[-1], {"volume_music_speaker": 20, "media_muted": 1})
+
+    def test_volume_mute_hotkey_toggles_and_queries_volume(self):
+        host, calls, _, emitted, hud = self._make_host(volume=24, muted=0)
+        host.trigger_hotkey_action("volume_mute_toggle")
+        self.assertIn(("set_media_muted", True, False, True), calls)
+        self.assertEqual(host.current_vals["media_muted"], 1)
+        self.assertEqual(emitted[-1], {"media_muted": 1})
+        self.assertEqual(hud[-1][:2], ("静音", "开"))
+        self.assertEqual(host.query_setting_or_jni("volume_music_speaker", check=True), 24)
+
+    def test_show_volume_osd_setting_passes_show_ui_flag(self):
+        from mimonitor_toolbox import display_features
+
+        host, calls, _, _, _ = self._make_host(volume=15, muted=0)
+        with mock.patch.object(
+            display_features,
+            "load_settings",
+            return_value={"show_volume_osd": True},
+        ):
+            host.set_media_volume(28)
+            host.toggle_media_mute(muted=True)
+        self.assertIn(("set_media_volume", 28, False, True, True), calls)
+        self.assertIn(("set_media_muted", True, True, True), calls)
+
+
+class MemcFeatureTests(unittest.TestCase):
+    def _make_host(
+        self,
+        mode=9,
+        source="23",
+        jni=None,
+        settings=None,
+        current_memc=0,
+        host_refresh_hz=None,
+    ):
+        from mimonitor_toolbox import core, display_features
+
+        calls = []
+        logs = []
+        messages = []
+        highlights = []
+        noted = []
+        refreshed = []
+
+        live_settings = {
+            "picture_mode": str(mode),
+            "mitv.tvplayer.hdmi.last.source": str(source),
+        }
+        if settings:
+            live_settings.update({k: str(v) for k, v in settings.items()})
+        live_jni = dict(jni or {})
+        live_jni.setdefault("g_video__picture_mode", mode)
+
+        class FakeAdb:
+            def transaction(self):
+                return nullcontext()
+
+            def shell(self, cmd, check=False):
+                calls.append(("shell", cmd))
+                return "\n".join(f"{k}={v}" for k, v in live_settings.items())
+
+            def get(self, key, check=False):
+                calls.append(("get", key, check))
+                return live_settings.get(key, "null")
+
+            def jni_batch_get(self, keys, check=False):
+                calls.append(("jni_batch_get", tuple(keys)))
+                return {k: live_jni[k] for k in keys if k in live_jni}
+
+            def jni_get(self, key, check=False):
+                calls.append(("jni_get", key, check))
+                return live_jni.get(key, 0)
+
+            def jni_set(self, key, val, upd=3, check=False):
+                calls.append(("jni_set", key, val, upd, check))
+
+            def put(self, key, val, check=False):
+                calls.append(("put", key, val, check))
+
+            def refresh_pq(self, check=False):
+                calls.append(("refresh_pq", check))
+
+        class Host(display_features.DisplayFeaturesMixin):
+            adb_connected = True
+            adb = FakeAdb()
+            current_vals = {
+                "picture_mode": mode,
+                core.MEMC_SETTINGS_KEY: current_memc,
+            }
+            state_buttons = {}
+            _control_rollback_values = {}
+            _picture_mode_switch_seq = 0
+            message_signal = SimpleNamespace(
+                emit=lambda mtype, title, body: messages.append((mtype, title, body))
+            )
+
+            def check_connection(self):
+                return self.adb_connected
+
+            def _mark_adb_busy(self, seconds=2.0):
+                pass
+
+            def log(self, msg):
+                logs.append(msg)
+
+            def _note_picture_change(self):
+                noted.append(True)
+
+            def _highlight_mode(self, value):
+                highlights.append(("picture_mode", value))
+
+            def _optimistic_highlight(self, key, value):
+                highlights.append((key, value))
+
+            def _refresh_pages(self, pages, delay_ms=0, force=False):
+                refreshed.append((tuple(pages), force))
+
+            def _run_adb_action(self, label, operation, on_success=None, on_failure=None):
+                try:
+                    operation()
+                except Exception:
+                    if on_failure:
+                        on_failure()
+                    return
+                if on_success:
+                    on_success()
+
+            def _read_memc_host_refresh_rate(self):
+                return host_refresh_hz
+
+        return Host(), calls, logs, messages, highlights, noted, refreshed
+
+    def test_case_a_disallowed_modes_intercept_write_and_report_conditions(self):
+        from mimonitor_toolbox import core
+
+        for bad_mode in (14, 18, 69):
+            host, calls, _, messages, highlights, noted, _ = self._make_host(
+                mode=bad_mode, current_memc=0
+            )
+            host._set_memc(2, "中")
+            self.assertFalse(any(c[0] in ("jni_set", "put") for c in calls), f"mode={bad_mode} 不应写入")
+            self.assertEqual(host.current_vals[core.MEMC_SETTINGS_KEY], 0)
+            self.assertEqual(highlights[-1], (core.MEMC_SETTINGS_KEY, 0))
+            self.assertEqual(noted, [])
+            self.assertEqual(len(messages), 1)
+            mtype, title, body = messages[0]
+            self.assertEqual(mtype, "warn")
+            self.assertEqual(title, "当前画面模式不支持开启运动补偿")
+            self.assertIn("✗ 画面模式支持", body)
+            self.assertIn("ℹ 输入信号刷新率 ≤ 120Hz", body)
+
+    def test_case_b_supported_mode_with_freesync_or_320_or_dlg_still_writes_and_warns(self):
+        from mimonitor_toolbox import core
+
+        # 电影模式 + HDMI FreeSync 开
+        host, calls, _, messages, highlights, noted, _ = self._make_host(
+            mode=9, source="23", jni={"g_video__freesync_switch": 3}
+        )
+        host._set_memc(2, "中")
+        self.assertIn(("jni_set", core.MEMC_JNI_KEY, 2, 3, True), calls)
+        self.assertIn(("put", core.MEMC_SETTINGS_KEY, "2", True), calls)
+        self.assertIn(("put", core.MEMC_SAVE_KEY, "2", True), calls)
+        self.assertEqual(host.current_vals[core.MEMC_SETTINGS_KEY], 2)
+        self.assertEqual(noted, [True])
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0][0], "info")
+        self.assertIn("已保存「中」档位", messages[0][1])
+        self.assertIn("✗ FreeSync 已关闭", messages[0][2])
+
+        # 游戏模式 + DLG 开
+        host2, calls2, _, messages2, _, _, _ = self._make_host(
+            mode=10, source="23", jni={"g_video__dlg_vrr_switch": 1}
+        )
+        host2._set_memc(3, "高")
+        self.assertIn(("jni_set", core.MEMC_GAME_JNI_KEY, 3, 3, True), calls2)
+        self.assertIn(("put", core.MEMC_GAME_SETTINGS_KEY, "3", True), calls2)
+        self.assertIn(("put", core.MEMC_GAME_PREF_KEY, "3", True), calls2)
+        self.assertIn("DLG 高帧率已开启", messages2[0][2])
+
+        # 模式 5 (DV IQ) + 内容自适应开
+        host3, calls3, _, messages3, _, _, _ = self._make_host(
+            mode=5, source="23", jni={"g_video__vid_content_adaptive": 1}
+        )
+        host3._set_memc(1, "低")
+        self.assertIn(("jni_set", core.MEMC_JNI_KEY, 1, 3, True), calls3)
+        self.assertIn("✗ 内容自适应已关闭", messages3[0][2])
+
+    def test_hdmi_does_not_read_dp_adaptive_sync_and_case_c_has_no_popup(self):
+        from mimonitor_toolbox import core
+
+        # HDMI1 下即使 dp_adaptive_sync=1，也应判定为 Case C 且不弹窗
+        host, calls, _, messages, _, noted, _ = self._make_host(
+            mode=9,
+            source="23",
+            jni={
+                "g_video__freesync_switch": 0,
+                "g_video__dp_adaptive_sync": 1,
+                "g_fusion_picture__hdmi_edid_version": 1,
+                "g_video__dlg_vrr_switch": 0,
+            },
+        )
+        host._set_memc(2, "中")
+        self.assertIn(("jni_set", core.MEMC_JNI_KEY, 2, 3, True), calls)
+        self.assertEqual(messages, [])
+        self.assertEqual(noted, [True])
+
+        # DP 源下 dp_adaptive_sync=1 必须判定为未满足
+        host_dp, _, _, messages_dp, _, _, _ = self._make_host(
+            mode=9,
+            source="29",
+            jni={"g_video__dp_adaptive_sync": 1, "g_fusion_picture__dp_edid_version": 2},
+        )
+        host_dp._set_memc(2, "中")
+        self.assertEqual(len(messages_dp), 1)
+        self.assertIn("✗ FreeSync 已关闭", messages_dp[0][2])
+
+        # 刷新率检查在清单中始终为 info 提示态，不伪造 ✓
+        report = core.evaluate_memc_conditions({"picture_mode": 9, "mitv.tvplayer.hdmi.last.source": 23}, {})
+        self.assertEqual(report.case, "C")
+        rr = next(item for item in report.items if item.key == "refresh_rate")
+        self.assertEqual(rr.status, "info")
+
+    def test_setting_memc_off_skips_condition_check_even_in_standard_mode(self):
+        from mimonitor_toolbox import core
+
+        host, calls, _, messages, _, _, _ = self._make_host(mode=14, current_memc=2)
+        host._set_memc(0, "关")
+        self.assertIn(("jni_set", core.MEMC_JNI_KEY, 0, 3, True), calls)
+        self.assertIn(("put", core.MEMC_SETTINGS_KEY, "0", True), calls)
+        self.assertEqual(messages, [])
+
+    def test_switch_to_cinema_and_enable_memc_writes_mode_9_then_memc(self):
+        from mimonitor_toolbox import core, display_features
+
+        host, calls, _, _, highlights, noted, refreshed = self._make_host(mode=14, current_memc=0)
+        with mock.patch.object(display_features.time, "sleep"):
+            host._switch_to_cinema_and_enable_memc(2)
+        mode_idx = calls.index(("put", "picture_mode", "9", True))
+        memc_idx = calls.index(("jni_set", core.MEMC_JNI_KEY, 2, 3, True))
+        self.assertLess(mode_idx, memc_idx)
+        self.assertEqual(host.current_vals["picture_mode"], 9)
+        self.assertEqual(host.current_vals[core.MEMC_SETTINGS_KEY], 2)
+        self.assertEqual(noted, [True])
+        self.assertIn(("picture_mode", 9), highlights)
+        self.assertIn((core.MEMC_SETTINGS_KEY, 2), highlights)
+        self.assertEqual(refreshed, [(("picturePage",), True)])
+
+    def test_tray_hotkey_and_query_support_memc(self):
+        from mimonitor_toolbox import core
+
+        host, calls, _, _, _, _, _ = self._make_host(
+            mode=64, jni={core.MEMC_GAME_JNI_KEY: 2}, current_memc=1
+        )
+        entry = host.tray_entry("memc")
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["label"], "运动补偿")
+        self.assertEqual(entry["options"], core.MEMC_OPTIONS)
+        self.assertEqual(host.tray_entry_value("memc"), 1)
+
+        self.assertEqual(host.query_setting_or_jni(core.MEMC_SETTINGS_KEY, check=True), 2)
+        self.assertIn(("jni_get", core.MEMC_GAME_JNI_KEY, True), calls)
+
+        host.tray_apply_option("memc", 3)
+        self.assertIn(("jni_set", core.MEMC_GAME_JNI_KEY, 3, 3, True), calls)
+
+        staged = []
+        host._stage_cycle_hotkey_action = (
+            lambda action, sk, options, label, exec_fn: staged.append(
+                (action, sk, list(options), label)
+            )
+        )
+        host.trigger_hotkey_action("memc_cycle")
+        self.assertEqual(
+            staged,
+            [("memc_cycle", core.MEMC_SETTINGS_KEY, core.MEMC_OPTIONS, "运动补偿")],
+        )
+
+    def test_windows_refresh_rate_check_saves_and_warns_above_120hz_with_disclaimer(self):
+        from mimonitor_toolbox import core, display_features
+
+        # 160Hz (>120Hz) 触发 Case B：已保存档位，并提示仅供参考/可能不准
+        host_high, calls_high, _, messages_high, _, noted_high, _ = self._make_host(
+            mode=9,
+            source="23",
+            jni={"g_video__freesync_switch": 0, "g_fusion_picture__hdmi_edid_version": 1, "g_video__dlg_vrr_switch": 0},
+            host_refresh_hz=160,
+        )
+        host_high._set_memc(2, "中")
+        self.assertIn(("jni_set", core.MEMC_JNI_KEY, 2, 3, True), calls_high)
+        self.assertEqual(noted_high, [True])
+        self.assertEqual(len(messages_high), 1)
+        self.assertEqual(messages_high[0][0], "info")
+        self.assertIn("已保存「中」档位", messages_high[0][1])
+        self.assertIn("✗ 输入信号刷新率 ≤ 120Hz", messages_high[0][2])
+        self.assertIn("160Hz", messages_high[0][2])
+        self.assertIn("可能不准", messages_high[0][2])
+
+        # 120Hz (<=120Hz) 且其它条件满足时直接 Case C 无弹窗，Case A 清单内含 ✓ 与仅供参考说明
+        host_ok, calls_ok, _, messages_ok, _, _, _ = self._make_host(
+            mode=9,
+            source="23",
+            jni={"g_video__freesync_switch": 0, "g_fusion_picture__hdmi_edid_version": 1, "g_video__dlg_vrr_switch": 0},
+            host_refresh_hz=120,
+        )
+        host_ok._set_memc(3, "高")
+        self.assertIn(("jni_set", core.MEMC_JNI_KEY, 3, 3, True), calls_ok)
+        self.assertEqual(messages_ok, [])
+
+        report_ok = core.evaluate_memc_conditions(
+            {"picture_mode": 9, "mitv.tvplayer.hdmi.last.source": 23},
+            {},
+            host_refresh_hz=120,
+        )
+        rr = next(item for item in report_ok.items if item.key == "refresh_rate")
+        self.assertEqual(rr.status, "ok")
+        self.assertIn("120Hz", rr.detail)
+        self.assertIn("仅供参考", rr.detail)
+
+        # 验证 Mixin 真实方法会委托 query_target_display_refresh_rate 并保留目标屏参数
+        plain_host = display_features.DisplayFeaturesMixin()
+        plain_host._hdr_target_device_name = r"\\.\DISPLAY1"
+        with mock.patch.object(display_features, "load_settings", return_value={"hdr_target_display_id": "ID1"}), \
+                mock.patch.object(display_features, "query_target_display_refresh_rate", return_value=144) as query_rr:
+            self.assertEqual(plain_host._read_memc_host_refresh_rate(), 144)
+        query_rr.assert_called_once_with(configured_id="ID1", target_device_name=r"\\.\DISPLAY1")
 
 
 if __name__ == "__main__":

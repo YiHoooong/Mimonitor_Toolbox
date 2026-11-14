@@ -54,6 +54,27 @@ enum HDRDetector {
         return false
     }
 
+    /// 主机侧：尝试读取单个外接显示器的系统输出刷新率（Hz）。
+    /// 多外接屏或无法读取有效刷新率时返回 nil，退回手动确认提示。
+    static func externalDisplayRefreshRateHz() -> Int? {
+        var rates: [Int] = []
+        for screen in NSScreen.screens {
+            guard let num = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
+            else { continue }
+            let displayID = CGDirectDisplayID(num.uint32Value)
+            if CGDisplayIsBuiltin(displayID) != 0 { continue }
+            var hz = CGDisplayCopyDisplayMode(displayID)?.refreshRate ?? 0
+            if hz <= 1, #available(macOS 12.0, *) {
+                hz = Double(screen.maximumFramesPerSecond)
+            }
+            let rounded = Int(hz.rounded())
+            if rounded > 1 {
+                rates.append(rounded)
+            }
+        }
+        return rates.count == 1 ? rates[0] : nil
+    }
+
     /// 诊断用：列出各屏的 EDR 数值。
     static func debugDescription() -> String {
         NSScreen.screens.map { screen in

@@ -25,6 +25,7 @@ final class AdbPresetDeviceTests: XCTestCase {
               'picture_hue=49' 'picture_sharpness=30' 'picture_color_temperature=\(customTemperature && !staleTemperature ? "3" : "1")' \
               'picture_red_gain=1024' 'picture_green_gain=1024' 'picture_blue_gain=1024' \
               'picture_local_dimming=3' 'picture_dynamic_definition=0' 'picture_response_time=2' \
+              '\(MemcSupport.primarySettingKey)=0' \
               'tv_picture_advanced_video_color_space=6' \(soundLine)
             cat '\(updates.path)' ;;
           'settings put global '*)
@@ -37,6 +38,7 @@ final class AdbPresetDeviceTests: XCTestCase {
             printf '%s\\n' 'g_disp__disp_back_light=52' 'g_video__vid_gamut_mapping_mode=6' \
               'g_video__clr_temp=\(invalidTemperature ? "99" : (customTemperature ? "0" : "2"))' 'g_video__vid_local_dimming=3' 'g_video__light_sensor_switch=0' \
               'g_video__vid_insert_black=0' 'g_video__vid_od_response_time=2' \
+              'g_video__vid_mjc_effect=0' 'g_video__vid_game_mode_with_memc_switch=0' 'g_video__picture_mode=14' \
               '\(incomplete ? "__error__=missing" : "g_video__dp_adaptive_sync=0")'
             case "$4" in
               *g_video__clr_gain_r*) printf '%s\\n' 'g_video__clr_gain_r=900' 'g_video__clr_gain_g=1000' 'g_video__clr_gain_b=1100' ;;
@@ -95,6 +97,16 @@ final class AdbPresetDeviceTests: XCTestCase {
             let report = try device.apply(values)
             XCTAssertFalse(report.ok)
             XCTAssertTrue(report.failed.contains { $0.hasPrefix("动态清晰度:") })
+        }
+    }
+
+    func testMemcReadbackCatchesSilentJniFailure() throws {
+        try device { device in
+            var values = try device.capture()
+            values[MemcSupport.primarySettingKey] = "2"
+            let report = try device.apply(values)
+            XCTAssertFalse(report.ok)
+            XCTAssertTrue(report.failed.contains { $0.hasPrefix("运动补偿:") })
         }
     }
 

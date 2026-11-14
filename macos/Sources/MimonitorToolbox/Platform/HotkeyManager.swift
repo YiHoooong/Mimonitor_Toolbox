@@ -43,9 +43,11 @@ let hotkeyActions: [(id: String, label: String)] = [
     ("color_space_cycle", "色域 循环切换"),
     ("color_temp_cycle", "色温 循环切换"),
     ("response_time_cycle", "响应时间 循环切换"),
+    ("memc_cycle", "运动补偿 循环切换"),
     ("freesync_toggle", "FreeSync 开关切换"),
     ("input_source_cycle", "信号源 循环切换"),
     ("sound_output_cycle", "声音输出 循环切换"),
+    ("volume_mute_toggle", "静音 开关切换"),
 ]
 
 /// 可调参数（对应 core.py ADJUSTABLE_HOTKEY_PARAMS）
@@ -60,6 +62,7 @@ let adjustableParams: [(id: String, label: String, defaultStep: Int)] = [
     ("green_gain", "绿色增益", 10),
     ("blue_gain", "蓝色增益", 10),
     ("atmosphere_illumination", "屏幕灯亮度", 1),
+    ("volume", "音量", 5),
 ]
 
 // MARK: - 按键 / 修饰键映射

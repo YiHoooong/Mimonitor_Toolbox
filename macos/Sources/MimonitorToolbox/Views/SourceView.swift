@@ -45,6 +45,19 @@ struct SourceView: View {
                     }
                     .frame(maxWidth: .infinity)
                 }
+
+                HStack(spacing: 12) {
+                    SliderRow(
+                        title: "显示器音量",
+                        range: 0...100,
+                        externalValue: state.intValue("volume_music_speaker", default: 15)
+                    ) { v in
+                        state.setMediaVolumeValue(v)
+                    }
+                    SelectableButton(title: "静音", isSelected: state.mediaVolumeMuted == true) {
+                        state.toggleMediaMuteExplicit(showHUD: false)
+                    }
+                }
             }
             .padding(30)
         }

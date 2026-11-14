@@ -1,4 +1,5 @@
 import SwiftUI
+import MimonitorPresetCore
 
 struct PictureView: View {
     @EnvironmentObject var state: AppState
@@ -139,6 +140,12 @@ struct PictureView: View {
                 ButtonGroupSection(title: "色域", options: OptionLists.gamut,
                                    selectedValue: state.intValue("tv_picture_advanced_video_color_space", default: 0)) { v in
                     state.setGamut(v)
+                }
+
+                ButtonGroupSection(title: "运动补偿", options: OptionLists.memc,
+                                   selectedValue: state.intValue(MemcSupport.primarySettingKey, default: 0),
+                                   hint: "仅支持电影/游戏等非标准模式；需关闭 FreeSync、320Hz/DLG 且输入信号 ≤ 120Hz 时生效") { v in
+                    state.setMemc(v)
                 }
             }
             .padding(30)

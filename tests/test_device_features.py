@@ -1636,6 +1636,117 @@ class SoundOutputDevicePipelineTests(unittest.TestCase):
             [("sourcePage", True)],
         )
 
+    def test_refresh_source_page_and_poll_include_media_volume_and_mute(self):
+        page = SimpleNamespace(objectName=lambda: "sourcePage")
+
+        class FakeAdb:
+            def transaction(self):
+                return nullcontext()
+
+            def shell(self, _cmd):
+                return "mitv.tvplayer.hdmi.last.source=23\n"
+
+            def get(self, key, check=False):
+                return "23" if key == "mitv.tvplayer.hdmi.last.source" else "0"
+
+            def media_volume(self, check=False):
+                return 32
+
+            def media_muted(self, check=False):
+                return True
+
+        class Host(device_features.DeviceFeaturesMixin):
+            pass
+
+        host = Host()
+        host.initialize_device_features()
+        host.adb_connected = True
+        host.adb = FakeAdb()
+        host.values_signal = FakeSignal()
+        host.page_refresh_finished = FakeSignal()
+        host._page_loading = set()
+        host._page_loaded = set()
+        host._mark_adb_busy = lambda _s=4.0: None
+        host._show_loading_overlay = lambda _p: None
+        host.log = lambda _m: None
+
+        with mock.patch.object(device_features, "async_run", side_effect=lambda fn: fn()):
+            host._refresh_page_data("sourcePage")
+
+        self.assertEqual(
+            host.values_signal.events[-1][0]["volume_music_speaker"],
+            32,
+        )
+        self.assertEqual(
+            host.values_signal.events[-1][0]["media_muted"],
+            1,
+        )
+
+        host.values_signal.events.clear()
+        host.stackedWidget = SimpleNamespace(currentWidget=lambda: page)
+        host._source_poll_armed = True
+        host._source_poll_checking = False
+        host._adb_channel_busy = lambda: False
+
+        with mock.patch.object(device_features, "async_run", side_effect=lambda fn: fn()):
+            host._poll_source_state()
+
+        self.assertEqual(host.values_signal.events[-1][0]["volume_music_speaker"], 32)
+        self.assertEqual(host.values_signal.events[-1][0]["media_muted"], 1)
+
+    def test_apply_polled_values_syncs_volume_slider_and_mute_button(self):
+        synced = []
+        highlighted = []
+        fake_slider = SimpleNamespace(isSliderDown=lambda: False)
+
+        class Host(device_features.DeviceFeaturesMixin):
+            current_vals = {}
+            sliders = {"volume_music_speaker": (fake_slider, "lbl")}
+            state_buttons = {}
+            sound_mute_btn = "mute_btn"
+
+            def _sync_slider_value(self, slider, label_widget, display_val):
+                synced.append((slider, label_widget, display_val))
+
+            def _highlight_btn(self, btn, active):
+                highlighted.append((btn, active))
+
+        host = Host()
+        host._apply_polled_values({"volume_music_speaker": 28, "media_muted": 1})
+        self.assertEqual(host.current_vals["volume_music_speaker"], 28)
+        self.assertEqual(host.current_vals["media_muted"], 1)
+        self.assertEqual(synced, [(fake_slider, "lbl", 28)])
+        self.assertEqual(highlighted, [("mute_btn", True)])
+
+
+class MemcJniOverrideTests(unittest.TestCase):
+    def test_apply_picture_jni_overrides_picks_normal_vs_game_memc_key(self):
+        from mimonitor_toolbox.core import MEMC_GAME_JNI_KEY, MEMC_JNI_KEY, MEMC_SETTINGS_KEY
+
+        jni = {MEMC_JNI_KEY: 2, MEMC_GAME_JNI_KEY: 3}
+
+        normal_settings = {"picture_mode": 9, MEMC_SETTINGS_KEY: 0}
+        device_features.apply_picture_jni_overrides(normal_settings, jni)
+        self.assertEqual(normal_settings[MEMC_SETTINGS_KEY], 2)
+
+        for game_mode in (10, 64, 13, 16):
+            game_settings = {"picture_mode": game_mode, MEMC_SETTINGS_KEY: 0}
+            device_features.apply_picture_jni_overrides(game_settings, jni)
+            self.assertEqual(game_settings[MEMC_SETTINGS_KEY], 3)
+
+    def test_picture_page_keys_include_memc_settings_and_both_jni_keys(self):
+        from mimonitor_toolbox.core import MEMC_GAME_JNI_KEY, MEMC_JNI_KEY, MEMC_SETTINGS_KEY
+
+        class Host(device_features.DeviceFeaturesMixin, QObject):
+            pass
+
+        host = Host()
+        host.initialize_device_features()
+        pic = host._page_data_keys["picturePage"]
+        self.assertIn(MEMC_SETTINGS_KEY, pic["settings"])
+        self.assertIn(MEMC_JNI_KEY, pic["jni"])
+        self.assertIn(MEMC_GAME_JNI_KEY, pic["jni"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -95,6 +95,7 @@ enum RegisterMap {
                                             5: "BT2020", 6: "DCI-P3", 7: "BT709"]
     static let responseTimeNames: [Int: String] = [1: "普通", 2: "快速", 3: "高速"]
     static let dynamicDefinitionNames: [Int: String] = [0: "关", 1: "低", 2: "中", 3: "高"]
+    static let memcNames: [Int: String] = MemcSupport.levelNames
     static let localDimmingNames: [Int: String] = [0: "关", 1: "低", 2: "中", 3: "高"]
     static let hdrToneNames: [Int: String] = [0: "HGiG", 1: "层次", 2: "动态", 3: "明亮"]
     static let lightColorTempNames: [Int: String] = [0: "2700K", 1: "4000K", 2: "6500K"]
@@ -112,8 +113,11 @@ enum PageDataKeys {
         "picture_blue_gain", "picture_local_dimming",
         "tv_picture_video_local_dimming", "picture_hdr_tone_mapping",
         "settings_display_hdr_color_tone", "picture_dynamic_definition",
+        MemcSupport.primarySettingKey, MemcSupport.gameSettingKey,
+        MemcSupport.gamePrefSettingKey, MemcSupport.saveMemcSettingKey,
         "picture_response_time", "tv_picture_advanced_video_color_space",
         "tv_picture_video_color_space", "tv_picture_light_sensor",
+        "mitv.tvplayer.hdmi.last.source", "picture_content_adaptive",
     ]
     static let pictureJni = [
         "g_disp__disp_back_light", "g_video__vid_gamut_mapping_mode",
@@ -123,6 +127,10 @@ enum PageDataKeys {
         "g_video__vid_od_response_time",
         // 自动调整亮度（光感）：菜单读的是 MTK 侧，回读后覆盖 settings 值
         "g_video__light_sensor_switch",
+        MemcSupport.normalJniKey, MemcSupport.gameJniKey,
+        "g_video__picture_mode", "g_video__freesync_switch", "g_video__dp_adaptive_sync",
+        "g_fusion_picture__hdmi_edid_version", "g_fusion_picture__dp_edid_version",
+        "g_video__dlg_vrr_switch", "g_video__vid_content_adaptive",
     ]
     static let gameSettings = [
         "picture_mode", "picture_preset_scenario", "front_sight_index",
@@ -163,6 +171,9 @@ enum OptionLists {
         .init(label: "关", value: 0), .init(label: "低", value: 1),
         .init(label: "中", value: 2), .init(label: "高", value: 3),
     ]
+    static let memc: [Option] = [0, 1, 2, 3].map {
+        .init(label: MemcSupport.levelLabel($0), value: $0)
+    }
     static let responseTime: [Option] = [
         .init(label: "普通", value: 1), .init(label: "快速", value: 2), .init(label: "高速", value: 3),
     ]

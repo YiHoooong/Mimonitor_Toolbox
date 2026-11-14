@@ -320,6 +320,66 @@ class HdrTargetDetectionTests(unittest.TestCase):
         self.assertEqual(labels[0], "XMI3009 · 屏幕 1")
         self.assertEqual(labels[1], "Zako Virtual Display · ZAKO99 · 屏幕 1-2")
 
+    def test_query_target_display_refresh_rate_reads_resolved_xiaomi_screen(self):
+        from mimonitor_toolbox import windows
+
+        fake_devmode_calls = []
+
+        def fake_enum_settings(device_name, mode_num, lp_devmode):
+            fake_devmode_calls.append((device_name, int(mode_num) & 0xFFFFFFFF))
+            dm = lp_devmode._obj
+            if device_name == r"\\.\DISPLAY2":
+                dm.dmDisplayFrequency = 160
+                return 1
+            if device_name == r"\\.\DISPLAY3":
+                dm.dmDisplayFrequency = 1
+                return 1
+            return 0
+
+        fake_devices = _FakeEnumDisplayDevices(
+            adapters=[
+                (r"\\.\DISPLAY1", "Notebook Display", 0x1),
+                (r"\\.\DISPLAY2", "External Mi Monitor", 0x1),
+            ],
+            monitors={
+                r"\\.\DISPLAY1": [_monitor_entry("BOE0D16", 1001)],
+                r"\\.\DISPLAY2": [_monitor_entry("XMI3009", 4352)],
+            },
+        )
+        fake_user32 = mock.Mock(
+            EnumDisplayDevicesW=fake_devices,
+            EnumDisplaySettingsW=fake_enum_settings,
+        )
+        with mock.patch.object(windows.sys, "platform", "win32"), \
+                mock.patch.object(windows, "user32", fake_user32):
+            self.assertEqual(windows.query_target_display_refresh_rate(), 160)
+            self.assertIsNone(windows.query_windows_display_refresh_rate(r"\\.\DISPLAY3"))
+            self.assertIsNone(windows.query_windows_display_refresh_rate(""))
+
+        self.assertEqual(fake_devmode_calls[0], (r"\\.\DISPLAY2", 0xFFFFFFFF))
+
+    def test_query_target_display_refresh_rate_returns_none_when_ambiguous(self):
+        from mimonitor_toolbox import windows
+
+        fake_devices = _FakeEnumDisplayDevices(
+            adapters=[
+                (r"\\.\DISPLAY1", "Monitor A", 0x1),
+                (r"\\.\DISPLAY2", "Monitor B", 0x1),
+            ],
+            monitors={
+                r"\\.\DISPLAY1": [_monitor_entry("XMI3009", 1)],
+                r"\\.\DISPLAY2": [_monitor_entry("XMI27B3", 2)],
+            },
+        )
+        fake_enum_settings = mock.Mock(return_value=1)
+        with mock.patch.object(windows.sys, "platform", "win32"), \
+                mock.patch.object(windows, "user32", mock.Mock(
+                    EnumDisplayDevicesW=fake_devices,
+                    EnumDisplaySettingsW=fake_enum_settings,
+                )):
+            self.assertIsNone(windows.query_target_display_refresh_rate())
+        fake_enum_settings.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

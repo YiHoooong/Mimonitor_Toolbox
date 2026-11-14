@@ -9,7 +9,8 @@ final class PicturePresetPlanTests: XCTestCase {
         "picture_color_temperature": "3", "picture_red_gain": "1024",
         "picture_green_gain": "1100", "picture_blue_gain": "950",
         "picture_local_dimming": "3", "settings_display_hdr_color_tone": "0",
-        "picture_dynamic_definition": "0", "picture_response_time": "2",
+        "picture_dynamic_definition": "0", MemcSupport.primarySettingKey: "2",
+        "picture_response_time": "2",
         "tv_picture_advanced_video_color_space": "6",
     ]
 
@@ -17,7 +18,7 @@ final class PicturePresetPlanTests: XCTestCase {
         var commands: [PresetCommand] = []
         let result = PicturePresetPlan.apply(values, source: "29") { commands.append($0) }
         XCTAssertTrue(result.ok)
-        XCTAssertEqual(result.applied.count, 16)
+        XCTAssertEqual(result.applied.count, 17)
         XCTAssertEqual(Array(commands.prefix(3)), [
             .jni("g_video__dp_adaptive_sync", "0", 3), .refresh,
             .setting("picture_mode", "18"),
@@ -111,7 +112,7 @@ final class PicturePresetPlanTests: XCTestCase {
         var commands: [PresetCommand] = []
         let report = PicturePresetPlan.apply(changed, source: "29") { commands.append($0) }
         XCTAssertTrue(report.ok)
-        XCTAssertEqual(report.applied.count, 17)
+        XCTAssertEqual(report.applied.count, 18)
         XCTAssertTrue(report.applied.contains("声音输出"))
         XCTAssertEqual(Array(commands.suffix(2)), [
             .soundOutput("8"),
@@ -127,5 +128,58 @@ final class PicturePresetPlanTests: XCTestCase {
         XCTAssertFalse(report.ok)
         XCTAssertEqual(report.failed.count, 1)
         XCTAssertFalse(commands.contains { if case .soundOutput = $0 { return true }; return false })
+    }
+
+    func testLegacyPresetWithoutMemcSkipsGracefully() {
+        var changed = values
+        changed.removeValue(forKey: MemcSupport.primarySettingKey)
+        var commands: [PresetCommand] = []
+        let report = PicturePresetPlan.apply(changed, source: "29") { commands.append($0) }
+        XCTAssertTrue(report.ok)
+        XCTAssertTrue(report.skipped.contains { $0.hasPrefix("运动补偿：") })
+        XCTAssertFalse(commands.contains(.jni(MemcSupport.normalJniKey, "2", 3)))
+    }
+
+    func testMemcRoutesByNormalVsGamePictureModeAndToleratesCustomLevel() {
+        var normal = values
+        normal["picture_mode"] = "9"
+        normal[MemcSupport.primarySettingKey] = "3"
+        var normalCmds: [PresetCommand] = []
+        let normalReport = PicturePresetPlan.apply(normal, source: "29") { normalCmds.append($0) }
+        XCTAssertTrue(normalReport.ok)
+        XCTAssertTrue(normalCmds.contains(.jni(MemcSupport.normalJniKey, "3", 3)))
+        XCTAssertTrue(normalCmds.contains(.setting(MemcSupport.primarySettingKey, "3")))
+        XCTAssertTrue(normalCmds.contains(.setting(MemcSupport.saveMemcSettingKey, "3")))
+        XCTAssertFalse(normalCmds.contains(.jni(MemcSupport.gameJniKey, "3", 3)))
+
+        for gameMode in ["10", "64", "13", "16", "15", "19"] {
+            var game = values
+            game["picture_mode"] = gameMode
+            game[MemcSupport.primarySettingKey] = "4"
+            var gameCmds: [PresetCommand] = []
+            let gameReport = PicturePresetPlan.apply(game, source: "29") { gameCmds.append($0) }
+            XCTAssertTrue(gameReport.ok)
+            XCTAssertTrue(gameCmds.contains(.jni(MemcSupport.gameJniKey, "4", 3)))
+            XCTAssertTrue(gameCmds.contains(.setting(MemcSupport.gameSettingKey, "4")))
+            XCTAssertTrue(gameCmds.contains(.setting(MemcSupport.gamePrefSettingKey, "4")))
+            XCTAssertTrue(gameCmds.contains(.setting(MemcSupport.saveMemcSettingKey, "4")))
+            XCTAssertFalse(gameCmds.contains(.jni(MemcSupport.normalJniKey, "4", 3)))
+        }
+    }
+
+    func testMemcNormalizeUsesModeSpecificHardwareJni() {
+        let normal = PicturePresetPlan.normalize(
+            settings: ["picture_mode": "9", MemcSupport.primarySettingKey: "0"],
+            jni: [MemcSupport.normalJniKey: "2", MemcSupport.gameJniKey: "0"],
+            source: "23"
+        )
+        XCTAssertEqual(normal[MemcSupport.primarySettingKey], "2")
+
+        let game = PicturePresetPlan.normalize(
+            settings: ["picture_mode": "64", MemcSupport.primarySettingKey: "0"],
+            jni: [MemcSupport.normalJniKey: "0", MemcSupport.gameJniKey: "3"],
+            source: "23"
+        )
+        XCTAssertEqual(game[MemcSupport.primarySettingKey], "3")
     }
 }

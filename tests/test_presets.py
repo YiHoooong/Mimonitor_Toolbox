@@ -40,8 +40,8 @@ class FakeAdb:
         self._record("check_and_heal_jar")
 
 
-def full_values(mode=14, color_temp=1, light_sensor=0, freesync=0, sound_output=8):
-    """一套完整可用的值（含 FreeSync 与声音输出 —— 均在预设范围内）。"""
+def full_values(mode=14, color_temp=1, light_sensor=0, freesync=0, sound_output=8, memc=2):
+    """一套完整可用的值（含 FreeSync、声音输出与运动补偿 —— 均在预设范围内）。"""
     return {
         "freesync": freesync,
         "mitv.settings.db.sound.device.output_device": sound_output,
@@ -63,6 +63,7 @@ def full_values(mode=14, color_temp=1, light_sensor=0, freesync=0, sound_output=
         "picture_hdr_tone_mapping": 5,
         "settings_display_hdr_color_tone": 0,
         "picture_dynamic_definition": 2,
+        "tv_picture_advance_video_mjc_effect": memc,
         "picture_response_time": 3,
         "tv_picture_advanced_video_color_space": 6,
         "tv_picture_video_color_space": 6,
@@ -543,6 +544,55 @@ class SoundOutputPresetTests(unittest.TestCase):
             "HDMI(eARC)",
         )
         self.assertIsNone(presets.preset_sound_output_label({"values": {"picture_mode": 14}}))
+
+
+class MemcPresetTests(unittest.TestCase):
+    """运动补偿纳入预设：普通/游戏模式分键写入、旧预设兼容跳过及范围校验。"""
+
+    def test_normal_mode_writes_mjc_effect_and_save_key(self):
+        from mimonitor_toolbox import core, presets
+
+        adb = FakeAdb()
+        result = presets.apply_preset(adb, full_values(mode=9, memc=2))
+        self.assertIn("运动补偿", result.applied)
+        self.assertEqual(result.failed, [])
+        self.assertIn(("jni_set", core.MEMC_JNI_KEY, 2, 3, True), adb.calls)
+        self.assertIn(("put", core.MEMC_SETTINGS_KEY, "2", True), adb.calls)
+        self.assertIn(("put", core.MEMC_SAVE_KEY, "2", True), adb.calls)
+
+    def test_game_modes_write_game_memc_keys(self):
+        from mimonitor_toolbox import core, presets
+
+        for mode in (10, 64, 13, 16):
+            adb = FakeAdb()
+            result = presets.apply_preset(adb, full_values(mode=mode, memc=3))
+            self.assertIn("运动补偿", result.applied)
+            self.assertIn(("jni_set", core.MEMC_GAME_JNI_KEY, 3, 3, True), adb.calls)
+            self.assertIn(("put", core.MEMC_GAME_SETTINGS_KEY, "3", True), adb.calls)
+            self.assertIn(("put", core.MEMC_GAME_PREF_KEY, "3", True), adb.calls)
+            self.assertIn(("put", core.MEMC_SAVE_KEY, "3", True), adb.calls)
+
+    def test_legacy_preset_without_memc_is_skipped_not_failed(self):
+        from mimonitor_toolbox import core, presets
+
+        values = full_values()
+        del values[core.MEMC_SETTINGS_KEY]
+        adb = FakeAdb()
+        result = presets.apply_preset(adb, values)
+        self.assertIn("运动补偿", [name for name, _ in result.skipped])
+        self.assertNotIn("运动补偿", result.applied)
+        self.assertEqual(result.failed, [])
+
+    def test_memc_tolerates_custom_4_and_rejects_out_of_range(self):
+        from mimonitor_toolbox import presets
+
+        adb_ok = FakeAdb()
+        res_ok = presets.apply_preset(adb_ok, full_values(mode=9, memc=4))
+        self.assertIn("运动补偿", res_ok.applied)
+
+        adb_bad = FakeAdb()
+        res_bad = presets.apply_preset(adb_bad, full_values(mode=9, memc=5))
+        self.assertIn("运动补偿", [name for name, _ in res_bad.failed])
 
 
 if __name__ == "__main__":

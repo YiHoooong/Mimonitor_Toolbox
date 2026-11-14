@@ -100,6 +100,7 @@ struct ButtonGroupSection: View {
     let title: String
     let options: [Option]
     let selectedValue: Int
+    var hint: String? = nil
     let onSelect: (Int) -> Void
 
     var body: some View {
@@ -121,6 +122,11 @@ struct ButtonGroupSection: View {
                                       selectedValue: selectedValue,
                                       onSelect: onSelect)
                     .frame(maxWidth: .infinity)
+            }
+            if let hint {
+                Text(hint)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
             }
         }
     }

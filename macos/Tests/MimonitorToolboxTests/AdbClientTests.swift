@@ -123,4 +123,24 @@ final class AdbClientTests: XCTestCase {
             XCTAssertThrowsError(try client.setSoundOutput(5))
         }
     }
+
+    func testServiceCallParcelParsingAndVolumeVerification() throws {
+        XCTAssertTrue(AdbClient.serviceCallSucceeded("Result: Parcel(00000000 00000019   '........')"))
+        XCTAssertFalse(AdbClient.serviceCallSucceeded("Result: Parcel(Exception occurred)"))
+        XCTAssertEqual(AdbClient.parseServiceCallInt("Result: Parcel(\t00000000 00000019   '........')"), 25)
+        XCTAssertNil(AdbClient.parseServiceCallInt("Result: Parcel(00000000    '....')"))
+
+        try fake("""
+        case "$*" in
+          *"service call audio 22 i32 3"*) echo "Result: Parcel(\t00000000 0000002a   '....*...')" ;;
+          *"service call audio 17 i32 3"*) echo "Result: Parcel(\t00000000 00000001   '........')" ;;
+          *"service call audio 12 i32 3 i32 42 i32 1"*) echo "Result: Parcel(00000000    '....')" ;;
+          *) echo "Result: Parcel(00000000    '....')" ;;
+        esac
+        """) { client in
+            XCTAssertEqual(client.mediaVolume(), 42)
+            XCTAssertEqual(client.mediaMuted(), true)
+            XCTAssertTrue(client.setMediaVolume(42, showUI: true))
+        }
+    }
 }

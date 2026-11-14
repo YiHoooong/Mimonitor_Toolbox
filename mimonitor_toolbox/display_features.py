@@ -13,19 +13,27 @@ from .core import (
     CUSTOM_COLOR_TEMP_VALUE,
     HDR_TONE_MAPPING_UI_TO_MTK,
     LOCAL_DIMMING_NAMES,
+    MEMC_CONDITION_JNI_KEYS,
+    MEMC_OPTIONS,
+    MEMC_SETTINGS_KEY,
     PICTURE_MODE_GROUPS,
     PICTURE_SCENE_NAMES,
     SOUND_OUTPUT_OPTIONS,
     SOUND_OUTPUT_SETTINGS_KEY,
     SOUND_OUTPUT_VALID_VALUES,
     XIAOMI_TO_MTK_COLOR_TEMP,
+    evaluate_memc_conditions,
+    format_memc_condition_dialog,
+    format_memc_label,
     format_sound_output_label,
     is_game_picture_mode,
     is_hdr_tone_mapping_picture_mode,
     load_settings,
+    memc_jni_key_for_mode,
     normalize_sound_output_value,
     parse_sound_output_value,
     update_settings,
+    write_memc_value,
 )
 from .presets import (
     BASELINE_PRESET_ID,
@@ -38,7 +46,11 @@ from .presets import (
     unique_name,
 )
 from .widgets import LoadingSpinner, OverlayResizeFilter
-from .windows import query_windows_hdr_enabled, resolve_hdr_target_display
+from .windows import (
+    query_target_display_refresh_rate,
+    query_windows_hdr_enabled,
+    resolve_hdr_target_display,
+)
 
 _preset_overlay_filter = None
 
@@ -140,6 +152,12 @@ class DisplayFeaturesMixin:
                 "灰阶响应时间",
                 lambda val, name: self._jni("g_video__vid_od_response_time", val, "picture_response_time", f"响应时间: {name}")
             ),
+            "memc": (
+                MEMC_SETTINGS_KEY,
+                list(MEMC_OPTIONS),
+                "运动补偿",
+                lambda val, name: self._set_memc(val, name),
+            ),
             "freesync": (
                 "freesync",
                 [(0, "关"), (1, "开")],
@@ -238,6 +256,9 @@ class DisplayFeaturesMixin:
         if action == "local_dimming_toggle_off":
             self._toggle_local_dimming_off_hotkey()
             return
+        if action == "volume_mute_toggle":
+            self.toggle_media_mute(show_hud=True)
+            return
 
         catalog = self._cycle_action_catalog()
         actions_map = {
@@ -246,6 +267,7 @@ class DisplayFeaturesMixin:
             "color_space_cycle": catalog["color_space"],
             "color_temp_cycle": catalog["color_temp"],
             "response_time_cycle": catalog["response_time"],
+            "memc_cycle": catalog["memc"],
             "freesync_toggle": catalog["freesync"],
             "input_source_cycle": catalog["input_source"],
             "sound_output_cycle": catalog["sound_output"],
@@ -1116,6 +1138,10 @@ class DisplayFeaturesMixin:
             self.values_signal.emit({setting: value})
             return
 
+        if cfg.get("media_volume"):
+            self.set_media_volume(value)
+            return
+
         settings_keys = cfg.get("settings", [setting])
         for k in settings_keys:
             self.current_vals[k] = value
@@ -1168,6 +1194,12 @@ class DisplayFeaturesMixin:
         elif sk == "picture_response_time":
             v = self.adb.jni_get("g_video__vid_od_response_time", check=check)
             return as_int(v)
+        elif sk == MEMC_SETTINGS_KEY:
+            mode = self.current_vals.get("picture_mode")
+            if mode in (None, "", "null", "N/A"):
+                mode = self.adb.get("picture_mode", check=check)
+            v = self.adb.jni_get(memc_jni_key_for_mode(mode), check=check)
+            return as_int(v)
         elif sk == "freesync":
             src = self.adb.get("mitv.tvplayer.hdmi.last.source", check=check)
             src_id = as_int(src)
@@ -1177,6 +1209,9 @@ class DisplayFeaturesMixin:
             else:
                 fs = self.adb.jni_get("g_video__freesync_switch", check=check)
                 return 1 if as_int(fs) == 3 else 0
+        elif sk == "volume_music_speaker":
+            v = self.adb.media_volume(check=check)
+            return as_int(v)
         else:
             # Standard settings key
             v = self.adb.get(sk, check=check)
@@ -1312,6 +1347,15 @@ class DisplayFeaturesMixin:
         if enabled:
             # 开启时立刻纠正一次当前状态（可能在非游戏模式下正显示着准星）
             self._reconcile_crosshair_mode_state()
+
+    def _toggle_show_volume_osd(self, state):
+        try:
+            state_val = int(state)
+        except Exception:
+            state_val = getattr(state, "value", 0)
+        enabled = state_val == Qt.CheckState.Checked.value
+        update_settings({"show_volume_osd": enabled})
+        self.log(f"调节显示器音量时显示音量条: {'开启' if enabled else '关闭'}")
 
     def _crosshair_value_from_vals(self):
         raw = getattr(self, "current_vals", {}).get("front_sight_index")
@@ -1997,6 +2041,89 @@ class DisplayFeaturesMixin:
 
     _set_sound_output = set_sound_output
 
+    def set_media_volume(self, value, unmute_first=None):
+        """绝对设置显示器媒体音量（0~100）。"""
+        if not self.check_connection():
+            return
+        target = max(0, min(100, int(value)))
+        prev_muted = bool(self.current_vals.get("media_muted", 0))
+        should_unmute = prev_muted if unmute_first is None else bool(unmute_first)
+        previous = self._take_control_previous("volume_music_speaker")
+        prev_mute_raw = self.current_vals.get("media_muted")
+
+        self.current_vals["volume_music_speaker"] = target
+        emitted = {"volume_music_speaker": target}
+        if should_unmute:
+            self.current_vals["media_muted"] = 0
+            emitted["media_muted"] = 0
+        self.values_signal.emit(emitted)
+        self._mark_adb_busy(1.5)
+
+        def operation():
+            show_ui = bool(load_settings().get("show_volume_osd", False))
+            with self.adb.transaction():
+                self.adb.set_media_volume(target, unmute_first=should_unmute, show_ui=show_ui, check=True)
+
+        def success():
+            self.log(f"音量: {target}")
+
+        def failure():
+            rollback = {}
+            if previous is not None:
+                self.current_vals["volume_music_speaker"] = previous
+                rollback["volume_music_speaker"] = previous
+            if prev_mute_raw is not None:
+                self.current_vals["media_muted"] = prev_mute_raw
+                rollback["media_muted"] = prev_mute_raw
+            if rollback:
+                self.values_signal.emit(rollback)
+
+        self._run_adb_action("音量", operation, success, failure)
+
+    def toggle_media_mute(self, muted=None, show_hud=False):
+        """切换或设置显示器媒体静音状态。"""
+        if not self.check_connection():
+            return
+        if muted is None and "media_muted" not in self.current_vals:
+            state = {}
+
+            def resolve_op():
+                with self.adb.transaction():
+                    state["muted"] = bool(self.adb.media_muted(check=True))
+
+            def resolve_ok():
+                cur = 1 if state.get("muted") else 0
+                self.current_vals["media_muted"] = cur
+                self.values_signal.emit({"media_muted": cur})
+                self.toggle_media_mute(muted=not bool(cur), show_hud=show_hud)
+
+            self._run_adb_action("读取静音状态", resolve_op, resolve_ok)
+            return
+
+        target_muted = (not bool(self.current_vals.get("media_muted", 0))) if muted is None else bool(muted)
+        target_val = 1 if target_muted else 0
+        prev_mute_raw = self.current_vals.get("media_muted")
+        self.current_vals["media_muted"] = target_val
+        self.values_signal.emit({"media_muted": target_val})
+        if show_hud and getattr(self, "osd", None):
+            self.osd.show_hud("静音", "开" if target_muted else "关")
+        self._mark_adb_busy(1.5)
+
+        def operation():
+            show_ui = bool(load_settings().get("show_volume_osd", False))
+            with self.adb.transaction():
+                self.adb.set_media_muted(target_muted, show_ui=show_ui, check=True)
+
+        def success():
+            self.log(f"静音: {'开' if target_muted else '关'}")
+
+        def failure():
+            if prev_mute_raw is not None:
+                self.current_vals["media_muted"] = prev_mute_raw
+                self.values_signal.emit({"media_muted": prev_mute_raw})
+
+        self._run_adb_action("静音", operation, success, failure)
+
     def _confirm_switch_to_game_mode(self, feature_name):
         w = MessageBox(
             "需要游戏模式",
@@ -2115,6 +2242,177 @@ class DisplayFeaturesMixin:
                 self._optimistic_highlight(sk, previous)
 
         self._run_adb_action(m.split(":", 1)[0], operation, success, failure)
+
+    def _read_memc_live_mode(self):
+        if hasattr(self.adb, "get"):
+            raw = self.adb.get("picture_mode", check=True)
+            if raw not in (None, "", "null", "N/A"):
+                try:
+                    return int(str(raw).strip())
+                except (TypeError, ValueError):
+                    pass
+        return getattr(self, "current_vals", {}).get("picture_mode")
+
+    def _read_memc_condition_state(self):
+        live_settings = dict(getattr(self, "current_vals", {}))
+        cond_keys = ("picture_mode", "picture_preset_scenario", "mitv.tvplayer.hdmi.last.source")
+        if hasattr(self.adb, "shell"):
+            try:
+                keys_str = " ".join(cond_keys)
+                out = self.adb.shell(
+                    f"for k in {keys_str}; do echo $k=$(settings get global $k); done",
+                    check=False,
+                )
+                for line in str(out or "").splitlines():
+                    key, sep, raw = line.strip().partition("=")
+                    if not sep or not key or raw in ("", "null", "N/A"):
+                        continue
+                    try:
+                        live_settings[key] = int(raw)
+                    except (TypeError, ValueError):
+                        live_settings[key] = raw
+            except Exception:
+                pass
+        elif hasattr(self.adb, "get"):
+            for key in cond_keys:
+                try:
+                    raw = self.adb.get(key, check=False)
+                except Exception:
+                    raw = None
+                if raw not in (None, "", "null", "N/A"):
+                    try:
+                        live_settings[key] = int(str(raw).strip())
+                    except (TypeError, ValueError):
+                        live_settings[key] = raw
+
+        live_jni = {}
+        if hasattr(self.adb, "jni_batch_get"):
+            try:
+                live_jni = self.adb.jni_batch_get(MEMC_CONDITION_JNI_KEYS, check=False) or {}
+            except Exception:
+                live_jni = {}
+        return live_settings, live_jni
+
+    def _show_memc_blocked_dialog(self, title, body, target_val):
+        if isinstance(self, QWidget):
+            w = MessageBox(title, body, self)
+            w.yesButton.setText("切至电影模式并开启")
+            w.cancelButton.setText("知道了")
+            accepted = bool(w.exec())
+            w.deleteLater()
+            if accepted:
+                self._switch_to_cinema_and_enable_memc(target_val)
+            return
+        sig = getattr(self, "message_signal", None)
+        if sig is not None:
+            sig.emit("warn", title, body)
+
+    def _present_memc_condition_dialog(self, report, target_val):
+        title, body = format_memc_condition_dialog(report, target_val)
+        if report.case == "A":
+            self._show_memc_blocked_dialog(title, body, target_val)
+        elif report.case == "B":
+            sig = getattr(self, "message_signal", None)
+            if sig is not None:
+                sig.emit("info", title, body)
+
+    def _switch_to_cinema_and_enable_memc(self, target_val):
+        if not self.check_connection():
+            return
+        target_val = int(target_val)
+        target_name = format_memc_label(target_val)
+        self._mark_adb_busy(3.5)
+        self._picture_mode_switch_seq = getattr(self, "_picture_mode_switch_seq", 0) + 1
+
+        def operation():
+            with self.adb.transaction():
+                self.adb.put("picture_mode", "9", check=True)
+                time.sleep(1.2)
+                write_memc_value(self.adb, 9, target_val)
+
+        def success():
+            self._note_picture_change()
+            self.current_vals["picture_mode"] = 9
+            self.current_vals[MEMC_SETTINGS_KEY] = target_val
+            self._highlight_mode(9)
+            self._optimistic_highlight(MEMC_SETTINGS_KEY, target_val)
+            self.log(f"已切至电影模式并开启运动补偿: {target_name}")
+            if hasattr(self, "_refresh_pages"):
+                self._refresh_pages(("picturePage",), delay_ms=600, force=True)
+
+        self._run_adb_action("切换电影模式并开启运动补偿", operation, success)
+
+    def _read_memc_host_refresh_rate(self):
+        try:
+            configured = load_settings().get("hdr_target_display_id") or ""
+        except Exception:
+            configured = ""
+        target_name = getattr(self, "_hdr_target_device_name", None)
+        return query_target_display_refresh_rate(
+            configured_id=configured,
+            target_device_name=target_name,
+        )
+
+    def _set_memc(self, val, name=None):
+        if not self.check_connection():
+            return
+        val = int(val)
+        name = name or format_memc_label(val)
+        self._mark_adb_busy(2.5)
+        previous = self._take_control_previous(MEMC_SETTINGS_KEY)
+        host_refresh_hz = None if val == 0 else self._read_memc_host_refresh_rate()
+        outcome = {}
+
+        def operation():
+            with self.adb.transaction():
+                if val == 0:
+                    mode = self._read_memc_live_mode()
+                    write_memc_value(self.adb, mode, 0)
+                    outcome["mode"] = mode
+                    outcome["case"] = "off"
+                    return
+                live_settings, live_jni = self._read_memc_condition_state()
+                report = evaluate_memc_conditions(
+                    live_settings,
+                    live_jni,
+                    host_refresh_hz=host_refresh_hz,
+                )
+                outcome["report"] = report
+                outcome["live_settings"] = live_settings
+                outcome["mode"] = report.mode
+                outcome["case"] = report.case
+                if report.case == "A":
+                    return
+                write_memc_value(self.adb, report.mode, val)
+
+        def success():
+            if outcome.get("mode") is not None:
+                self.current_vals["picture_mode"] = outcome["mode"]
+            if outcome.get("case") == "A":
+                if previous is not None:
+                    self.current_vals[MEMC_SETTINGS_KEY] = previous
+                else:
+                    self.current_vals.pop(MEMC_SETTINGS_KEY, None)
+                self._optimistic_highlight(MEMC_SETTINGS_KEY, previous)
+                self.log(f"运动补偿: 当前模式不支持开启（已拦截切换为 {name}）")
+                self._present_memc_condition_dialog(outcome["report"], val)
+                return
+
+            self._note_picture_change()
+            self.log(f"运动补偿: {name}")
+            self.current_vals[MEMC_SETTINGS_KEY] = val
+            self._optimistic_highlight(MEMC_SETTINGS_KEY, val)
+            if outcome.get("case") == "B":
+                self._present_memc_condition_dialog(outcome["report"], val)
+
+        def failure():
+            if previous is not None:
+                self.current_vals[MEMC_SETTINGS_KEY] = previous
+            else:
+                self.current_vals.pop(MEMC_SETTINGS_KEY, None)
+            self._optimistic_highlight(MEMC_SETTINGS_KEY, previous)
+
+        self._run_adb_action("运动补偿", operation, success, failure)
 
     def _set_hdr_tone_mapping(self, ui_value, name):
         if not self.check_connection():

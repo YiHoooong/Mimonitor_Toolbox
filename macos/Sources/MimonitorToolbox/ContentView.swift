@@ -1,4 +1,5 @@
 import SwiftUI
+import MimonitorPresetCore
 
 struct ContentView: View {
     @EnvironmentObject var state: AppState
@@ -74,6 +75,19 @@ struct ContentView: View {
         )) {
             Button("好", role: .cancel) { state.presetError = nil }
         } message: { Text(state.presetError ?? "") }
+        .alert(state.memcPrompt?.title ?? "运动补偿", isPresented: Binding(
+            get: { state.memcPrompt != nil },
+            set: { if !$0 { state.memcPrompt = nil } }
+        )) {
+            if let prompt = state.memcPrompt, prompt.canSwitchToMovie {
+                Button("切至电影模式并开启") {
+                    let level = prompt.pendingLevel
+                    state.memcPrompt = nil
+                    state.switchToMovieAndEnableMemc(level)
+                }
+            }
+            Button("知道了", role: .cancel) { state.memcPrompt = nil }
+        } message: { Text(state.memcPrompt?.message ?? "") }
     }
 
     @ViewBuilder

@@ -346,8 +346,51 @@ def unblock_adb_spawns():
         _adb_spawn_blocked = False
 
 
+_AUDIO_SERVICE_TXN_ADJUST_STREAM_VOLUME = 10
+_AUDIO_SERVICE_TXN_SET_STREAM_VOLUME = 12
+_AUDIO_SERVICE_TXN_IS_STREAM_MUTE = 17
+_AUDIO_SERVICE_TXN_GET_STREAM_VOLUME_FOR_MUTE = 22
+_AUDIO_STREAM_MUSIC = 3
+_AUDIO_ADJUST_MUTE = -100
+_AUDIO_ADJUST_UNMUTE = 100
+_AUDIO_BINDER_SHELL_PACKAGE = "com.android.shell"
+
+
+def service_call_succeeded(output):
+    """判断 `service call` 输出是否成功且无 binder 异常。"""
+    text = str(output or "")
+    if "Result: Parcel(" not in text:
+        return False
+    lower = text.lower()
+    return "error" not in lower and "exception" not in lower
+
+
+def parse_service_call_int(output):
+    """从 `service call` 返回的 Parcel dump 中提取末尾 int32 返回值。"""
+    hex_digits = set("0123456789abcdefABCDEF")
+    tokens = []
+    current = []
+    for ch in str(output or ""):
+        if ch in hex_digits:
+            current.append(ch)
+        else:
+            if len(current) == 8:
+                tokens.append("".join(current))
+            current = []
+    if len(current) == 8:
+        tokens.append("".join(current))
+    if len(tokens) < 2:
+        return None
+    val = int(tokens[-1], 16)
+    if val >= 0x80000000:
+        val -= 0x100000000
+    return val
+
+
 class Adb:
-    def __init__(self, ip=""): self.ip = ip
+    def __init__(self, ip=""):
+        self.ip = ip
+        self._media_volume_binder_verified = None
     @property
     def serial(self):
         return format_adb_serial(self.ip)
@@ -474,6 +517,101 @@ class Adb:
             jar, ["MtkDirectTool", "setSoundOutput", int(device_id)]
         )
         return self.shell(command, check=check)
+
+    def media_volume(self, check=False):
+        """读取显示器媒体音量（0~100）。优先走 AudioService getStreamVolumeForMute。"""
+        out = self.shell(
+            f"service call audio {_AUDIO_SERVICE_TXN_GET_STREAM_VOLUME_FOR_MUTE} i32 {_AUDIO_STREAM_MUSIC}",
+            check=check,
+        )
+        val = parse_service_call_int(out)
+        if val is not None and 0 <= val <= 100:
+            _adb_log(f"media_volume => {val}")
+            return val
+        raw = str(self.shell("settings get system volume_music_speaker", check=check) or "").strip()
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError):
+            parsed = None
+        if parsed is not None and 0 <= parsed <= 100:
+            _adb_log(f"media_volume (fallback) => {parsed}")
+            return parsed
+        return None
+
+    def media_muted(self, check=False):
+        """读取显示器媒体流静音状态。"""
+        out = self.shell(
+            f"service call audio {_AUDIO_SERVICE_TXN_IS_STREAM_MUTE} i32 {_AUDIO_STREAM_MUSIC}",
+            check=check,
+        )
+        val = parse_service_call_int(out)
+        if val is None:
+            return None
+        muted = val != 0
+        _adb_log(f"media_muted => {muted}")
+        return muted
+
+    def _apply_media_volume_by_keyevent(self, target, check=False):
+        current = self.media_volume(check=check)
+        if current is None:
+            return
+        delta = target - current
+        if delta == 0:
+            return
+        key = "KEYCODE_VOLUME_UP" if delta > 0 else "KEYCODE_VOLUME_DOWN"
+        batch = " ".join([key] * min(abs(delta), 100))
+        self.shell(f"input keyevent {batch}", check=check)
+
+    def set_media_volume(self, value, unmute_first=False, show_ui=False, check=False):
+        """绝对设置显示器媒体音量（0~100）。返回是否使用了 binder 快速通道。"""
+        target = max(0, min(100, int(value)))
+        flags = 1 if show_ui else 0
+        _adb_log(f"set_media_volume = {target} (unmute_first={bool(unmute_first)}, show_ui={bool(show_ui)})")
+        if unmute_first:
+            self.set_media_muted(False, show_ui=False, check=check)
+        if self._media_volume_binder_verified is not False:
+            out = self.shell(
+                f"service call audio {_AUDIO_SERVICE_TXN_SET_STREAM_VOLUME} "
+                f"i32 {_AUDIO_STREAM_MUSIC} i32 {target} i32 {flags} s16 {_AUDIO_BINDER_SHELL_PACKAGE}",
+                check=check,
+            )
+            if service_call_succeeded(out):
+                if self._media_volume_binder_verified is None:
+                    applied = self.media_volume(check=check) == target
+                    self._media_volume_binder_verified = applied
+                    if applied:
+                        return True
+                else:
+                    return True
+            else:
+                self._media_volume_binder_verified = False
+        self._apply_media_volume_by_keyevent(target, check=check)
+        return False
+
+    def set_media_muted(self, muted, show_ui=False, check=False):
+        """设置/解除显示器媒体流静音。返回是否使用了 binder 快速通道。"""
+        muted_bool = bool(muted)
+        flags = 1 if show_ui else 0
+        _adb_log(f"set_media_muted = {muted_bool} (show_ui={bool(show_ui)})")
+        if self._media_volume_binder_verified is not False:
+            direction = _AUDIO_ADJUST_MUTE if muted_bool else _AUDIO_ADJUST_UNMUTE
+            out = self.shell(
+                f"service call audio {_AUDIO_SERVICE_TXN_ADJUST_STREAM_VOLUME} "
+                f"i32 {_AUDIO_STREAM_MUSIC} i32 {direction} i32 {flags} s16 {_AUDIO_BINDER_SHELL_PACKAGE}",
+                check=check,
+            )
+            if service_call_succeeded(out):
+                if self._media_volume_binder_verified is None:
+                    applied = self.media_muted(check=check) == muted_bool
+                    self._media_volume_binder_verified = applied
+                    if applied:
+                        return True
+                else:
+                    return True
+            else:
+                self._media_volume_binder_verified = False
+        self.shell("input keyevent KEYCODE_VOLUME_MUTE", check=check)
+        return False
     def jni_set_color_gains(self, red, green, blue, check=False):
         _adb_log(f"jni_set_color_gains r={red} g={green} b={blue}")
         jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"

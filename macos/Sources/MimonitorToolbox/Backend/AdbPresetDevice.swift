@@ -47,7 +47,8 @@ final class AdbPresetDevice: PresetDevice {
             var required = ["picture_mode", "tv_picture_light_sensor", "picture_backlight",
                             "picture_brightness", "picture_contrast", "picture_saturation", "picture_hue",
                             "picture_sharpness", "picture_color_temperature", "picture_local_dimming",
-                            "picture_dynamic_definition", "picture_response_time",
+                            "picture_dynamic_definition", MemcSupport.primarySettingKey,
+                            "picture_response_time",
                             "tv_picture_advanced_video_color_space", "freesync"]
             if values["picture_color_temperature"] == "3" {
                 required += ["picture_red_gain", "picture_green_gain", "picture_blue_gain"]
@@ -121,7 +122,9 @@ final class AdbPresetDevice: PresetDevice {
         ("色温", ["picture_color_temperature"]),
         ("色增益", ["picture_red_gain", "picture_green_gain", "picture_blue_gain"]),
         ("精密控光", ["picture_local_dimming"]), ("HDR 色调映射", ["settings_display_hdr_color_tone"]),
-        ("动态清晰度", ["picture_dynamic_definition"]), ("灰阶响应时间", ["picture_response_time"]),
+        ("动态清晰度", ["picture_dynamic_definition"]),
+        ("运动补偿", [MemcSupport.primarySettingKey]),
+        ("灰阶响应时间", ["picture_response_time"]),
         ("色域", ["tv_picture_advanced_video_color_space"]),
         ("声音输出", [PicturePresetPlan.soundOutputKey]),
     ]

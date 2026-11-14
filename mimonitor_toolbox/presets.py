@@ -15,11 +15,15 @@ from dataclasses import dataclass, field
 from .core import (
     CUSTOM_COLOR_TEMP_VALUE,
     HDR_TONE_MAPPING_UI_TO_MTK,
+    MEMC_GAME_JNI_KEY,
+    MEMC_JNI_KEY,
+    MEMC_SETTINGS_KEY,
     SOUND_OUTPUT_SETTINGS_KEY,
     SOUND_OUTPUT_VALID_VALUES,
     XIAOMI_TO_MTK_COLOR_TEMP,
     format_sound_output_label,
     is_hdr_tone_mapping_picture_mode,
+    write_memc_value,
 )
 
 
@@ -46,6 +50,7 @@ PICTURE_PRESET_SETTINGS_KEYS = (
     "picture_hdr_tone_mapping",
     "settings_display_hdr_color_tone",
     "picture_dynamic_definition",
+    MEMC_SETTINGS_KEY,
     "picture_response_time",
     "tv_picture_advanced_video_color_space",
     "tv_picture_video_color_space",
@@ -57,6 +62,8 @@ PICTURE_PRESET_JNI_KEYS = (
     "g_video__clr_temp",
     "g_video__vid_local_dimming",
     "g_video__light_sensor_switch",
+    MEMC_JNI_KEY,
+    MEMC_GAME_JNI_KEY,
 )
 
 
@@ -113,15 +120,24 @@ def _has_freesync(values):
     return True, ""
 
 
-def _has_sound_output(values):
-    if SOUND_OUTPUT_SETTINGS_KEY not in values:
-        return False, "这条预设没有记录声音输出（保存于旧版本），保持现状"
-    raw = values.get(SOUND_OUTPUT_SETTINGS_KEY)
-    if raw is None or (
-        isinstance(raw, str) and raw.strip().lower() in ("", "null", "none", "n/a")
-    ):
-        return False, "这条预设没有记录声音输出（保存于旧版本），保持现状"
-    return True, ""
+def _has_optional_setting(key, label):
+    """构造可选预设字段的存在性校验器，确保旧版预设缺键时跳过而非报错。"""
+    reason = f"这条预设没有记录{label}（保存于旧版本），保持现状"
+
+    def check(values):
+        if key not in values:
+            return False, reason
+        raw = values.get(key)
+        if raw is None or (
+            isinstance(raw, str) and raw.strip().lower() in ("", "null", "none", "n/a")
+        ):
+            return False, reason
+        return True, ""
+
+    return check
+
+
+_has_sound_output = _has_optional_setting(SOUND_OUTPUT_SETTINGS_KEY, "声音输出")
 
 
 def _apply_sound_output(adb, values):
@@ -209,6 +225,17 @@ def _jni_setting(jni_key, setting_key, osd_key=None):
     return apply
 
 
+_has_memc = _has_optional_setting(MEMC_SETTINGS_KEY, "运动补偿")
+
+
+def _apply_memc(adb, values):
+    value = _as_int(values, MEMC_SETTINGS_KEY)
+    if not 0 <= value <= 4:
+        raise ValueError(f"运动补偿 {value} 超出 0-4")
+    mode = _as_int(values, "picture_mode") if "picture_mode" in values else None
+    write_memc_value(adb, mode, value)
+
+
 def _apply_hdr_tone_mapping(adb, values):
     """HDR 色调映射：两个 settings 键存的是**不同枚举**，不能混用。
 
@@ -277,6 +304,7 @@ PICTURE_ITEMS = (
         "dynamic_definition", "动态清晰度",
         _jni_setting("g_video__vid_insert_black", "picture_dynamic_definition"),
     ),
+    PictureItem("memc", "运动补偿", _apply_memc, _has_memc),
     PictureItem(
         "response_time", "灰阶响应时间",
         _jni_setting("g_video__vid_od_response_time", "picture_response_time"),

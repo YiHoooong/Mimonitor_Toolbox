@@ -479,11 +479,12 @@ final class AdbClient {
     /// 绝对设置媒体音量（0~100）。返回是否走了 binder 快速通道。
     /// binder 不可用时退回 `input keyevent` 逐级调整（先读当前值再补差值）。
     @discardableResult
-    func setMediaVolume(_ value: Int, unmuteFirst: Bool = false) -> Bool {
+    func setMediaVolume(_ value: Int, unmuteFirst: Bool = false, showUI: Bool = false) -> Bool {
         let target = max(0, min(100, value))
-        if unmuteFirst { _ = setMediaMuted(false) }
+        let flags = showUI ? 1 : 0
+        if unmuteFirst { _ = setMediaMuted(false, showUI: false) }
         if mediaVolumeBinderVerified != false {
-            let output = shell("service call audio \(AudioServiceTxn.setStreamVolume) i32 \(Self.streamMusic) i32 \(target) i32 0 s16 \(Self.binderShellPackage)")
+            let output = shell("service call audio \(AudioServiceTxn.setStreamVolume) i32 \(Self.streamMusic) i32 \(target) i32 \(flags) s16 \(Self.binderShellPackage)")
             if Self.serviceCallSucceeded(output) {
                 if mediaVolumeBinderVerified == nil {
                     // 首次调用回读确认真的生效：ROM 若改了 transaction code，
@@ -504,10 +505,11 @@ final class AdbClient {
 
     /// 设置/解除媒体流静音。返回是否走了 binder 快速通道。
     @discardableResult
-    func setMediaMuted(_ muted: Bool) -> Bool {
+    func setMediaMuted(_ muted: Bool, showUI: Bool = false) -> Bool {
+        let flags = showUI ? 1 : 0
         if mediaVolumeBinderVerified != false {
             let direction = muted ? Self.adjustMute : Self.adjustUnmute
-            let output = shell("service call audio \(AudioServiceTxn.adjustStreamVolume) i32 \(Self.streamMusic) i32 \(direction) i32 0 s16 \(Self.binderShellPackage)")
+            let output = shell("service call audio \(AudioServiceTxn.adjustStreamVolume) i32 \(Self.streamMusic) i32 \(direction) i32 \(flags) s16 \(Self.binderShellPackage)")
             if Self.serviceCallSucceeded(output) {
                 if mediaVolumeBinderVerified == nil {
                     let applied = mediaMuted() == muted

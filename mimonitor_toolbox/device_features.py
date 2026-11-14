@@ -35,11 +35,15 @@ from .core import (
     GUARDIAN_MAIN_ACTIVITY,
     GUARDIAN_PACKAGE,
     HDR_TONE_MAPPING_MTK_TO_UI,
+    MEMC_GAME_JNI_KEY,
+    MEMC_JNI_KEY,
+    MEMC_SETTINGS_KEY,
     MTK_TO_XIAOMI_COLOR_TEMP,
     SOUND_OUTPUT_SETTINGS_KEY,
     format_sound_output_label,
     get_guardian_apk_path,
     load_settings,
+    memc_jni_key_for_mode,
     normalize_sound_output_value,
     strip_guardian_package_from_accessibility,
     update_settings,
@@ -122,6 +126,16 @@ def apply_picture_jni_overrides(settings_vals, jni_batch_vals):
                 settings_vals["settings_display_hdr_color_tone"] = ui_val
         except (TypeError, ValueError): pass
 
+    # 运动补偿 (MEMC)：普通模式与游戏模式读不同的 MTK 键，统一覆盖逻辑主键
+    memc_mode = settings_vals.get("picture_mode")
+    if memc_mode in (None, "", "null", "N/A"):
+        memc_mode = settings_vals.get("picture_preset_scenario")
+    memc_jni_key = memc_jni_key_for_mode(memc_mode)
+    if memc_jni_key in jni_batch_vals:
+        try:
+            settings_vals[MEMC_SETTINGS_KEY] = int(jni_batch_vals[memc_jni_key])
+        except (TypeError, ValueError): pass
+
     return jni_out
 
 
@@ -172,6 +186,18 @@ class DeviceFeaturesMixin:
                         )
                     except Exception:
                         raw_sound = None
+                    raw_volume = None
+                    if hasattr(self.adb, "media_volume"):
+                        try:
+                            raw_volume = self.adb.media_volume(check=False)
+                        except Exception:
+                            raw_volume = None
+                    raw_muted = None
+                    if hasattr(self.adb, "media_muted"):
+                        try:
+                            raw_muted = self.adb.media_muted(check=False)
+                        except Exception:
+                            raw_muted = None
                 polled = {}
                 source_text = str(raw_source or "").strip()
                 if source_text and source_text.lower() not in ("null", "n/a"):
@@ -182,6 +208,13 @@ class DeviceFeaturesMixin:
                 sound_val = normalize_sound_output_value(raw_sound)
                 if sound_val is not None:
                     polled[SOUND_OUTPUT_SETTINGS_KEY] = sound_val
+                if raw_volume is not None:
+                    try:
+                        polled["volume_music_speaker"] = int(raw_volume)
+                    except (TypeError, ValueError):
+                        pass
+                if raw_muted is not None:
+                    polled["media_muted"] = 1 if raw_muted else 0
                 if not polled:
                     return
                 if (
@@ -217,6 +250,7 @@ class DeviceFeaturesMixin:
                     "picture_blue_gain", "picture_local_dimming",
                     "tv_picture_video_local_dimming", "picture_hdr_tone_mapping",
                     "settings_display_hdr_color_tone", "picture_dynamic_definition",
+                    MEMC_SETTINGS_KEY,
                     "picture_response_time", "tv_picture_advanced_video_color_space",
                     "tv_picture_video_color_space", "tv_picture_light_sensor",
                 ],
@@ -224,6 +258,7 @@ class DeviceFeaturesMixin:
                     "g_disp__disp_back_light", "g_video__vid_gamut_mapping_mode",
                     "g_video__clr_temp", "g_video__vid_local_dimming",
                     "g_video__vid_hdr_tone_mapping_mode", "g_video__light_sensor_switch",
+                    MEMC_JNI_KEY, MEMC_GAME_JNI_KEY,
                 ],
             },
             "gamePage": {
@@ -1470,6 +1505,7 @@ class DeviceFeaturesMixin:
             "picture_green_gain": "green_gain",
             "picture_blue_gain": "blue_gain",
             "atmosphere_light_illumination": "atmosphere_illumination",
+            "volume_music_speaker": "volume_music_speaker",
         }
         for k, name in slider_mappings.items():
             if k in vals and name in self.sliders:
@@ -1504,6 +1540,12 @@ class DeviceFeaturesMixin:
             sound_label = getattr(self, "sound_output_label", None)
             if sound_label is not None:
                 sound_label.setText(format_sound_output_label(sound_val))
+
+        if "media_muted" in vals:
+            mute_btn = getattr(self, "sound_mute_btn", None)
+            highlight = getattr(self, "_highlight_btn", None)
+            if mute_btn is not None and callable(highlight):
+                highlight(mute_btn, bool(vals["media_muted"]))
 
         update_game_hint = getattr(self, "_update_game_mode_hint", None)
         if callable(update_game_hint):
@@ -1637,6 +1679,22 @@ class DeviceFeaturesMixin:
                     if page_name == "gamePage":
                         for key in GAME_FEATURE_KEYS:
                             settings_vals.setdefault(key, 0)
+
+                    if page_name == "sourcePage":
+                        if hasattr(self.adb, "media_volume"):
+                            try:
+                                vol = self.adb.media_volume(check=False)
+                            except Exception:
+                                vol = None
+                            if vol is not None:
+                                settings_vals["volume_music_speaker"] = int(vol)
+                        if hasattr(self.adb, "media_muted"):
+                            try:
+                                muted = self.adb.media_muted(check=False)
+                            except Exception:
+                                muted = None
+                            if muted is not None:
+                                settings_vals["media_muted"] = 1 if muted else 0
 
                     jni_batch_vals = {}
                     jni_keys = cfg.get("jni", [])

@@ -77,6 +77,7 @@ final class AppState: ObservableObject {
     @Published var isPresetOperationInFlight = false
     @Published var presetOperationText = ""
     @Published var presetError: String?
+    @Published var memcPrompt: MemcPromptState?
     @Published var automaticTaskStatus = ""
     @Published var requestedPage: Page?
     var presetTimer: Timer?
@@ -201,6 +202,11 @@ final class AppState: ObservableObject {
     /// 目标音频输出设备名（CoreAudio 设备名，匹配用「包含」）
     @Published var mediaVolumeOutputName = UserDefaults.standard.string(forKey: "media_volume_output_name") ?? "Mi Monitor" {
         didSet { UserDefaults.standard.set(mediaVolumeOutputName, forKey: "media_volume_output_name") }
+    }
+
+    /// 调节显示器音量/静音时是否在显示器端弹出系统音量条（Android AudioManager FLAG_SHOW_UI）
+    @Published var showVolumeOSD = UserDefaults.standard.object(forKey: "show_volume_osd") as? Bool ?? false {
+        didSet { UserDefaults.standard.set(showVolumeOSD, forKey: "show_volume_osd") }
     }
 
     private var hdrLastState: Bool?
@@ -599,6 +605,10 @@ final class AppState: ObservableObject {
         loadingPages = []
         activeSource = "未知"
         activeSoundOutput = "未知"
+        mediaVolumePreview = nil
+        mediaVolumeHardware = nil
+        mediaVolumeMuted = nil
+        mediaVolumeNeedsUnmute = false
         hdrLastState = nil
         stopSourcePolling()
         if !ip.isEmpty {
@@ -731,6 +741,13 @@ final class AppState: ObservableObject {
             values["picture_backlight"] = String(v)
             values["xiaomi_picture_backlight"] = String(v)
         }
+        // 运动补偿（MEMC）：按当前画面模式选普通/游戏 JNI 键覆盖逻辑主键
+        let memcMode = MemcSupport.parseInt(values["g_video__picture_mode"])
+            ?? MemcSupport.parseInt(values["picture_mode"])
+        let memcJniKey = MemcSupport.jniKey(forPictureMode: memcMode)
+        if let raw = values[memcJniKey], let v = MemcSupport.parseInt(raw) {
+            values[MemcSupport.primarySettingKey] = String(v)
+        }
     }
 
     /// 游戏页的 320Hz / FreeSync 开关没有直接的 settings 键，要由 EDID / 自适应同步
@@ -786,6 +803,22 @@ final class AppState: ObservableObject {
                 if let rawSound = settingsVals[RegisterMap.soundOutputKey],
                    let normalizedSound = RegisterMap.normalizeSoundOutput(rawSound) {
                     settingsVals[RegisterMap.soundOutputKey] = String(normalizedSound)
+                }
+                if page == "picture" {
+                    let phase1Mode = MemcSupport.parseInt(settingsVals["picture_mode"])
+                    if MemcSupport.isGameMode(phase1Mode),
+                       let gameMemc = MemcSupport.parseInt(settingsVals[MemcSupport.gameSettingKey]) {
+                        settingsVals[MemcSupport.primarySettingKey] = String(gameMemc)
+                    }
+                }
+            }
+            var refreshedVolume: Int?
+            var refreshedMuted: Bool?
+            if page == "source" {
+                refreshedVolume = self.adb.mediaVolume()
+                refreshedMuted = self.adb.mediaMuted()
+                if let vol = refreshedVolume {
+                    settingsVals["volume_music_speaker"] = String(vol)
                 }
             }
             if !settingsVals.isEmpty {
@@ -844,6 +877,14 @@ final class AppState: ObservableObject {
                         self.activeSoundOutput = RegisterMap.soundOutputNames[soundId] ?? "\(soundId)"
                     } else {
                         self.activeSoundOutput = "未知"
+                    }
+                    if let vol = refreshedVolume {
+                        self.mediaVolumePreview = vol
+                        self.mediaVolumeHardware = vol
+                        self.currentValues["volume_music_speaker"] = String(vol)
+                    }
+                    if let muted = refreshedMuted {
+                        self.mediaVolumeMuted = muted
                     }
                 }
                 self.loadingPages.remove(page)
@@ -1074,6 +1115,125 @@ final class AppState: ObservableObject {
             self.adb.jniSet(key: "g_video__vid_insert_black", value: String(value))
             self.adb.settingsPut("picture_dynamic_definition", String(value))
             self.adb.refreshPq()
+        }
+    }
+
+    func setMemc(_ value: Int) {
+        guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
+        guard isConnected else { return log("未连接") }
+        guard (0...3).contains(value) else { return }
+
+        if value == 0 {
+            let mode = MemcSupport.parseInt(currentValues["g_video__picture_mode"])
+                ?? MemcSupport.parseInt(currentValues["picture_mode"])
+            currentValues[MemcSupport.primarySettingKey] = "0"
+            log("运动补偿: \(MemcSupport.levelLabel(0))")
+            runPictureChange {
+                self.executeMemcCommands(MemcSupport.writeCommands(value: 0, pictureMode: mode))
+            }
+            return
+        }
+
+        let request = connectionIntent.generation
+        let identity = adb.ip
+        let fallbackValue = currentValues[MemcSupport.primarySettingKey] ?? "0"
+        let hostRefreshHz = HDRDetector.externalDisplayRefreshRateHz()
+
+        runBackground {
+            let (freshSettings, freshJni) = self.adb.transaction {
+                let s = self.adb.settingsGetBatch([
+                    "picture_mode",
+                    "picture_preset_scenario",
+                    "mitv.tvplayer.hdmi.last.source",
+                    "picture_content_adaptive",
+                    "freesync",
+                    "mode_320",
+                ])
+                let j = self.adb.jniBatchGet(keys: [
+                    "g_video__picture_mode",
+                    "g_video__freesync_switch",
+                    "g_video__dp_adaptive_sync",
+                    "g_fusion_picture__hdmi_edid_version",
+                    "g_fusion_picture__dp_edid_version",
+                    "g_video__dlg_vrr_switch",
+                    "g_video__vid_content_adaptive",
+                    MemcSupport.normalJniKey,
+                    MemcSupport.gameJniKey,
+                ])
+                return (s, j)
+            }
+            let evaluation = MemcSupport.evaluate(
+                settings: freshSettings,
+                jni: freshJni,
+                hostRefreshHz: hostRefreshHz
+            )
+            let jniKey = MemcSupport.jniKey(forPictureMode: evaluation.pictureMode)
+            let hardwareValue = MemcSupport.parseInt(freshJni[jniKey]).map(String.init) ?? fallbackValue
+
+            DispatchQueue.main.async {
+                guard self.isConnected,
+                      self.connectionIntent.isCurrent(request),
+                      self.adb.ip == identity,
+                      !self.isPresetBusy,
+                      !self.presetConfiguration.applicationIncomplete else { return }
+
+                if let mode = evaluation.pictureMode {
+                    self.currentValues["picture_mode"] = String(mode)
+                }
+
+                if evaluation.outcome == .disallowedMode {
+                    self.currentValues[MemcSupport.primarySettingKey] = hardwareValue
+                    self.log("运动补偿: 当前模式（\(evaluation.modeName)）不支持开启，已拦截写入")
+                    HUDWindow.shared.show(title: "运动补偿", value: "当前模式不支持")
+                    self.memcPrompt = MemcPromptState(report: evaluation, level: value)
+                    return
+                }
+
+                let label = MemcSupport.levelLabel(value)
+                self.currentValues[MemcSupport.primarySettingKey] = String(value)
+                if evaluation.outcome == .unmetRuntimeConditions {
+                    self.log("运动补偿: \(label)（部分条件未满足，已保存档位）")
+                    HUDWindow.shared.show(title: "运动补偿", value: "\(label)（部分条件未满足）")
+                    self.memcPrompt = MemcPromptState(report: evaluation, level: value)
+                } else {
+                    self.log("运动补偿: \(label)")
+                }
+                self.runPictureChange {
+                    self.executeMemcCommands(MemcSupport.writeCommands(value: value, pictureMode: evaluation.pictureMode))
+                }
+            }
+        }
+    }
+
+    func switchToMovieAndEnableMemc(_ value: Int) {
+        guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
+        guard isConnected else { return log("未连接") }
+        guard (1...3).contains(value) else { return }
+        currentValues["picture_mode"] = "9"
+        currentValues[MemcSupport.primarySettingKey] = String(value)
+        log("运动补偿: 已切至电影模式并设为 \(MemcSupport.levelLabel(value))")
+        runPictureChange(delay: 1.5) {
+            self.adb.settingsPut("picture_mode", "9")
+            Thread.sleep(forTimeInterval: 0.3)
+            self.executeMemcCommands(MemcSupport.writeCommands(value: value, pictureMode: 9))
+            DispatchQueue.main.async {
+                self.scheduleCoalescedRefresh(delay: 1.2, pages: ["picture"])
+            }
+        }
+    }
+
+    private func executeMemcCommands(_ commands: [PresetCommand]) {
+        for command in commands {
+            switch command {
+            case .jni(let key, let value, let upd):
+                adb.jniSet(key: key, value: value, upd: upd)
+            case .setting(let key, let value):
+                adb.settingsPut(key, value)
+            case .refresh:
+                adb.refreshPq()
+            case .colorGains, .hdrToneMapping, .soundOutput:
+                break
+            }
         }
     }
 
@@ -1417,7 +1577,9 @@ final class AppState: ObservableObject {
         let pollRequest = pageRefreshIntent.begin("sourcePoll")
         runBackground {
             let vals = self.adb.settingsGetBatch(PageDataKeys.sourceSettings)
-            guard !vals.isEmpty else { return }
+            let polledVol = self.adb.mediaVolume()
+            let polledMuted = self.adb.mediaMuted()
+            guard !vals.isEmpty || polledVol != nil || polledMuted != nil else { return }
             DispatchQueue.main.async {
                 guard self.sourcePollArmed, self.isConnected,
                       self.connectionIntent.isCurrent(connectionRequest),
@@ -1438,6 +1600,16 @@ final class AppState: ObservableObject {
                     if self.activeSoundOutput != soundName {
                         self.activeSoundOutput = soundName
                         self.log("声音输出变化: \(soundName)")
+                    }
+                }
+                if self.mediaVolumePreview == nil || self.mediaVolumePreview == self.mediaVolumeHardware {
+                    if let polledVol {
+                        self.mediaVolumePreview = polledVol
+                        self.mediaVolumeHardware = polledVol
+                        self.currentValues["volume_music_speaker"] = String(polledVol)
+                    }
+                    if let polledMuted {
+                        self.mediaVolumeMuted = polledMuted
                     }
                 }
             }
@@ -2046,9 +2218,11 @@ final class AppState: ObservableObject {
         case "color_temp":          return intValue("picture_color_temperature", default: -1)
         case "response_time":       return intValue("picture_response_time", default: -1)
         case "dynamic_definition":  return intValue("picture_dynamic_definition", default: -1)
+        case "memc":                return intValue(MemcSupport.primarySettingKey, default: -1)
         case "hdr_tone_mapping":    return intValue("settings_display_hdr_color_tone", default: -1)
         case "source":              return intValue("mitv.tvplayer.hdmi.last.source", default: -1)
         case "sound_output":        return intValue(RegisterMap.soundOutputKey, default: -1)
+        case "volume":              return intValue("volume_music_speaker", default: -1)
         case "freesync":            return intValue("freesync", default: -1)
         case "light_sensor":        return intValue("tv_picture_light_sensor", default: -1)
         case "backlight":           return intValue("picture_backlight", default: -1)
@@ -2072,6 +2246,7 @@ final class AppState: ObservableObject {
         case "color_temp":          setColorTemp(value)
         case "response_time":       setResponseTime(value)
         case "dynamic_definition":  setDynamicDefinition(value)
+        case "memc":                setMemc(value)
         case "hdr_tone_mapping":    setHdrToneMapping(value)
         case "source":              setSource(value)
         case "sound_output":        setSoundOutput(value)
@@ -2208,9 +2383,11 @@ final class AppState: ObservableObject {
         case "color_space_cycle": cycleColorSpace()
         case "color_temp_cycle": cycleColorTemp()
         case "response_time_cycle": cycleResponseTime()
+        case "memc_cycle": cycleMemc()
         case "freesync_toggle": toggleFreesync()
         case "input_source_cycle": cycleSource()
         case "sound_output_cycle": cycleSoundOutput()
+        case "volume_mute_toggle": toggleMediaMuteExplicit(showHUD: true)
         default: break
         }
     }
@@ -2335,6 +2512,14 @@ final class AppState: ObservableObject {
                   valueKey: "picture_response_time",
                   nameFor: { names[$0] ?? "\($0)" }) { [weak self] v in
             self?.setResponseTime(v)
+        }
+    }
+
+    private func cycleMemc() {
+        cycleStep(actionId: "memc_cycle", label: "运动补偿", order: [0, 1, 2, 3],
+                  valueKey: MemcSupport.primarySettingKey,
+                  nameFor: { MemcSupport.levelLabel($0) }) { [weak self] v in
+            self?.setMemc(v)
         }
     }
 
@@ -2466,7 +2651,7 @@ final class AppState: ObservableObject {
     /// 最近一次真正下发到设备的音量
     private var mediaVolumeHardware: Int?
     /// 设备当前是否静音（nil = 未知）
-    private var mediaVolumeMuted: Bool?
+    @Published var mediaVolumeMuted: Bool?
     /// 连按期间出现过「静音状态下按音量键」，收尾时需要先解除静音
     private var mediaVolumeNeedsUnmute = false
     /// 待下发的收尾任务（尾部去抖）
@@ -2490,16 +2675,17 @@ final class AppState: ObservableObject {
     /// 空闲时回读一次音量/静音状态（连接后 + 每 5 秒）。
     /// 连按/待下发期间跳过，避免把预览基准带偏。
     func refreshMediaVolumeState() {
-        guard mediaVolumeKeysEnabled, isConnected else { return }
+        guard isConnected else { return }
         guard mediaVolumePreview == nil || mediaVolumePreview == mediaVolumeHardware else { return }
         runBackground {
             let volume = self.adb.mediaVolume()
             let muted = self.adb.mediaMuted()
             DispatchQueue.main.async {
-                guard self.mediaVolumeKeysEnabled, self.isConnected else { return }
+                guard self.isConnected else { return }
                 if let volume {
                     self.mediaVolumePreview = volume
                     self.mediaVolumeHardware = volume
+                    self.currentValues["volume_music_speaker"] = String(volume)
                 }
                 if let muted { self.mediaVolumeMuted = muted }
             }
@@ -2565,8 +2751,9 @@ final class AppState: ObservableObject {
         guard mediaVolumeHardware != value || unmute else { return }
         mediaVolumeNeedsUnmute = false
         mediaVolumeCommitInFlight = true
+        let showUI = showVolumeOSD
         runBackground {
-            let usedBinder = self.adb.setMediaVolume(value, unmuteFirst: unmute)
+            let usedBinder = self.adb.setMediaVolume(value, unmuteFirst: unmute, showUI: showUI)
             DispatchQueue.main.async {
                 self.mediaVolumeHardware = value
                 self.mediaVolumeCommitInFlight = false
@@ -2578,32 +2765,71 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func toggleMediaMute() {
+    /// UI 滑块 / 自定义快捷键 / 菜单栏直接设置显示器音量（0~100）。
+    func setMediaVolumeValue(_ value: Int, unmuteIfNeeded: Bool = true) {
         guard isConnected else { return log("未连接") }
-        guard shouldHandleNativeVolume() else { return }
-        if let known = mediaVolumeMuted {
-            applyMediaMute(!known)
-        } else {
-            // 状态未知（刚连接/被外部改过）：先回读再切换
-            runBackground {
-                let current = self.adb.mediaMuted() ?? false
-                DispatchQueue.main.async { self.applyMediaMute(!current) }
+        let target = clamp(value, 0, 100)
+        let shouldUnmute = unmuteIfNeeded && mediaVolumeMuted == true
+        if shouldUnmute { mediaVolumeMuted = false }
+        mediaVolumeNeedsUnmute = false
+        mediaVolumePreview = target
+        mediaVolumeHardware = target
+        currentValues["volume_music_speaker"] = String(target)
+        let showUI = showVolumeOSD
+        runBackground {
+            let usedBinder = self.adb.setMediaVolume(target, unmuteFirst: shouldUnmute, showUI: showUI)
+            DispatchQueue.main.async {
+                self.log("音量: \(target)")
+                if !usedBinder, !self.mediaVolumeFallbackLogged {
+                    self.mediaVolumeFallbackLogged = true
+                    self.log("音量控制: AudioService binder 不可用，已回退 input keyevent")
+                }
             }
         }
     }
 
-    private func applyMediaMute(_ muted: Bool) {
+    /// UI 静音按钮 / 自定义快捷键直接切换静音，不经过 Mac 音频输出门控。
+    func toggleMediaMuteExplicit(showHUD: Bool = true) {
+        guard isConnected else { return log("未连接") }
+        resolveAndToggleMediaMute(showHUD: showHUD, allowNativeOSD: false)
+    }
+
+    private func toggleMediaMute() {
+        guard isConnected else { return log("未连接") }
+        guard shouldHandleNativeVolume() else { return }
+        resolveAndToggleMediaMute(showHUD: true, allowNativeOSD: true)
+    }
+
+    private func resolveAndToggleMediaMute(showHUD: Bool, allowNativeOSD: Bool) {
+        if let known = mediaVolumeMuted {
+            applyMediaMute(!known, showHUD: showHUD, allowNativeOSD: allowNativeOSD)
+        } else {
+            // 状态未知（刚连接/被外部改过）：先回读再切换
+            runBackground {
+                let current = self.adb.mediaMuted() ?? false
+                DispatchQueue.main.async {
+                    self.applyMediaMute(!current, showHUD: showHUD, allowNativeOSD: allowNativeOSD)
+                }
+            }
+        }
+    }
+
+    private func applyMediaMute(_ muted: Bool, showHUD: Bool = true, allowNativeOSD: Bool = true) {
         mediaVolumeMuted = muted
         // 更新的静音动作覆盖掉「按键先解除静音」的意图，避免收尾提交把它又打开
         mediaVolumeNeedsUnmute = false
-        if mediaVolumeNativeOSD, NativeOSD.shared.showMute() {
-            // 原生静音 OSD
-        } else {
-            HUDWindow.shared.show(title: "静音", value: muted ? "开" : "关")
+        if showHUD {
+            if allowNativeOSD, mediaVolumeNativeOSD, NativeOSD.shared.showMute() {
+                // 原生静音 OSD
+            } else {
+                HUDWindow.shared.show(title: "静音", value: muted ? "开" : "关")
+            }
         }
+        let showUI = showVolumeOSD
         runBackground {
-            let usedBinder = self.adb.setMediaMuted(muted)
+            let usedBinder = self.adb.setMediaMuted(muted, showUI: showUI)
             DispatchQueue.main.async {
+                self.log("静音: \(muted ? "开" : "关")")
                 if !usedBinder, !self.mediaVolumeFallbackLogged {
                     self.mediaVolumeFallbackLogged = true
                     self.log("静音键: AudioService binder 不可用，已回退 input keyevent")
@@ -2774,6 +3000,10 @@ final class AppState: ObservableObject {
             }
             adjustPendingWork[param] = work
             DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+        case "volume":
+            stage("volume_music_speaker", "音量", range: 0...100, fallback: mediaVolumeHardware ?? 15) { [weak self] v in
+                self?.setMediaVolumeValue(v)
+            }
         default:
             break
         }

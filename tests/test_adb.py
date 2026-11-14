@@ -309,6 +309,123 @@ class ConnectByDeviceStateTests(unittest.TestCase):
         self.assertIn("8", command)
         self.assertNotIn("settings put", command)
 
+    def test_service_call_helpers_parse_int_and_detect_errors(self):
+        from mimonitor_toolbox import adb as adb_runtime
+
+        self.assertTrue(adb_runtime.service_call_succeeded("Result: Parcel(00000000 00000018   '........')"))
+        self.assertFalse(adb_runtime.service_call_succeeded("Parcel: Exception occurred"))
+        self.assertEqual(
+            adb_runtime.parse_service_call_int("Result: Parcel(\t00000000 00000019   '........')"),
+            25,
+        )
+        # Void binder response (only status word) must not be treated as return value 0.
+        self.assertIsNone(adb_runtime.parse_service_call_int("Result: Parcel(00000000    '....')"))
+
+    def test_media_volume_reads_binder_then_falls_back_to_settings(self):
+        from mimonitor_toolbox import adb as adb_runtime
+
+        client = adb_runtime.Adb("192.168.1.9")
+        with mock.patch.object(
+            client,
+            "shell",
+            return_value="Result: Parcel(\t00000000 0000002a   '....*...')",
+        ):
+            self.assertEqual(client.media_volume(), 42)
+
+        calls = []
+
+        def fake_fallback(cmd, check=False):
+            calls.append(cmd)
+            if cmd.startswith("service call audio 22"):
+                return "Result: Parcel(00000000    '....')"
+            return "19"
+
+        with mock.patch.object(client, "shell", side_effect=fake_fallback):
+            self.assertEqual(client.media_volume(), 19)
+        self.assertEqual(
+            calls,
+            ["service call audio 22 i32 3", "settings get system volume_music_speaker"],
+        )
+
+    def test_set_media_volume_verifies_binder_and_falls_back_to_keyevent(self):
+        from mimonitor_toolbox import adb as adb_runtime
+
+        client = adb_runtime.Adb("192.168.1.9")
+        commands = []
+
+        def fake_binder_ok(cmd, check=False):
+            commands.append(cmd)
+            if cmd.startswith("service call audio 17"):
+                return "Result: Parcel(00000000 00000000   '........')"
+            if cmd.startswith("service call audio 22"):
+                return "Result: Parcel(00000000 0000001e   '........')"
+            return "Result: Parcel(00000000    '....')"
+
+        with mock.patch.object(client, "shell", side_effect=fake_binder_ok):
+            used_binder = client.set_media_volume(30, unmute_first=False, check=True)
+            used_binder_unmute = client.set_media_volume(35, unmute_first=True, show_ui=True, check=True)
+
+        self.assertTrue(used_binder)
+        self.assertTrue(used_binder_unmute)
+        self.assertTrue(client._media_volume_binder_verified)
+        self.assertEqual(
+            commands,
+            [
+                "service call audio 12 i32 3 i32 30 i32 0 s16 com.android.shell",
+                "service call audio 22 i32 3",
+                "service call audio 10 i32 3 i32 100 i32 0 s16 com.android.shell",
+                "service call audio 12 i32 3 i32 35 i32 1 s16 com.android.shell",
+            ],
+        )
+
+        client_fb = adb_runtime.Adb("192.168.1.9")
+        fb_commands = []
+
+        def fake_binder_fail(cmd, check=False):
+            fb_commands.append(cmd)
+            if cmd.startswith("service call audio 12"):
+                return "Result: Parcel(Exception occurred)"
+            if cmd.startswith("service call audio 22"):
+                return "Result: Parcel(00000000    '....')"
+            if cmd == "settings get system volume_music_speaker":
+                return "10"
+            return ""
+
+        with mock.patch.object(client_fb, "shell", side_effect=fake_binder_fail):
+            used_binder_fb = client_fb.set_media_volume(13)
+
+        self.assertFalse(used_binder_fb)
+        self.assertFalse(client_fb._media_volume_binder_verified)
+        self.assertEqual(
+            fb_commands[-1],
+            "input keyevent KEYCODE_VOLUME_UP KEYCODE_VOLUME_UP KEYCODE_VOLUME_UP",
+        )
+
+    def test_set_media_muted_verifies_binder_and_falls_back_to_mute_key(self):
+        from mimonitor_toolbox import adb as adb_runtime
+
+        client = adb_runtime.Adb("192.168.1.9")
+
+        def fake_ok(cmd, check=False):
+            if cmd.startswith("service call audio 17"):
+                return "Result: Parcel(00000000 00000001   '........')"
+            return "Result: Parcel(00000000    '....')"
+
+        with mock.patch.object(client, "shell", side_effect=fake_ok):
+            self.assertTrue(client.set_media_muted(True))
+        self.assertTrue(client._media_volume_binder_verified)
+
+        client_fb = adb_runtime.Adb("192.168.1.9")
+        cmds = []
+
+        def fake_fail(cmd, check=False):
+            cmds.append(cmd)
+            return "Error: failed" if cmd.startswith("service call") else ""
+
+        with mock.patch.object(client_fb, "shell", side_effect=fake_fail):
+            self.assertFalse(client_fb.set_media_muted(True))
+        self.assertEqual(cmds[-1], "input keyevent KEYCODE_VOLUME_MUTE")
+
 
 if __name__ == "__main__":
     unittest.main()

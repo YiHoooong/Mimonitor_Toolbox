@@ -24,9 +24,45 @@ DXGI_ERROR_NOT_FOUND = 0x887A0002
 DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 = 12
 DISPLAY_DEVICE_ATTACHED_TO_DESKTOP = 0x00000001
 EDD_GET_DEVICE_INTERFACE_NAME = 0x00000001
+ENUM_CURRENT_SETTINGS = -1
 # 小米系显示器的 EDID PNP 厂商码（XMI3009 = 2026 款 G Pro 27U，XMI27B3 = 2025 款）。
 # 只匹配厂商码、不锁具体型号：型号串随年头变，写死会让新机型多屏时识别不到。
 HDR_TARGET_VENDOR_PREFIX = "XMI"
+
+
+class _DEVMODEW(ctypes.Structure):
+    _fields_ = [
+        ("dmDeviceName", wt.WCHAR * 32),
+        ("dmSpecVersion", wt.WORD),
+        ("dmDriverVersion", wt.WORD),
+        ("dmSize", wt.WORD),
+        ("dmDriverExtra", wt.WORD),
+        ("dmFields", wt.DWORD),
+        ("dmPositionX", wt.LONG),
+        ("dmPositionY", wt.LONG),
+        ("dmDisplayOrientation", wt.DWORD),
+        ("dmDisplayFixedOutput", wt.DWORD),
+        ("dmColor", ctypes.c_short),
+        ("dmDuplex", ctypes.c_short),
+        ("dmYResolution", ctypes.c_short),
+        ("dmTTOption", ctypes.c_short),
+        ("dmCollate", ctypes.c_short),
+        ("dmFormName", wt.WCHAR * 32),
+        ("dmLogPixels", wt.WORD),
+        ("dmBitsPerPel", wt.DWORD),
+        ("dmPelsWidth", wt.DWORD),
+        ("dmPelsHeight", wt.DWORD),
+        ("dmDisplayFlags", wt.DWORD),
+        ("dmDisplayFrequency", wt.DWORD),
+        ("dmICMMethod", wt.DWORD),
+        ("dmICMIntent", wt.DWORD),
+        ("dmMediaType", wt.DWORD),
+        ("dmDitherType", wt.DWORD),
+        ("dmReserved1", wt.DWORD),
+        ("dmReserved2", wt.DWORD),
+        ("dmPanningWidth", wt.DWORD),
+        ("dmPanningHeight", wt.DWORD),
+    ]
 
 
 class _GUID(ctypes.Structure):
@@ -326,6 +362,44 @@ def query_windows_hdr_enabled(*, target_device_name=None):
         return _select_hdr_output_state(attached_outputs, target_device_name)
     except Exception:
         return None
+
+
+def query_windows_display_refresh_rate(device_name):
+    """查询指定 GDI 显示设备的当前 Windows 输出刷新率 (Hz)，失败或不可用时返回 None。"""
+    if sys.platform != "win32" or not user32 or not device_name:
+        return None
+    try:
+        enum_settings = user32.EnumDisplaySettingsW
+        enum_settings.argtypes = [wt.LPCWSTR, wt.DWORD, ctypes.POINTER(_DEVMODEW)]
+        enum_settings.restype = wt.BOOL
+        dm = _DEVMODEW()
+        dm.dmSize = ctypes.sizeof(_DEVMODEW)
+        if not enum_settings(device_name, ENUM_CURRENT_SETTINGS & 0xFFFFFFFF, ctypes.byref(dm)):
+            return None
+        freq = int(dm.dmDisplayFrequency)
+        return freq if freq > 1 else None
+    except Exception:
+        return None
+
+
+def query_target_display_refresh_rate(*, configured_id=None, target_device_name=None):
+    """解析目标小米显示器并读取其当前 Windows 输出刷新率 (Hz)。
+
+    主机读取的刷新率仅代表 Windows 桌面输出配置，在多信号源切换或 VRR 动态刷新下
+    可能与显示器当前真实输入信号不一致，仅作辅助判断与提示使用。
+    """
+    if sys.platform != "win32" or not user32:
+        return None
+    device_name = target_device_name
+    if not device_name:
+        try:
+            target = resolve_hdr_target_display(list_windows_displays(), configured_id)
+        except Exception:
+            target = None
+        device_name = target["device_name"] if target else None
+    if not device_name:
+        return None
+    return query_windows_display_refresh_rate(device_name)
 
 
 def get_autostart_path():

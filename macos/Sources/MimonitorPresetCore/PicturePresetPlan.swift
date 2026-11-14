@@ -24,12 +24,14 @@ public enum PicturePresetPlan {
         "picture_local_dimming", "tv_picture_video_local_dimming", "picture_hdr_tone_mapping",
         "settings_display_hdr_color_tone", "picture_dynamic_definition", "picture_response_time",
         "tv_picture_advanced_video_color_space", "tv_picture_video_color_space",
+        MemcSupport.primarySettingKey,
     ]
     public static let jniKeys = [
         "g_disp__disp_back_light", "g_video__vid_gamut_mapping_mode", "g_video__clr_temp",
         "g_video__vid_local_dimming", "g_video__light_sensor_switch",
         "g_video__vid_hdr_tone_mapping_mode", "g_video__vid_od_response_time",
         "g_video__vid_insert_black", "g_video__clr_gain_r", "g_video__clr_gain_g", "g_video__clr_gain_b",
+        MemcSupport.normalJniKey, MemcSupport.gameJniKey, "g_video__picture_mode",
     ]
     public static func freesyncKey(source: String) -> String {
         ["29", "30"].contains(source.trimmingCharacters(in: .whitespacesAndNewlines))
@@ -58,6 +60,12 @@ public enum PicturePresetPlan {
         override("g_video__vid_hdr_tone_mapping_mode", ["settings_display_hdr_color_tone"], map: [5: 0, 0: 1, 2: 2, 1: 3])
         override("g_video__vid_od_response_time", ["picture_response_time"])
         override("g_video__vid_insert_black", ["picture_dynamic_definition"])
+        let memcMode = MemcSupport.parseInt(jni["g_video__picture_mode"]) ?? MemcSupport.parseInt(values["picture_mode"])
+        if MemcSupport.isGameMode(memcMode),
+           let gameMemc = MemcSupport.parseInt(settings[MemcSupport.gameSettingKey]) {
+            values[MemcSupport.primarySettingKey] = String(gameMemc)
+        }
+        override(MemcSupport.jniKey(forPictureMode: memcMode), [MemcSupport.primarySettingKey])
         override("g_video__clr_gain_r", ["picture_red_gain"])
         override("g_video__clr_gain_g", ["picture_green_gain"])
         override("g_video__clr_gain_b", ["picture_blue_gain"])
@@ -162,6 +170,15 @@ public enum PicturePresetPlan {
             }
         } else { report.skipped.append("HDR 色调映射：当前预设不是 HDR 模式") }
         jniSetting("动态清晰度", "g_video__vid_insert_black", "picture_dynamic_definition", range: 0...3)
+        if values[MemcSupport.primarySettingKey] == nil {
+            report.skipped.append("运动补偿：预设未记录此项，保持现状")
+        } else {
+            item("运动补偿") {
+                let value = try number(MemcSupport.primarySettingKey, range: 0...4)
+                let mode = try? number("picture_mode")
+                return MemcSupport.writeCommands(value: value, pictureMode: mode)
+            }
+        }
         jniSetting("灰阶响应时间", "g_video__vid_od_response_time", "picture_response_time", range: 1...3)
         jniSetting("色域", "g_video__vid_gamut_mapping_mode", "tv_picture_advanced_video_color_space",
                    alias: "tv_picture_video_color_space", range: 0...7)

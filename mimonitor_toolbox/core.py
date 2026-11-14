@@ -7,6 +7,7 @@ import shutil
 import sys
 import tempfile
 import threading
+from dataclasses import dataclass
 
 _settings_lock = threading.RLock()
 
@@ -71,6 +72,7 @@ def _load_settings_unlocked():
         "tray_items": ["picture_mode", "local_dimming", "backlight"],
         "hotkey_countdown_enabled": True,
         "hotkey_countdown_seconds": 0.8,
+        "show_volume_osd": False,
         # 预设：[{"id", "name", "values": {settings_key: value}}]
         "presets": [],
         # 自动任务：[{"id", "start": "HH:MM", "end": "HH:MM",
@@ -306,6 +308,10 @@ ADJUSTABLE_HOTKEY_PARAMS = {
         "label": "屏幕灯亮度", "setting": "atmosphere_light_illumination", "slider": "atmosphere_illumination",
         "min": 1, "max": 15, "step": 1, "ui_offset": 1, "screen_light": True,
     },
+    "volume": {
+        "label": "音量", "setting": "volume_music_speaker", "slider": "volume_music_speaker",
+        "min": 0, "max": 100, "step": 5, "default": 15, "media_volume": True,
+    },
 }
 PICTURE_MODE_GROUPS = {
     14: {14, 64, 65, 66, 67, 68},
@@ -320,12 +326,73 @@ GAME_FEATURE_KEYS = (
 )
 GAME_PICTURE_MODES = frozenset(PICTURE_MODE_GROUPS[10]) | {4, 15, 19}
 
+MEMC_SETTINGS_KEY = "tv_picture_advance_video_mjc_effect"
+MEMC_GAME_SETTINGS_KEY = "tv_picture_game_mode_with_memc_switch"
+MEMC_GAME_PREF_KEY = "tv_picture_advanced_settings_game_mode_with_memc"
+MEMC_SAVE_KEY = "com.xiaomi.mitv.settings.SAVE_MEMC_VALUE"
+MEMC_JNI_KEY = "g_video__vid_mjc_effect"
+MEMC_GAME_JNI_KEY = "g_video__vid_game_mode_with_memc_switch"
+MEMC_OPTIONS = [(0, "关"), (1, "低"), (2, "中"), (3, "高")]
+MEMC_NAMES = {0: "关", 1: "低", 2: "中", 3: "高", 4: "自定义"}
+# SystemControlManager.setMemcValue/getMemcValue 使用 MTK 场景枚举（10/13/16 + 64..68 等游戏子场景）
+MEMC_GAME_PICTURE_MODES = frozenset(PICTURE_MODE_GROUPS[10]) | {4, 13, 15, 16, 19, 64, 65, 66, 67, 68}
+# 标准模式 / PC 色域预设（MTK 14, 18, 30..34, 69..73 及 Xiaomi 2, 22, 34..43）在 OSD 禁用 MEMC
+MEMC_DISALLOWED_PICTURE_MODES = frozenset({2, 14, 18, 22, *range(30, 44), *range(69, 74)})
+MEMC_CONDITION_JNI_KEYS = (
+    "g_video__picture_mode",
+    "g_video__freesync_switch",
+    "g_video__dp_adaptive_sync",
+    "g_fusion_picture__hdmi_edid_version",
+    "g_fusion_picture__dp_edid_version",
+    "g_video__dlg_vrr_switch",
+    "g_video__vid_content_adaptive",
+)
+
 
 def is_game_picture_mode(value):
     try:
         return int(value) in GAME_PICTURE_MODES
     except (TypeError, ValueError):
         return False
+
+
+def is_memc_game_picture_mode(value):
+    try:
+        return int(value) in MEMC_GAME_PICTURE_MODES
+    except (TypeError, ValueError):
+        return False
+
+
+def is_memc_supported_picture_mode(value):
+    try:
+        return int(value) not in MEMC_DISALLOWED_PICTURE_MODES
+    except (TypeError, ValueError):
+        return False
+
+
+def memc_jni_key_for_mode(mode):
+    return MEMC_GAME_JNI_KEY if is_memc_game_picture_mode(mode) else MEMC_JNI_KEY
+
+
+def format_memc_label(value):
+    try:
+        return MEMC_NAMES.get(int(value), str(value))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def write_memc_value(adb, mode, value):
+    """按当前画面模式（普通 vs 游戏）写入 MEMC 寄存器、Settings 与保存标记并刷新 PQ。"""
+    val_str = str(value)
+    if is_memc_game_picture_mode(mode):
+        adb.jni_set(MEMC_GAME_JNI_KEY, value, check=True)
+        adb.put(MEMC_GAME_SETTINGS_KEY, val_str, check=True)
+        adb.put(MEMC_GAME_PREF_KEY, val_str, check=True)
+    else:
+        adb.jni_set(MEMC_JNI_KEY, value, check=True)
+        adb.put(MEMC_SETTINGS_KEY, val_str, check=True)
+    adb.put(MEMC_SAVE_KEY, val_str, check=True)
+    adb.refresh_pq(check=True)
 
 
 PICTURE_SCENE_NAMES = {
@@ -382,6 +449,231 @@ def is_hdr_tone_mapping_picture_mode(mode):
         return int(mode) in HDR_TONE_MAPPING_PICTURE_MODES
     except Exception:
         return False
+
+
+def memc_mode_display_name(mode):
+    """返回 MEMC 条件提示中使用的画面模式名称。"""
+    try:
+        mode_int = int(mode)
+    except (TypeError, ValueError):
+        return "未知模式"
+    special = {
+        2: "标准模式",
+        5: "Dolby Vision IQ",
+        9: "电影模式",
+        10: "游戏模式",
+        14: "标准模式",
+        18: "HDR 标准",
+        22: "HDR 显示器",
+    }
+    if mode_int in special:
+        return special[mode_int]
+    if 64 <= mode_int <= 68:
+        return f"游戏模式（{mode_int}）"
+    if 69 <= mode_int <= 73:
+        return f"SDR PC 模式（{mode_int}）"
+    if 30 <= mode_int <= 34:
+        return f"HDR PC 模式（{mode_int}）"
+    return PICTURE_SCENE_NAMES.get(mode_int, f"模式 {mode_int}")
+
+
+@dataclass(frozen=True)
+class MemcConditionItem:
+    key: str
+    status: str  # "ok" | "fail" | "info"
+    title: str
+    detail: str
+
+
+@dataclass(frozen=True)
+class MemcConditionReport:
+    mode: object
+    mode_name: str
+    mode_supported: bool
+    case: str  # "A" | "B" | "C"
+    items: tuple
+    blocking_reasons: tuple
+
+
+def _pick_cond_int(jni_vals, settings_vals, jni_key, setting_key):
+    for mapping, key in ((jni_vals, jni_key), (settings_vals, setting_key)):
+        if not key or not mapping or key not in mapping:
+            continue
+        raw = mapping[key]
+        if raw in (None, "", "null", "N/A"):
+            continue
+        try:
+            return int(str(raw).strip())
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def evaluate_memc_conditions(settings_vals, jni_vals=None, host_refresh_hz=None):
+    """评估开启运动补偿（MEMC）的运行时条件，返回 Case A / B / C 判定与清单。"""
+    settings_vals = settings_vals or {}
+    jni_vals = jni_vals or {}
+
+    mode = _pick_cond_int(jni_vals, settings_vals, "g_video__picture_mode", "picture_mode")
+    if mode is None:
+        mode = _pick_cond_int(jni_vals, settings_vals, None, "picture_preset_scenario")
+    mode_name = memc_mode_display_name(mode)
+    mode_supported = mode is not None and is_memc_supported_picture_mode(mode)
+
+    source_raw = settings_vals.get("mitv.tvplayer.hdmi.last.source", "")
+    is_dp = str(source_raw).strip() in ("29", "30")
+
+    # 切勿在 HDMI 源下读取未激活的 dp_adaptive_sync
+    if is_dp:
+        dp_fs = _pick_cond_int(jni_vals, settings_vals, "g_video__dp_adaptive_sync", None)
+        freesync_on = (
+            dp_fs == 1
+            if dp_fs is not None
+            else (_pick_cond_int(jni_vals, settings_vals, None, "freesync") == 1)
+        )
+        dp_edid = _pick_cond_int(jni_vals, settings_vals, "g_fusion_picture__dp_edid_version", None)
+        edid_320_on = (
+            dp_edid == 3
+            if dp_edid is not None
+            else (_pick_cond_int(jni_vals, settings_vals, None, "mode_320") == 1)
+        )
+    else:
+        hdmi_fs = _pick_cond_int(jni_vals, settings_vals, "g_video__freesync_switch", None)
+        hdmi_edid = _pick_cond_int(jni_vals, settings_vals, "g_fusion_picture__hdmi_edid_version", None)
+        fs_flag = (
+            hdmi_fs == 3
+            if hdmi_fs is not None
+            else (_pick_cond_int(jni_vals, settings_vals, None, "freesync") == 1)
+        )
+        freesync_on = fs_flag or (hdmi_edid in (3, 5))
+        edid_320_on = (
+            hdmi_edid in (5, 6)
+            if hdmi_edid is not None
+            else (_pick_cond_int(jni_vals, settings_vals, None, "mode_320") == 1)
+        )
+
+    dlg_on = _pick_cond_int(jni_vals, settings_vals, "g_video__dlg_vrr_switch", None) == 1
+
+    items = [
+        MemcConditionItem(
+            key="picture_mode",
+            status="ok" if mode_supported else "fail",
+            title="画面模式支持",
+            detail=(
+                f"当前为「{mode_name}」"
+                if mode_supported
+                else f"当前为「{mode_name}」（需电影 / 游戏等非标准模式）"
+            ),
+        ),
+        MemcConditionItem(
+            key="freesync",
+            status="fail" if freesync_on else "ok",
+            title="FreeSync 已关闭",
+            detail="FreeSync 已开启，需关闭" if freesync_on else "已关闭",
+        ),
+    ]
+
+    if edid_320_on and dlg_on:
+        hr_detail = "320Hz 模式与 DLG 高帧率已开启，需关闭"
+    elif edid_320_on:
+        hr_detail = "320Hz 模式已开启，需关闭"
+    elif dlg_on:
+        hr_detail = "DLG 高帧率已开启，需关闭"
+    else:
+        hr_detail = "已关闭"
+    items.append(
+        MemcConditionItem(
+            key="high_refresh",
+            status="fail" if (edid_320_on or dlg_on) else "ok",
+            title="320Hz / DLG 模式已关闭",
+            detail=hr_detail,
+        )
+    )
+    try:
+        refresh_hz = int(host_refresh_hz) if host_refresh_hz is not None else None
+    except (TypeError, ValueError):
+        refresh_hz = None
+    if refresh_hz is not None and refresh_hz <= 0:
+        refresh_hz = None
+
+    if refresh_hz is not None:
+        if refresh_hz > 120:
+            rr_status = "fail"
+            rr_detail = (
+                f"Windows 读取当前约 {refresh_hz}Hz（> 120Hz；获取值仅供参考，多信号源或 VRR 下可能不准，请调至 ≤ 120Hz）"
+            )
+        else:
+            rr_status = "ok"
+            rr_detail = (
+                f"Windows 读取当前约 {refresh_hz}Hz（获取值仅供参考，多信号源或 VRR 下实际以显示器信号为准）"
+            )
+    else:
+        rr_status = "info"
+        rr_detail = "未能读取当前显示器刷新率，请确认输入信号为 120Hz 及以下"
+
+    items.append(
+        MemcConditionItem(
+            key="refresh_rate",
+            status=rr_status,
+            title="输入信号刷新率 ≤ 120Hz",
+            detail=rr_detail,
+        )
+    )
+    if mode == 5:
+        ca_on = (
+            _pick_cond_int(
+                jni_vals, settings_vals, "g_video__vid_content_adaptive", "picture_content_adaptive"
+            )
+            == 1
+        )
+        items.append(
+            MemcConditionItem(
+                key="content_adaptive",
+                status="fail" if ca_on else "ok",
+                title="内容自适应已关闭",
+                detail="内容自适应已开启，需关闭" if ca_on else "已关闭",
+            )
+        )
+
+    blocking = tuple(item.detail for item in items if item.key != "picture_mode" and item.status == "fail")
+    if not mode_supported:
+        case = "A"
+    elif blocking:
+        case = "B"
+    else:
+        case = "C"
+
+    return MemcConditionReport(
+        mode=mode,
+        mode_name=mode_name,
+        mode_supported=mode_supported,
+        case=case,
+        items=tuple(items),
+        blocking_reasons=blocking,
+    )
+
+
+def format_memc_condition_dialog(report, target_value):
+    """生成 MEMC 条件检测弹窗的 (title, body_text)。"""
+    symbols = {"ok": "✓", "fail": "✗", "info": "ℹ"}
+    checklist = "\n".join(
+        f"{symbols.get(item.status, '•')} {item.title}：{item.detail}"
+        for item in report.items
+    )
+    if report.case == "A":
+        title = "当前画面模式不支持开启运动补偿"
+        intro = (
+            f"当前处于「{report.mode_name}」，系统在该模式下禁用运动补偿（MEMC）。"
+            "请先切换至「电影模式」或「游戏模式」后再开启。"
+        )
+    else:
+        memc_label = format_memc_label(target_value)
+        title = f"已保存「{memc_label}」档位，部分条件未满足"
+        intro = (
+            "运动补偿档位已保存，但以下条件未满足，当前暂不生效；"
+            "关闭冲突项并确保输入信号 ≤ 120Hz 后将自动生效："
+        )
+    return title, f"{intro}\n\n{checklist}"
 
 def get_guardian_apk_path():
     return bundled_resource_path("assets", "adb_guardian", GUARDIAN_APK_NAME) or os.path.join(get_app_base_dir(), "assets", "adb_guardian", GUARDIAN_APK_NAME)

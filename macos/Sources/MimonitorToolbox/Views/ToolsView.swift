@@ -110,6 +110,11 @@ struct ToolsView: View {
                          : "已关闭：每次按键立即下发。连按会把 ADB 命令堆起来，可能变慢。")
                         .font(.caption)
                         .foregroundColor(.secondary)
+
+                    Divider()
+
+                    Toggle("调节显示器音量时显示音量条", isOn: $state.showVolumeOSD)
+                        .toggleStyle(.checkbox)
                 }
 
                 // 4K UI

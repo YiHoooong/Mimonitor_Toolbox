@@ -47,6 +47,7 @@ enum MenuBarCatalog {
         MenuBarEntry(id: "dynamic_definition", label: "动态清晰度", kind: .options(
             [0, 1, 2, 3].map { Option(label: RegisterMap.dynamicDefinitionNames[$0] ?? "\($0)", value: $0) }
         )),
+        MenuBarEntry(id: "memc", label: "运动补偿", kind: .options(OptionLists.memc)),
         MenuBarEntry(id: "hdr_tone_mapping", label: "HDR 色调映射", kind: .options(
             [0, 1, 2, 3].map { Option(label: RegisterMap.hdrToneNames[$0] ?? "\($0)", value: $0) }
         )),
@@ -57,6 +58,7 @@ enum MenuBarCatalog {
             Option(label: "USB-C", value: 30),
         ])),
         MenuBarEntry(id: "sound_output", label: "声音输出", kind: .options(OptionLists.soundOutput)),
+        MenuBarEntry(id: "volume", label: "音量", kind: .stepper(min: 0, max: 100, step: 5)),
         MenuBarEntry(id: "freesync", label: "FreeSync", kind: .options([
             Option(label: "关", value: 0),
             Option(label: "开", value: 1),

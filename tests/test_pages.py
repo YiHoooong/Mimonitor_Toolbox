@@ -519,7 +519,32 @@ class TrayMenuTests(TrayTestBase):
         self.assertIn((14, "标准"), catalog["picture_mode"]["options"])
         self.assertEqual(catalog["backlight"]["kind"], "stepper")
         self.assertEqual(catalog["backlight"]["max"], 100)
+        self.assertEqual(catalog["volume"]["kind"], "stepper")
+        self.assertEqual(catalog["volume"]["min"], 0)
+        self.assertEqual(catalog["volume"]["max"], 100)
+        self.assertEqual(catalog["volume"]["step"], 5)
+        self.assertEqual(catalog["memc"]["kind"], "options")
+        self.assertEqual(catalog["memc"]["label"], "运动补偿")
+        self.assertEqual(catalog["memc"]["options"], [(0, "关"), (1, "低"), (2, "中"), (3, "高")])
         self._close(window)
+
+    def test_source_page_has_volume_slider_and_mute_button_synced_with_connection(self):
+        window = self._app()
+        try:
+            self.assertIn("volume_music_speaker", window.sliders)
+            volume_slider, _ = window.sliders["volume_music_speaker"]
+            mute_btn = window.sound_mute_btn
+
+            self.assertFalse(volume_slider.isEnabled())
+            self.assertFalse(mute_btn.isEnabled())
+
+            window.adb_connected = True
+            window._sync_source_page_connection_state()
+            self.assertTrue(volume_slider.isEnabled())
+            self.assertTrue(mute_btn.isEnabled())
+            self.assertEqual(window.chk_show_volume_osd.text(), "调节显示器音量时显示音量条")
+        finally:
+            self._close(window)
 
     def test_entry_value_reads_current_values(self):
         window = self._app()
@@ -1492,6 +1517,38 @@ class PresetAndTaskPageTests(TrayTestBase):
                 self.assertNotIn("已应用", self._texts(card)[1:],
                                  "除了应用按钮，卡片上不该再出现「已应用」字样")
 
+
+class MemcPageIntegrationTests(TrayTestBase):
+    def test_picture_page_and_hotkey_page_include_memc(self):
+        from mimonitor_toolbox.core import MEMC_SETTINGS_KEY
+
+        window = self._app()
+        try:
+            self.assertIn(MEMC_SETTINGS_KEY, window.state_buttons)
+            self.assertEqual(sorted(window.state_buttons[MEMC_SETTINGS_KEY].keys()), [0, 1, 2, 3])
+            self.assertIn("memc_cycle", window.hotkey_combos)
+            picture_texts = " ".join(
+                lbl.text() for lbl in window.picture_page.findChildren(QWidget)
+                if callable(getattr(lbl, "text", None))
+            )
+            self.assertIn("仅支持电影/游戏等非标准模式", picture_texts)
+
+            # 运动补偿卡片应位于画面设置页面最底部（在「色域」之后）
+            container_layout = window.picture_page.widget().layout()
+            section_titles = []
+            for idx in range(container_layout.count()):
+                widget = container_layout.itemAt(idx).widget()
+                if widget is None:
+                    continue
+                labels = [
+                    child.text() for child in widget.findChildren(QWidget)
+                    if callable(getattr(child, "text", None)) and child.text() in ("色域", "运动补偿")
+                ]
+                if labels:
+                    section_titles.append(labels[0])
+            self.assertEqual(section_titles, ["色域", "运动补偿"])
+        finally:
+            self._close(window)
 
 
 if __name__ == "__main__":

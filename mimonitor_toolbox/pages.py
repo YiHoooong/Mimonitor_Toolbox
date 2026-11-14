@@ -54,6 +54,8 @@ from .core import (
     ADJUSTABLE_HOTKEY_PARAMS,
     HOTKEY_KEYS,
     HOTKEY_MODIFIERS,
+    MEMC_OPTIONS,
+    MEMC_SETTINGS_KEY,
     SOUND_OUTPUT_OPTIONS,
     SOUND_OUTPUT_SETTINGS_KEY,
     bundled_resource_path,
@@ -389,6 +391,17 @@ class PagesMixin:
             ("BT709", 7, lambda _: self._jni("g_video__vid_gamut_mapping_mode", 7, "tv_picture_advanced_video_color_space", "色域: BT709", "tv_picture_video_color_space")),
         ], state_key="tv_picture_advanced_video_color_space")
 
+        self._btn_section(
+            layout,
+            "运动补偿",
+            [
+                (label, val, lambda _, v=val, n=label: self._set_memc(v, n))
+                for val, label in MEMC_OPTIONS
+            ],
+            state_key=MEMC_SETTINGS_KEY,
+            hint="仅支持电影/游戏等非标准模式；需关闭 FreeSync、320Hz/DLG 且输入信号 ≤ 120Hz 时生效",
+        )
+
         scroll.setWidget(container)
         return scroll
 
@@ -588,6 +601,43 @@ class PagesMixin:
 
         layout.addWidget(sound_status_card)
 
+        # Monitor Volume Card
+        volume_card = SimpleCardWidget(container)
+        volume_layout = QHBoxLayout(volume_card)
+        volume_layout.setContentsMargins(20, 14, 20, 14)
+        volume_layout.setSpacing(12)
+
+        volume_title = BodyLabel("显示器音量", volume_card)
+        volume_title.setFixedWidth(100)
+        volume_layout.addWidget(volume_title)
+
+        volume_slider = PageScrollSlider(Qt.Orientation.Horizontal, volume_card)
+        volume_slider.setRange(0, 100)
+        volume_slider.setValue(15)
+        volume_layout.addWidget(volume_slider)
+
+        volume_val_label = BodyLabel("15", volume_card)
+        volume_val_label.setFixedWidth(40)
+        volume_val_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        volume_layout.addWidget(volume_val_label)
+
+        self.sound_mute_btn = ToggleButton("静音", volume_card)
+        self.sound_mute_btn.setCheckable(True)
+        self.sound_mute_btn.setFixedSize(84, 34)
+        self.sound_mute_btn.clicked.connect(self._on_sound_mute_clicked)
+        volume_layout.addWidget(self.sound_mute_btn)
+
+        volume_slider.valueChanged.connect(lambda v: volume_val_label.setText(str(v)))
+        self.sliders["volume_music_speaker"] = (volume_slider, volume_val_label)
+
+        volume_debounce = QTimer(volume_card)
+        volume_debounce.setSingleShot(True)
+        volume_debounce.setInterval(300)
+        volume_debounce.timeout.connect(lambda: self.set_media_volume(volume_slider.value()))
+        volume_slider.valueChanged.connect(lambda _v: volume_debounce.start())
+
+        layout.addWidget(volume_card)
+
         sync_conn = getattr(self, "_sync_source_page_connection_state", None)
         if callable(sync_conn):
             sync_conn()
@@ -606,6 +656,12 @@ class PagesMixin:
         if not getattr(self, "adb_connected", False) and hasattr(self, "_optimistic_highlight"):
             current = getattr(self, "current_vals", {}).get(SOUND_OUTPUT_SETTINGS_KEY)
             self._optimistic_highlight(SOUND_OUTPUT_SETTINGS_KEY, current)
+
+    def _on_sound_mute_clicked(self, checked=False):
+        self.toggle_media_mute(muted=bool(checked))
+        if not getattr(self, "adb_connected", False) and hasattr(self, "_highlight_btn"):
+            current = bool(getattr(self, "current_vals", {}).get("media_muted", 0))
+            self._highlight_btn(self.sound_mute_btn, current)
 
     def _make_light_page(self):
         scroll = ScrollArea(self)
@@ -1592,6 +1648,14 @@ class PagesMixin:
         c3_lay.addWidget(self.crosshair_mode_status_label)
         self._update_crosshair_mode_status_label()
 
+        volume_osd_layout = QHBoxLayout()
+        volume_osd_layout.setSpacing(15)
+        self.chk_show_volume_osd = CheckBox("调节显示器音量时显示音量条", card3)
+        self.chk_show_volume_osd.setChecked(bool(settings.get("show_volume_osd", False)))
+        self.chk_show_volume_osd.stateChanged.connect(self._toggle_show_volume_osd)
+        volume_osd_layout.addWidget(self.chk_show_volume_osd)
+        volume_osd_layout.addStretch()
+        c3_lay.addLayout(volume_osd_layout)
 
         grid.addWidget(card3, 2, 0, 1, 2)
 
@@ -1674,9 +1738,11 @@ class PagesMixin:
             ("color_space_cycle", "色域 循环切换"),
             ("color_temp_cycle", "色温 循环切换"),
             ("response_time_cycle", "响应时间 循环切换"),
+            ("memc_cycle", "运动补偿 循环切换"),
             ("freesync_toggle", "FreeSync 开关切换"),
             ("input_source_cycle", "信号源 循环切换"),
             ("sound_output_cycle", "声音输出 循环切换"),
+            ("volume_mute_toggle", "静音 开关切换"),
         ]
         
         def add_hotkey_row(row_layout_parent, label_text, action_name):
@@ -2191,10 +2257,21 @@ class PagesMixin:
         slider.valueChanged.connect(lambda v: _debounce_timer.start())
         parent_layout.addWidget(card)
 
-    def _btn_section(self, parent_layout, title, buttons, state_key=None):
+    def _btn_section(self, parent_layout, title, buttons, state_key=None, hint=None):
         card = SimpleCardWidget(self)
-        layout = QHBoxLayout(card)
-        layout.setContentsMargins(15, 10, 15, 10)
+        if hint:
+            outer = QVBoxLayout(card)
+            outer.setContentsMargins(15, 10, 15, 10)
+            outer.setSpacing(6)
+            layout = QHBoxLayout()
+            layout.setContentsMargins(0, 0, 0, 0)
+            outer.addLayout(layout)
+            hint_lbl = CaptionLabel(hint, card)
+            hint_lbl.setWordWrap(True)
+            outer.addWidget(hint_lbl)
+        else:
+            layout = QHBoxLayout(card)
+            layout.setContentsMargins(15, 10, 15, 10)
         
         title_label = BodyLabel(title, card)
         title_label.setFixedWidth(180)

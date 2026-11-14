@@ -219,8 +219,8 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
         candidates = {
             "picture_mode": "VIEW", "local_dimming": "BRIGHTNESS",
             "color_space": "PALETTE", "color_temp": "CONSTRACT",
-            "response_time": "SPEED_HIGH", "freesync": "SYNC",
-            "input_source": "LINK", "sound_output": "VOLUME", "backlight": "BRIGHTNESS",
+            "response_time": "SPEED_HIGH", "memc": "SPEED_HIGH", "freesync": "SYNC",
+            "input_source": "LINK", "sound_output": "VOLUME", "volume": "VOLUME", "backlight": "BRIGHTNESS",
             "black_level": "PHOTO", "contrast": "CONSTRACT",
             "saturation": "PALETTE", "hue": "PALETTE",
             "sharpness": "ZOOM", "red_gain": "PALETTE",
@@ -779,6 +779,12 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
         for key in ("mitv.tvplayer.hdmi.last.source", SOUND_OUTPUT_SETTINGS_KEY):
             for btn in state_buttons.get(key, {}).values():
                 btn.setEnabled(connected)
+        volume_entry = getattr(self, "sliders", {}).get("volume_music_speaker")
+        if volume_entry is not None:
+            volume_entry[0].setEnabled(connected)
+        mute_btn = getattr(self, "sound_mute_btn", None)
+        if mute_btn is not None:
+            mute_btn.setEnabled(connected)
 
     def _on_status(self, text):
         text = normalize_status_text(text)
