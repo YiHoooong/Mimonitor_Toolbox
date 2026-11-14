@@ -1803,5 +1803,22 @@ class MemcJniOverrideTests(unittest.TestCase):
         self.assertIn(MEMC_GAME_JNI_KEY, pic["jni"])
 
 
+class HdmiGameModeReadbackTests(unittest.TestCase):
+    """HDMI 下游戏页回读需按 hdmi_edid 识别 5/6 与真实 FreeSync 状态。"""
+
+    def test_parse_hdmi_edid_flags_all_combinations(self):
+        from mimonitor_toolbox import core
+
+        self.assertEqual(core.parse_hdmi_edid_flags(1, 0), (0, 0))
+        self.assertEqual(core.parse_hdmi_edid_flags(3, 3), (0, 1))
+        self.assertEqual(core.parse_hdmi_edid_flags(5, 3), (1, 1))
+        self.assertEqual(core.parse_hdmi_edid_flags(6, 0), (1, 0))
+        # OSD 单关 FS 留下 switch=2，或旧逻辑留下 switch=3，均以 edid=6 为准判定 FS 关
+        self.assertEqual(core.parse_hdmi_edid_flags(6, 2), (1, 0))
+        self.assertEqual(core.parse_hdmi_edid_flags(6, 3), (1, 0))
+        # 未知/缺失 EDID 时回退 freesync_switch
+        self.assertEqual(core.parse_hdmi_edid_flags(None, 3), (0, 1))
+
+
 if __name__ == "__main__":
     unittest.main()

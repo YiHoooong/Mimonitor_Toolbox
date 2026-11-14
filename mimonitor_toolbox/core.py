@@ -698,6 +698,57 @@ def strip_guardian_package_from_accessibility(services, package):
     return ":".join(kept), True
 
 
+HDMI_EDID_STATE_MATRIX = {
+    (False, False): 1,
+    (False, True): 3,
+    (True, False): 6,
+    (True, True): 5,
+}
+HDMI_EDID_KNOWN_VALUES = frozenset({1, 3, 5, 6})
+
+
+def hdmi_edid_for(mode_320, freesync):
+    """返回 HDMI 输入源下 (320Hz, FreeSync) 组合对应的 EDID 枚举值。"""
+    return HDMI_EDID_STATE_MATRIX[(bool(mode_320), bool(freesync))]
+
+
+def parse_hdmi_edid_int(raw):
+    """将 JNI 返回的整型文本解析为 int，失败返回 None。"""
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_hdmi_edid_flags(hdmi_edid, freesync_switch=None):
+    """结合 HDMI EDID 版本与 freesync_switch 解析 (mode_320, freesync) 状态。"""
+    edid = parse_hdmi_edid_int(hdmi_edid)
+    fs = parse_hdmi_edid_int(freesync_switch)
+    mode_320 = 1 if edid in (5, 6) else 0
+    if edid in HDMI_EDID_KNOWN_VALUES:
+        freesync = 1 if edid in (3, 5) else 0
+    else:
+        freesync = 1 if fs == 3 else 0
+    return mode_320, freesync
+
+
+def read_hdmi_edid_and_freesync(adb, check=True):
+    """尽量通过 adb 现读 HDMI EDID 与 freesync_switch，兼容简化的测试替身。"""
+    keys = ["g_fusion_picture__hdmi_edid_version", "g_video__freesync_switch"]
+    if hasattr(adb, "jni_batch_get_or_single"):
+        vals = adb.jni_batch_get_or_single(keys, check=check) or {}
+        return (
+            vals.get("g_fusion_picture__hdmi_edid_version"),
+            vals.get("g_video__freesync_switch"),
+        )
+    if hasattr(adb, "jni_get"):
+        return (
+            adb.jni_get("g_fusion_picture__hdmi_edid_version", check=check),
+            adb.jni_get("g_video__freesync_switch", check=check),
+        )
+    return None, None
+
+
 def get_mtk_direct_tool_path():
     return bundled_resource_path("assets", "runtime", MTK_DIRECT_TOOL_NAME)
 

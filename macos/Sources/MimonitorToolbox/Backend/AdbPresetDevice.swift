@@ -28,6 +28,9 @@ final class AdbPresetDevice: PresetDevice {
             }
             let source = try source()
             let fsKey = PicturePresetPlan.freesyncKey(source: source)
+            let extraKeys = fsKey == "g_video__freesync_switch"
+                ? [fsKey, "g_fusion_picture__hdmi_edid_version"]
+                : [fsKey]
             let keys = PicturePresetPlan.jniKeys.filter { key in
                 if key == "g_video__vid_hdr_tone_mapping_mode" {
                     return RegisterMap.isHdrToneMappingPictureMode(settings["picture_mode"])
@@ -37,7 +40,7 @@ final class AdbPresetDevice: PresetDevice {
                 }
                 return true
             }
-            var jni = try adb.jniBatchGetChecked(keys: keys + [fsKey], target: target)
+            var jni = try adb.jniBatchGetChecked(keys: keys + extraKeys, target: target)
             // Settings can lag behind the OSD. If JNI reveals custom temperature, read real gains.
             if jni["g_video__clr_temp"] == "0", !keys.contains("g_video__clr_gain_r") {
                 let gains = try adb.jniBatchGetChecked(keys: ["g_video__clr_gain_r", "g_video__clr_gain_g", "g_video__clr_gain_b"], target: target)
@@ -71,7 +74,15 @@ final class AdbPresetDevice: PresetDevice {
     func apply(_ values: [String: String]) throws -> PresetApplyReport {
         try adb.transaction {
             let source = try source()
-            var report = PicturePresetPlan.apply(values, source: source) { command in
+            var hdmi320: Bool? = nil
+            if PicturePresetPlan.freesyncKey(source: source) == "g_video__freesync_switch",
+               values["freesync"] != nil {
+                let edidMap = try adb.jniBatchGetChecked(keys: ["g_fusion_picture__hdmi_edid_version"], target: target)
+                if let edidRaw = edidMap["g_fusion_picture__hdmi_edid_version"] {
+                    hdmi320 = PicturePresetPlan.parseHdmiEdidFlags(edidRaw: edidRaw, freesyncRaw: nil).mode320
+                }
+            }
+            var report = PicturePresetPlan.apply(values, source: source, hdmi320: hdmi320) { command in
                 let shell: String
                 let jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
                 switch command {

@@ -766,8 +766,12 @@ final class AppState: ObservableObject {
         } else {
             let m = adb.jniBatchGet(keys: ["g_fusion_picture__hdmi_edid_version",
                                            "g_video__freesync_switch"])
-            values["mode_320"] = (Int(m["g_fusion_picture__hdmi_edid_version"] ?? "") == 6) ? "1" : "0"
-            values["freesync"] = (Int(m["g_video__freesync_switch"] ?? "") == 3) ? "1" : "0"
+            let flags = PicturePresetPlan.parseHdmiEdidFlags(
+                edidRaw: m["g_fusion_picture__hdmi_edid_version"],
+                freesyncRaw: m["g_video__freesync_switch"]
+            )
+            values["mode_320"] = flags.mode320 ? "1" : "0"
+            values["freesync"] = flags.freesync ? "1" : "0"
         }
     }
 
@@ -1314,7 +1318,22 @@ final class AppState: ObservableObject {
             if src == "29" || src == "30" {
                 self.adb.jniSet(key: "g_fusion_picture__dp_edid_version", value: on ? "3" : "2")
             } else {
-                self.adb.jniSet(key: "g_fusion_picture__hdmi_edid_version", value: on ? "6" : "1")
+                let m = self.adb.jniBatchGet(keys: ["g_fusion_picture__hdmi_edid_version",
+                                                    "g_video__freesync_switch"])
+                let flags = PicturePresetPlan.parseHdmiEdidFlags(
+                    edidRaw: m["g_fusion_picture__hdmi_edid_version"],
+                    freesyncRaw: m["g_video__freesync_switch"]
+                )
+                let desiredFsSwitch = flags.freesync ? "3" : "0"
+                let currentFsSwitch = (m["g_video__freesync_switch"] ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if currentFsSwitch != desiredFsSwitch {
+                    self.adb.jniSet(key: "g_video__freesync_switch", value: desiredFsSwitch)
+                }
+                self.adb.jniSet(
+                    key: "g_fusion_picture__hdmi_edid_version",
+                    value: String(PicturePresetPlan.hdmiEdidVersion(mode320: on, freesync: flags.freesync))
+                )
             }
             self.adb.refreshPq()
             self.refreshAfterEdidChange()
@@ -1331,9 +1350,18 @@ final class AppState: ObservableObject {
             let src = self.adb.settingsGet("mitv.tvplayer.hdmi.last.source")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let isDP = (src == "29" || src == "30")
-            let key = isDP ? "g_video__dp_adaptive_sync" : "g_video__freesync_switch"
-            let raw = Int(self.adb.jniBatchGet(keys: [key])[key] ?? "") ?? -1
-            let isOn = isDP ? (raw == 1) : (raw == 3)
+            let isOn: Bool
+            if isDP {
+                let raw = Int(self.adb.jniBatchGet(keys: ["g_video__dp_adaptive_sync"])["g_video__dp_adaptive_sync"] ?? "") ?? -1
+                isOn = (raw == 1)
+            } else {
+                let m = self.adb.jniBatchGet(keys: ["g_fusion_picture__hdmi_edid_version",
+                                                    "g_video__freesync_switch"])
+                isOn = PicturePresetPlan.parseHdmiEdidFlags(
+                    edidRaw: m["g_fusion_picture__hdmi_edid_version"],
+                    freesyncRaw: m["g_video__freesync_switch"]
+                ).freesync
+            }
             DispatchQueue.main.async { self.setFreesync(!isOn) }
         }
     }
@@ -1356,8 +1384,20 @@ final class AppState: ObservableObject {
             let isDP = (src == "29" || src == "30")
             let key = isDP ? "g_video__dp_adaptive_sync" : "g_video__freesync_switch"
             let onRaw = isDP ? "1" : "3"
-            let before = Int(self.adb.jniBatchGet(keys: [key])[key] ?? "") ?? -1
-            let wasOn = isDP ? (before == 1) : (before == 3)
+            let wasOn: Bool
+            var hdmiMode320 = false
+            if isDP {
+                let before = Int(self.adb.jniBatchGet(keys: [key])[key] ?? "") ?? -1
+                wasOn = (before == 1)
+            } else {
+                let m = self.adb.jniBatchGet(keys: ["g_fusion_picture__hdmi_edid_version", key])
+                let flags = PicturePresetPlan.parseHdmiEdidFlags(
+                    edidRaw: m["g_fusion_picture__hdmi_edid_version"],
+                    freesyncRaw: m[key]
+                )
+                wasOn = flags.freesync
+                hdmiMode320 = flags.mode320
+            }
 
             var restoreMode: Int? = nil
             if useMemory {
@@ -1386,6 +1426,12 @@ final class AppState: ObservableObject {
             }
 
             self.adb.jniSet(key: key, value: on ? onRaw : "0")
+            if !isDP {
+                self.adb.jniSet(
+                    key: "g_fusion_picture__hdmi_edid_version",
+                    value: String(PicturePresetPlan.hdmiEdidVersion(mode320: hdmiMode320, freesync: on))
+                )
+            }
             // 关闭时先切回原先的画面模式，再 refresh_pq（顺序与原版一致）
             if !on, let restoreMode {
                 self.adb.settingsPut("picture_mode", String(restoreMode))

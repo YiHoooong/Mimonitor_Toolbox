@@ -37,6 +37,7 @@ from .core import (
     GUARDIAN_MAIN_ACTIVITY,
     GUARDIAN_PACKAGE,
     HDR_TONE_MAPPING_MTK_TO_UI,
+    HDMI_EDID_KNOWN_VALUES,
     MEMC_GAME_JNI_KEY,
     MEMC_JNI_KEY,
     MEMC_SETTINGS_KEY,
@@ -47,6 +48,8 @@ from .core import (
     load_settings,
     memc_jni_key_for_mode,
     normalize_sound_output_value,
+    parse_hdmi_edid_flags,
+    parse_hdmi_edid_int,
     strip_guardian_package_from_accessibility,
     update_settings,
 )
@@ -1659,7 +1662,16 @@ class DeviceFeaturesMixin:
             source = self.adb.get("mitv.tvplayer.hdmi.last.source", check=True)
             fs_key = freesync_jni_key(source)
             fs_raw = self.adb.jni_batch_get_or_single([fs_key], check=True).get(fs_key)
-            if fs_raw is not None:
+            if fs_key == "g_video__freesync_switch":
+                edid_raw = self.adb.jni_batch_get_or_single(
+                    ["g_fusion_picture__hdmi_edid_version"],
+                    check=True,
+                ).get("g_fusion_picture__hdmi_edid_version")
+                if parse_hdmi_edid_int(edid_raw) in HDMI_EDID_KNOWN_VALUES:
+                    values["freesync"] = parse_hdmi_edid_flags(edid_raw, fs_raw)[1]
+                elif fs_raw is not None:
+                    values["freesync"] = 1 if freesync_is_on(fs_key, fs_raw) else 0
+            elif fs_raw is not None:
                 values["freesync"] = 1 if freesync_is_on(fs_key, fs_raw) else 0
 
             # 声音输出也纳入预设与快照（不放入 PICTURE_PRESET_SETTINGS_KEYS 以保持画面页键表一致）。
@@ -1759,16 +1771,15 @@ class DeviceFeaturesMixin:
                                 "g_fusion_picture__hdmi_edid_version",
                                 "g_video__freesync_switch",
                             ])
-                            try:
-                                jni_vals["mode_320"] = (
-                                    1 if int(mode_vals.get("g_fusion_picture__hdmi_edid_version")) == 6 else 0
-                                )
-                            except (TypeError, ValueError): pass
-                            try:
-                                jni_vals["freesync"] = (
-                                    1 if int(mode_vals.get("g_video__freesync_switch")) == 3 else 0
-                                )
-                            except (TypeError, ValueError): pass
+                            edid_raw = mode_vals.get("g_fusion_picture__hdmi_edid_version")
+                            fs_raw = mode_vals.get("g_video__freesync_switch")
+                            mode_320_val, freesync_val = parse_hdmi_edid_flags(edid_raw, fs_raw)
+                            edid_int = parse_hdmi_edid_int(edid_raw)
+                            fs_int = parse_hdmi_edid_int(fs_raw)
+                            if edid_int is not None:
+                                jni_vals["mode_320"] = mode_320_val
+                            if edid_int in HDMI_EDID_KNOWN_VALUES or fs_int is not None:
+                                jni_vals["freesync"] = freesync_val
 
                 if page_name == "picturePage" and refresh_seq != getattr(self, "_picture_mode_switch_seq", 0):
                     self.log("已丢弃过期的画面设置刷新结果")

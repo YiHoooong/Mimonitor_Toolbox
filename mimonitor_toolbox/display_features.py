@@ -26,12 +26,16 @@ from .core import (
     format_memc_condition_dialog,
     format_memc_label,
     format_sound_output_label,
+    hdmi_edid_for,
     is_game_picture_mode,
     is_hdr_tone_mapping_picture_mode,
     load_settings,
     memc_jni_key_for_mode,
     normalize_sound_output_value,
+    parse_hdmi_edid_flags,
+    parse_hdmi_edid_int,
     parse_sound_output_value,
+    read_hdmi_edid_and_freesync,
     update_settings,
     write_memc_value,
 )
@@ -1207,8 +1211,8 @@ class DisplayFeaturesMixin:
                 fs = self.adb.jni_get("g_video__dp_adaptive_sync", check=check)
                 return 1 if as_int(fs) == 1 else 0
             else:
-                fs = self.adb.jni_get("g_video__freesync_switch", check=check)
-                return 1 if as_int(fs) == 3 else 0
+                edid_raw, fs_raw = read_hdmi_edid_and_freesync(self.adb, check=check)
+                return parse_hdmi_edid_flags(edid_raw, fs_raw)[1]
         elif sk == "volume_music_speaker":
             v = self.adb.media_volume(check=check)
             return as_int(v)
@@ -2559,9 +2563,25 @@ class DisplayFeaturesMixin:
 
         def operation():
             with self.adb.transaction():
-                src = self._get_input_source(check=True)
-                if src in ("29","30"): self.adb.jni_set("g_fusion_picture__dp_edid_version", 3 if on else 2, check=True)
-                else: self.adb.jni_set("g_fusion_picture__hdmi_edid_version", 6 if on else 1, check=True)
+                src = str(self._get_input_source(check=True)).strip()
+                if src in ("29", "30"):
+                    self.adb.jni_set("g_fusion_picture__dp_edid_version", 3 if on else 2, check=True)
+                else:
+                    edid_raw, fs_raw = read_hdmi_edid_and_freesync(self.adb, check=True)
+                    if edid_raw is None and fs_raw is None:
+                        fs_on = self.current_vals.get("freesync") == 1
+                        fs_int = 3 if fs_on else 0
+                    else:
+                        fs_on = parse_hdmi_edid_flags(edid_raw, fs_raw)[1] == 1
+                        fs_int = parse_hdmi_edid_int(fs_raw)
+                    desired_fs = 3 if fs_on else 0
+                    if fs_int != desired_fs:
+                        self.adb.jni_set("g_video__freesync_switch", desired_fs, check=True)
+                    self.adb.jni_set(
+                        "g_fusion_picture__hdmi_edid_version",
+                        hdmi_edid_for(on, fs_on),
+                        check=True,
+                    )
                 self.adb.refresh_pq(check=True)
 
         def success():
@@ -2594,9 +2614,21 @@ class DisplayFeaturesMixin:
 
         def operation():
             with self.adb.transaction():
-                src = self._get_input_source(check=True)
-                if src in ("29","30"): self.adb.jni_set("g_video__dp_adaptive_sync", 1 if on else 0, check=True)
-                else: self.adb.jni_set("g_video__freesync_switch", 3 if on else 0, check=True)
+                src = str(self._get_input_source(check=True)).strip()
+                if src in ("29", "30"):
+                    self.adb.jni_set("g_video__dp_adaptive_sync", 1 if on else 0, check=True)
+                else:
+                    edid_raw, _ = read_hdmi_edid_and_freesync(self.adb, check=True)
+                    if edid_raw is None:
+                        is_320 = self.current_vals.get("mode_320") == 1
+                    else:
+                        is_320 = parse_hdmi_edid_flags(edid_raw)[0] == 1
+                    self.adb.jni_set("g_video__freesync_switch", 3 if on else 0, check=True)
+                    self.adb.jni_set(
+                        "g_fusion_picture__hdmi_edid_version",
+                        hdmi_edid_for(is_320, on),
+                        check=True,
+                    )
                 # 关闭 FreeSync 且开启模式记忆：先切回开启前的画面模式，再刷新数据（切换早于刷新）
                 if not on and restore_mode is not None:
                     self.adb.put("picture_mode", str(restore_mode), check=True)

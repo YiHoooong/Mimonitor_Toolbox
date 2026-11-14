@@ -448,6 +448,29 @@ class FreeSyncPresetTests(unittest.TestCase):
         calls = self._apply("23", 0)
         self.assertIn(("jni_set", "g_video__freesync_switch", 0, 3, True), calls)
 
+    def test_hdmi_preset_preserves_320hz_when_edid_readable(self):
+        from mimonitor_toolbox import presets
+
+        class EdidAwareAdb(FakeAdb):
+            def __init__(self, edid):
+                super().__init__(source="23")
+                self.edid = edid
+
+            def jni_batch_get_or_single(self, keys, check=False):
+                if "g_fusion_picture__hdmi_edid_version" in keys:
+                    return {"g_fusion_picture__hdmi_edid_version": self.edid}
+                return {}
+
+        adb_on = EdidAwareAdb(edid=6)
+        presets.PICTURE_ITEMS[0].apply(adb_on, full_values(freesync=1))
+        self.assertIn(("jni_set", "g_video__freesync_switch", 3, 3, True), adb_on.calls)
+        self.assertIn(("jni_set", "g_fusion_picture__hdmi_edid_version", 5, 3, True), adb_on.calls)
+
+        adb_off = EdidAwareAdb(edid=5)
+        presets.PICTURE_ITEMS[0].apply(adb_off, full_values(freesync=0))
+        self.assertIn(("jni_set", "g_video__freesync_switch", 0, 3, True), adb_off.calls)
+        self.assertIn(("jni_set", "g_fusion_picture__hdmi_edid_version", 6, 3, True), adb_off.calls)
+
     def test_dp_uses_adaptive_sync_with_one_for_on(self):
         calls = self._apply("29", 1)
         self.assertIn(("jni_set", "g_video__dp_adaptive_sync", 1, 3, True), calls)

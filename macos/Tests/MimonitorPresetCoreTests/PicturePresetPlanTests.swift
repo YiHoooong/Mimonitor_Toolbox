@@ -182,4 +182,34 @@ final class PicturePresetPlanTests: XCTestCase {
         )
         XCTAssertEqual(game[MemcSupport.primarySettingKey], "3")
     }
+
+    func testHdmiEdidMatrixAndReadbackFlags() {
+        XCTAssertEqual(PicturePresetPlan.hdmiEdidVersion(mode320: false, freesync: false), 1)
+        XCTAssertEqual(PicturePresetPlan.hdmiEdidVersion(mode320: false, freesync: true), 3)
+        XCTAssertEqual(PicturePresetPlan.hdmiEdidVersion(mode320: true, freesync: false), 6)
+        XCTAssertEqual(PicturePresetPlan.hdmiEdidVersion(mode320: true, freesync: true), 5)
+
+        let stale = PicturePresetPlan.parseHdmiEdidFlags(edidRaw: "6", freesyncRaw: "3")
+        XCTAssertTrue(stale.mode320)
+        XCTAssertFalse(stale.freesync)
+
+        let both = PicturePresetPlan.parseHdmiEdidFlags(edidRaw: "5", freesyncRaw: "3")
+        XCTAssertTrue(both.mode320)
+        XCTAssertTrue(both.freesync)
+
+        let normalized = PicturePresetPlan.normalize(
+            settings: ["picture_mode": "10"],
+            jni: ["g_video__freesync_switch": "2", "g_fusion_picture__hdmi_edid_version": "6"],
+            source: "23"
+        )
+        XCTAssertEqual(normalized["freesync"], "0")
+
+        var cmds: [PresetCommand] = []
+        var changed = values; changed["freesync"] = "1"
+        _ = PicturePresetPlan.apply(changed, source: "23", hdmi320: true) { cmds.append($0) }
+        XCTAssertEqual(Array(cmds.prefix(2)), [
+            .jni("g_video__freesync_switch", "3", 3),
+            .jni("g_fusion_picture__hdmi_edid_version", "5", 3),
+        ])
+    }
 }

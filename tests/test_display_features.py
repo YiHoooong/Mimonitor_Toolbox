@@ -2124,5 +2124,135 @@ class MemcFeatureTests(unittest.TestCase):
         query_rr.assert_called_once_with(configured_id="ID1", target_device_name=r"\\.\DISPLAY1")
 
 
+class Hdmi320AndFreeSyncTests(unittest.TestCase):
+    """HDMI 下 320Hz 与 FreeSync 共享 g_fusion_picture__hdmi_edid_version 四态枚举（1/3/5/6）。"""
+
+    def _make_host(self, edid=1, fs_switch=0, source="23"):
+        from mimonitor_toolbox.display_features import DisplayFeaturesMixin
+
+        state = {
+            "g_fusion_picture__hdmi_edid_version": edid,
+            "g_video__freesync_switch": fs_switch,
+        }
+        writes = []
+
+        class FakeAdb:
+            def transaction(self):
+                return nullcontext()
+
+            def jni_batch_get_or_single(self, keys, check=False):
+                return {k: state[k] for k in keys if k in state}
+
+            def jni_get(self, key, check=False):
+                return state.get(key)
+
+            def get(self, key, check=False):
+                if key == "mitv.tvplayer.hdmi.last.source":
+                    return source
+                return ""
+
+            def jni_set(self, key, val, upd=3, check=False):
+                writes.append((key, val))
+                state[key] = val
+
+            def put(self, key, val, check=False):
+                writes.append(("put", key, val))
+
+            def refresh_pq(self, check=False):
+                writes.append(("refresh_pq",))
+
+        class Host(DisplayFeaturesMixin):
+            adb = FakeAdb()
+            adb_connected = True
+            current_vals = {"picture_mode": 10}
+            state_buttons = {}
+
+            def check_connection(self):
+                return True
+
+            def _mark_adb_busy(self, _s=2.0):
+                pass
+
+            def _take_control_previous(self, _k):
+                return None
+
+            def _freesync_mode_memory_enabled(self):
+                return False
+
+            def memories_suspended_by_preset(self):
+                return False
+
+            def _get_input_source(self, check=False):
+                return source
+
+            def _optimistic_highlight(self, _k, _v):
+                pass
+
+            def _note_picture_change(self):
+                pass
+
+            def _refresh_pages(self, *_args, **_kwargs):
+                pass
+
+            def log(self, _msg):
+                pass
+
+            def _run_adb_action(self, _label, op, success, _failure):
+                op()
+                success()
+
+        return Host(), writes, state
+
+    def test_320_preserves_freesync_and_fixes_stale_switch(self):
+        # FreeSync 开 + 320Hz 关 (edid=3, fs=3) -> 开 320Hz 应写 5，再关应回 3
+        host, writes, state = self._make_host(edid=3, fs_switch=3)
+        host._320(True)
+        self.assertEqual(state["g_fusion_picture__hdmi_edid_version"], 5)
+        self.assertEqual(state["g_video__freesync_switch"], 3)
+        host._320(False)
+        self.assertEqual(state["g_fusion_picture__hdmi_edid_version"], 3)
+
+        # OSD 留下 edid=6 + freesync_switch=2/3（FS 实际关）-> 关 320Hz 应清理 freesync_switch=0 且回 1
+        host2, writes2, state2 = self._make_host(edid=6, fs_switch=2)
+        host2._320(False)
+        self.assertEqual(state2["g_video__freesync_switch"], 0)
+        self.assertEqual(state2["g_fusion_picture__hdmi_edid_version"], 1)
+        self.assertLess(
+            writes2.index(("g_video__freesync_switch", 0)),
+            writes2.index(("g_fusion_picture__hdmi_edid_version", 1)),
+        )
+
+    def test_fsync_writes_switch_then_coupled_hdmi_edid(self):
+        # 320Hz 关时开 FS -> 写 fs=3 再写 edid=3（不能跳成 5）
+        host, writes, state = self._make_host(edid=1, fs_switch=0)
+        host._fsync(True)
+        self.assertEqual(state["g_video__freesync_switch"], 3)
+        self.assertEqual(state["g_fusion_picture__hdmi_edid_version"], 3)
+        self.assertLess(
+            writes.index(("g_video__freesync_switch", 3)),
+            writes.index(("g_fusion_picture__hdmi_edid_version", 3)),
+        )
+
+        # 320Hz 开时开关 FS -> 在 6 与 5 之间切换并保持 320Hz
+        host2, writes2, state2 = self._make_host(edid=6, fs_switch=0)
+        host2._fsync(True)
+        self.assertEqual(state2["g_fusion_picture__hdmi_edid_version"], 5)
+        writes2.clear()
+        host2._fsync(False)
+        self.assertEqual(state2["g_video__freesync_switch"], 0)
+        self.assertEqual(state2["g_fusion_picture__hdmi_edid_version"], 6)
+        self.assertLess(
+            writes2.index(("g_video__freesync_switch", 0)),
+            writes2.index(("g_fusion_picture__hdmi_edid_version", 6)),
+        )
+
+    def test_query_setting_or_jni_uses_hdmi_edid_over_stale_switch(self):
+        host_off, _, _ = self._make_host(edid=6, fs_switch=3)
+        self.assertEqual(host_off.query_setting_or_jni("freesync"), 0)
+
+        host_on, _, _ = self._make_host(edid=5, fs_switch=3)
+        self.assertEqual(host_on.query_setting_or_jni("freesync"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -33,9 +33,33 @@ public enum PicturePresetPlan {
         "g_video__vid_insert_black", "g_video__clr_gain_r", "g_video__clr_gain_g", "g_video__clr_gain_b",
         MemcSupport.normalJniKey, MemcSupport.gameJniKey, "g_video__picture_mode",
     ]
+    public static let knownHdmiEdidVersions: Set<Int> = [1, 3, 5, 6]
+
     public static func freesyncKey(source: String) -> String {
         ["29", "30"].contains(source.trimmingCharacters(in: .whitespacesAndNewlines))
             ? "g_video__dp_adaptive_sync" : "g_video__freesync_switch"
+    }
+
+    public static func hdmiEdidVersion(mode320: Bool, freesync: Bool) -> Int {
+        switch (mode320, freesync) {
+        case (false, false): return 1
+        case (false, true): return 3
+        case (true, false): return 6
+        case (true, true): return 5
+        }
+    }
+
+    public static func parseHdmiEdidFlags(edidRaw: String?, freesyncRaw: String?) -> (mode320: Bool, freesync: Bool) {
+        let edid = edidRaw.flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        let fs = freesyncRaw.flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        let mode320 = edid == 5 || edid == 6
+        let freesync: Bool
+        if let edid, knownHdmiEdidVersions.contains(edid) {
+            freesync = (edid == 3 || edid == 5)
+        } else {
+            freesync = (fs == 3)
+        }
+        return (mode320, freesync)
     }
 
     public static func normalize(settings: [String: String], jni: [String: String], source: String) -> [String: String] {
@@ -70,9 +94,18 @@ public enum PicturePresetPlan {
         override("g_video__clr_gain_g", ["picture_green_gain"])
         override("g_video__clr_gain_b", ["picture_blue_gain"])
         let fsKey = freesyncKey(source: source)
-        if let raw = jni[fsKey], let value = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)) {
-            let onValue = fsKey == "g_video__freesync_switch" ? 3 : 1
-            if value == 0 || value == onValue { values["freesync"] = value == onValue ? "1" : "0" }
+        if fsKey == "g_video__freesync_switch",
+           let edidRaw = jni["g_fusion_picture__hdmi_edid_version"],
+           let edid = Int(edidRaw.trimmingCharacters(in: .whitespacesAndNewlines)),
+           knownHdmiEdidVersions.contains(edid) {
+            values["freesync"] = (edid == 3 || edid == 5) ? "1" : "0"
+        } else if let raw = jni[fsKey], let value = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            if fsKey == "g_video__freesync_switch" {
+                if value == 0 || value == 2 { values["freesync"] = "0" }
+                else if value == 3 { values["freesync"] = "1" }
+            } else if value == 0 || value == 1 {
+                values["freesync"] = value == 1 ? "1" : "0"
+            }
         }
         if let raw = settings[soundOutputKey], let value = normalizeSoundOutput(raw) {
             values[soundOutputKey] = String(value)
@@ -91,6 +124,7 @@ public enum PicturePresetPlan {
     }
 
     public static func apply(_ values: [String: String], source: String,
+                             hdmi320: Bool? = nil,
                              execute: (PresetCommand) throws -> Void) -> PresetApplyReport {
         var report = PresetApplyReport()
         func number(_ key: String, range: ClosedRange<Int>? = nil) throws -> Int {
@@ -126,7 +160,18 @@ public enum PicturePresetPlan {
             item("FreeSync") {
                 let key = freesyncKey(source: source)
                 let on = try number("freesync", range: 0...1) == 1
-                return [.jni(key, on ? (key == "g_video__freesync_switch" ? "3" : "1") : "0", 3), .refresh]
+                var commands: [PresetCommand] = [
+                    .jni(key, on ? (key == "g_video__freesync_switch" ? "3" : "1") : "0", 3),
+                ]
+                if key == "g_video__freesync_switch", let hdmi320 {
+                    commands.append(.jni(
+                        "g_fusion_picture__hdmi_edid_version",
+                        String(hdmiEdidVersion(mode320: hdmi320, freesync: on)),
+                        3
+                    ))
+                }
+                commands.append(.refresh)
+                return commands
             }
         }
         // Mode changes reset parameter defaults, so every parameter follows this command.

@@ -22,7 +22,10 @@ from .core import (
     SOUND_OUTPUT_VALID_VALUES,
     XIAOMI_TO_MTK_COLOR_TEMP,
     format_sound_output_label,
+    hdmi_edid_for,
     is_hdr_tone_mapping_picture_mode,
+    parse_hdmi_edid_flags,
+    read_hdmi_edid_and_freesync,
     write_memc_value,
 )
 
@@ -109,7 +112,18 @@ def _apply_freesync(adb, values):
     wanted = _as_int(values, "freesync") == 1
     source = adb.get("mitv.tvplayer.hdmi.last.source", check=True)
     key = freesync_jni_key(source)
-    adb.jni_set(key, freesync_on_value(key) if wanted else 0, check=True)
+    if key == "g_video__freesync_switch":
+        edid_raw, _ = read_hdmi_edid_and_freesync(adb, check=True)
+        adb.jni_set(key, freesync_on_value(key) if wanted else 0, check=True)
+        if edid_raw is not None:
+            is_320_int, _ = parse_hdmi_edid_flags(edid_raw)
+            adb.jni_set(
+                "g_fusion_picture__hdmi_edid_version",
+                hdmi_edid_for(is_320_int == 1, wanted),
+                check=True,
+            )
+    else:
+        adb.jni_set(key, freesync_on_value(key) if wanted else 0, check=True)
     adb.refresh_pq(check=True)
 
 
