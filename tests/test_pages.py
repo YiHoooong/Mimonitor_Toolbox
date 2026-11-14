@@ -10,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtCore import QPoint, QSize, QTime, Qt
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QAbstractButton, QApplication, QLabel, QWidget
-from qfluentwidgets import PrimaryPushButton, TransparentToolButton
+from qfluentwidgets import PrimaryPushButton, PushButton, TransparentToolButton
 
 from mimonitor_toolbox.pages import BASELINE_PRESET_ID
 from mimonitor_toolbox.widgets import (
@@ -692,6 +692,75 @@ class TrayMenuTests(TrayTestBase):
         self.assertEqual(menu._subMenus, [])
         self._close(window)
 
+    def test_tray_presets_submenu_shows_checked_active_and_triggers_switch(self):
+        from mimonitor_toolbox import display_features as display_module
+        from mimonitor_toolbox import main_window as mw
+        from mimonitor_toolbox.presets import BASELINE_PRESET_ID
+        from mimonitor_toolbox.widgets import TrayOptionMenu
+
+        window = self._app()
+        try:
+            settings = {
+                "tray_items": ["backlight"],
+                "tray_presets": ["p2", BASELINE_PRESET_ID],
+                "presets": [
+                    {"id": "p1", "name": "电影", "values": {}},
+                    {"id": "p2", "name": "办公", "values": {}},
+                ],
+                "active_preset_id": "p2",
+                "preset_snapshot": {"source": "办公", "values": {"picture_mode": 14}},
+            }
+            window.adb_connected = True
+            with mock.patch.object(mw, "load_settings", side_effect=lambda: dict(settings)), \
+                    mock.patch.object(display_module, "load_settings", side_effect=lambda: dict(settings)):
+                menu = window.build_tray_menu()
+
+            preset_menu = menu._subMenus[0]
+            self.assertIsInstance(preset_menu, TrayOptionMenu)
+            self.assertEqual(preset_menu.title(), "预设模式")
+            actions = preset_menu.menuActions()
+            self.assertEqual([a.text() for a in actions], ["无预设", "办公"])
+            self.assertFalse(actions[0].isChecked())
+            self.assertTrue(actions[1].isChecked())
+            self.assertTrue(actions[0].isEnabled())
+
+            # 再点当前预设应为无操作；点「无预设」触发退回基准
+            with mock.patch.object(window, "_preset_apply") as apply_preset, \
+                    mock.patch.object(window, "_preset_restore_baseline") as restore, \
+                    mock.patch.object(mw, "load_settings", side_effect=lambda: dict(settings)), \
+                    mock.patch.object(display_module, "load_settings", side_effect=lambda: dict(settings)):
+                actions[1].trigger()
+                apply_preset.assert_not_called()
+                actions[0].trigger()
+                restore.assert_called_once()
+
+            # 激活某预设但无快照时，「无预设」应禁用
+            settings["preset_snapshot"] = None
+            with mock.patch.object(mw, "load_settings", side_effect=lambda: dict(settings)), \
+                    mock.patch.object(display_module, "load_settings", side_effect=lambda: dict(settings)):
+                menu_no_snap = window.build_tray_menu()
+            self.assertFalse(menu_no_snap._subMenus[0].menuActions()[0].isEnabled())
+        finally:
+            self._close(window)
+
+    def test_tray_presets_only_suppresses_empty_hint(self):
+        from mimonitor_toolbox import main_window as mw
+
+        window = self._app()
+        try:
+            settings = {
+                "tray_items": [],
+                "tray_presets": ["p1"],
+                "presets": [{"id": "p1", "name": "电影", "values": {}}],
+            }
+            with mock.patch.object(mw, "load_settings", return_value=settings):
+                menu = window.build_tray_menu()
+            texts = [a.text() for a in menu.menuActions()]
+            self.assertFalse(any("添加快捷项" in t for t in texts))
+            self.assertEqual([m.title() for m in menu._subMenus], ["预设模式"])
+        finally:
+            self._close(window)
+
     def test_context_click_opens_menu_and_left_click_toggles_window(self):
         from PyQt6.QtWidgets import QSystemTrayIcon
 
@@ -1103,19 +1172,22 @@ class PresetAndTaskPageTests(TrayTestBase):
         self.assertIn("看电影", texts)
         self.assertTrue(any("2 项" in t for t in texts))
 
-    def test_preset_card_emits_apply_and_edit(self):
+    def test_preset_card_emits_apply_and_options(self):
         settings = {"presets": [{"id": "p1", "name": "A", "values": {}}]}
         window = self._window(settings)
-        applied, edited = [], []
+        applied, opted = [], []
         window._preset_apply = lambda pid: applied.append(pid)
-        window._preset_edit = lambda pid: edited.append(pid)
+        window._preset_options = lambda pid: opted.append(pid)
         # 重新建卡以接上新的回调
         window._preset_sync()
         card = self._card_id(window, "p1")
+        btn_texts = [b.text() for b in card.findChildren(PushButton)]
+        self.assertIn("选项", btn_texts)
+        self.assertNotIn("编辑", btn_texts)
         card.apply_requested.emit("p1")
-        card.edit_requested.emit("p1")
+        card.options_requested.emit("p1")
         self.assertEqual(applied, ["p1"])
-        self.assertEqual(edited, ["p1"])
+        self.assertEqual(opted, ["p1"])
 
     # ── 无预设卡 ──
 
@@ -1181,14 +1253,110 @@ class PresetAndTaskPageTests(TrayTestBase):
             self._cards(window)[-1].clicked.emit()
         self.assertEqual(created, [])
 
-    def test_edit_button_enters_edit_with_that_preset(self):
+    def test_options_button_opens_dialog_and_updates_preset_options(self):
+        from mimonitor_toolbox import pages as pages_module
+
         settings = {"presets": [{"id": "p1", "name": "A", "values": {}}]}
         window = self._window(settings)
-        started = []
-        with mock.patch.object(window, "begin_preset_edit",
-                               side_effect=lambda **kw: started.append(kw)):
-            self._card_id(window, "p1").edit_requested.emit("p1")
-        self.assertEqual(started, [{"preset_id": "p1"}])
+        saved = []
+        opts = {"picture": True, "display_sync": False, "game_tools": True, "screen_light": False, "audio": True}
+        with mock.patch.object(pages_module, "PresetOptionsDialog") as dialog, \
+                mock.patch.object(window, "update_preset_options",
+                                  side_effect=lambda pid, o: saved.append((pid, o))):
+            dialog.return_value.exec.return_value = True
+            dialog.return_value.options.return_value = opts
+            self._card_id(window, "p1").options_requested.emit("p1")
+        self.assertEqual(saved, [("p1", opts)])
+
+    def test_preset_options_dialog_and_merged_notice_behavior(self):
+        from mimonitor_toolbox import main_window as main_window_module, widgets
+
+        parent = self._window({})
+        dlg = widgets.PresetOptionsDialog("测试", None, parent)
+        self.assertIn("屏幕灯", [lbl.text() for lbl in dlg.findChildren(widgets.BodyLabel)])
+        self.assertTrue(dlg.yesButton.isEnabled())
+        for sw in dlg._switches.values():
+            sw.setChecked(False)
+        self.assertFalse(dlg.yesButton.isEnabled())
+        self.assertFalse(dlg.validate())
+        dlg.deleteLater()
+
+        notice = widgets.PresetEditMergedNoticeDialog(parent)
+        self.assertEqual(notice.titleLabel.text(), "预设交互更新提示")
+        self.assertIn("编辑", notice.bodyLabel.text())
+        self.assertEqual(notice.chk_never_show.text(), "不再提示")
+        self.assertFalse(notice.never_show_checked())
+        notice.deleteLater()
+
+        # 未勾「不再提示」时不写入配置，下次启动仍会弹出；勾选后则永久抑制
+        class NoticeHost:
+            _cleanup_done = False
+            _preset_notice_shown_this_session = False
+
+            def isVisible(self):
+                return True
+
+        fake_settings = {"never_show_preset_edit_merged_notice": False}
+        writes = []
+        with mock.patch.object(main_window_module, "load_settings", side_effect=lambda: dict(fake_settings)), \
+                mock.patch.object(main_window_module, "update_settings",
+                                  side_effect=lambda patch: writes.append(patch) or fake_settings.update(patch)), \
+                mock.patch.object(main_window_module, "PresetEditMergedNoticeDialog") as mock_dlg:
+            host = NoticeHost()
+            mock_dlg.return_value.exec.return_value = True
+            mock_dlg.return_value.never_show_checked.return_value = False
+            main_window_module.App._maybe_show_preset_edit_merged_notice(host)
+            self.assertEqual(writes, [])
+
+            host2 = NoticeHost()
+            mock_dlg.return_value.never_show_checked.return_value = True
+            main_window_module.App._maybe_show_preset_edit_merged_notice(host2)
+            self.assertEqual(writes, [{"never_show_preset_edit_merged_notice": True}])
+
+            host3 = NoticeHost()
+            mock_dlg.reset_mock()
+            main_window_module.App._maybe_show_preset_edit_merged_notice(host3)
+            mock_dlg.assert_not_called()
+
+        # 仅切换至预设页时排程提示，连接页等其它页面不弹
+        from mimonitor_toolbox import device_features
+
+        scheduled = []
+
+        class NavHost(device_features.DeviceFeaturesMixin):
+            _PAGES_NEED_CONNECTION = ()
+            _page_data_keys = {}
+            _page_loaded = set()
+            _page_loading = set()
+            _preset_notice_shown_this_session = False
+            home_w = SimpleNamespace(objectName=lambda: "homePage")
+            preset_w = SimpleNamespace(objectName=lambda: "presetPage")
+            stackedWidget = SimpleNamespace(
+                widget=lambda i: NavHost.home_w if i == 0 else NavHost.preset_w,
+                count=lambda: 2,
+            )
+
+            def _stop_source_polling(self):
+                pass
+
+            def _maybe_show_preset_edit_merged_notice(self):
+                pass
+
+        nav = NavHost()
+        with mock.patch.object(device_features.QTimer, "singleShot", side_effect=lambda ms, fn: scheduled.append(ms)):
+            nav._on_page_changed(0)
+            self.assertEqual(scheduled, [])
+            nav._on_page_changed(1)
+            self.assertEqual(scheduled, [150])
+
+        # 「在托盘显示」应紧接在「x 项设置」下方，stretch 放在它与底部按钮之间
+        window2 = self._window({"presets": [{"id": "p1", "name": "A", "values": {}}]})
+        card = self._card_id(window2, "p1")
+        vlayout = card.layout()
+        # 索引: 0=top, 1=caption, 2=spacing, 3=tray_row, 4=stretch(spacerItem), 5=button_row
+        self.assertIsNotNone(vlayout.itemAt(4).spacerItem())
+        self.assertIsNotNone(vlayout.itemAt(3).layout())
+        self.assertIsNotNone(vlayout.itemAt(5).layout())
 
     # ── 右键菜单：重命名 / 删除 ──
 
@@ -1516,6 +1684,38 @@ class PresetAndTaskPageTests(TrayTestBase):
             if hasattr(card, "findChildren"):
                 self.assertNotIn("已应用", self._texts(card)[1:],
                                  "除了应用按钮，卡片上不该再出现「已应用」字样")
+
+    def test_tray_toggle_enforces_limit_of_four_and_cleans_up_on_delete(self):
+        settings = {
+            "presets": [
+                {"id": f"p{i}", "name": f"预设{i}", "values": {}} for i in range(1, 6)
+            ],
+            "tray_presets": [BASELINE_PRESET_ID, "p1", "p2", "p3"],
+        }
+        window = self._window(settings)
+
+        # 已满 4 项：已勾选的可操作，第 5 张未勾选卡应禁用开关并给出限制提示
+        self.assertTrue(self._card_id(window, "p1").tray_switch.isChecked())
+        self.assertTrue(self._card_id(window, "p1").tray_switch.isEnabled())
+        p4_card = self._card_id(window, "p4")
+        self.assertFalse(p4_card.tray_switch.isChecked())
+        self.assertFalse(p4_card.tray_switch.isEnabled())
+        self.assertIn("最多添加 4 个", p4_card.tray_switch.toolTip())
+
+        # 取消其中一项后，第 5 张释放可点并可加入托盘
+        window._preset_toggle_tray("p2", False)
+        self.assertEqual(settings["tray_presets"], [BASELINE_PRESET_ID, "p1", "p3"])
+        self.assertTrue(self._card_id(window, "p4").tray_switch.isEnabled())
+
+        window._preset_toggle_tray("p4", True)
+        self.assertEqual(settings["tray_presets"], [BASELINE_PRESET_ID, "p1", "p3", "p4"])
+
+        # 删除预设时同步从 tray_presets 中剔除
+        from mimonitor_toolbox import pages as pages_module
+        with mock.patch.object(pages_module, "MessageBox") as box:
+            box.return_value.exec.return_value = True
+            window._preset_delete("p1")
+        self.assertEqual(settings["tray_presets"], [BASELINE_PRESET_ID, "p3", "p4"])
 
 
 class MemcPageIntegrationTests(TrayTestBase):

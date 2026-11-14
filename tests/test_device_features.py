@@ -1580,6 +1580,67 @@ class SoundOutputDevicePipelineTests(unittest.TestCase):
         vals = Host()._read_picture_values()
         self.assertEqual(vals[core.SOUND_OUTPUT_SETTINGS_KEY], 8)
 
+    def test_read_picture_values_captures_320_game_menu_audio_and_light(self):
+        from mimonitor_toolbox import core
+
+        class FakeAdb:
+            def transaction(self):
+                return nullcontext()
+
+            def shell(self, _cmd, check=False):
+                return "\n".join([
+                    "picture_mode=10",
+                    "front_sight_index=null",
+                    "mt_game_dynamic_ft=null",
+                    "mt_game_scope=5",
+                    "mt_game_scope_night=1",
+                    "monitor_menu_fps_counter=2",
+                    "monitor_menu_stopwatch=null",
+                    "monitor_menu_timer=300",
+                    "atmosphere_light_switcher_pm2=2",
+                    "atmosphere_light_illumination=12",
+                    "atmosphere_light_color_temp=null",
+                    "atmosphere_light_color_value=3",
+                ])
+
+            def jni_batch_get_or_single(self, keys, check=False):
+                if keys == ["g_video__freesync_switch"]:
+                    return {"g_video__freesync_switch": "3"}
+                if keys == ["g_fusion_picture__hdmi_edid_version"]:
+                    return {"g_fusion_picture__hdmi_edid_version": "5"}
+                return {}
+
+            def get(self, key, check=False):
+                if key == core.SOUND_OUTPUT_SETTINGS_KEY:
+                    return "8"
+                return "23"
+
+            def media_volume(self, check=False):
+                return 42
+
+            def media_muted(self, check=False):
+                return True
+
+        class Host(device_features.DeviceFeaturesMixin):
+            adb = FakeAdb()
+
+        vals = Host()._read_picture_values()
+        self.assertEqual(vals["mode_320"], 1)
+        self.assertEqual(vals["freesync"], 1)
+        self.assertEqual(vals["front_sight_index"], 0)
+        self.assertEqual(vals["mt_game_dynamic_ft"], 0)
+        self.assertEqual(vals["mt_game_scope"], 5)
+        self.assertEqual(vals["mt_game_scope_night"], 1)
+        self.assertEqual(vals["monitor_menu_fps_counter"], 2)
+        self.assertEqual(vals["monitor_menu_stopwatch"], 0)
+        self.assertEqual(vals["monitor_menu_timer"], 300)
+        self.assertEqual(vals["volume_music_speaker"], 42)
+        self.assertEqual(vals["media_muted"], 1)
+        self.assertEqual(vals["atmosphere_light_switcher_pm2"], 2)
+        self.assertEqual(vals["atmosphere_light_illumination"], 12)
+        self.assertEqual(vals["atmosphere_light_color_temp"], 1)
+        self.assertEqual(vals["atmosphere_light_color_value"], 3)
+
     def test_apply_polled_values_normalizes_arc_and_updates_label_and_buttons(self):
         from mimonitor_toolbox import core
 

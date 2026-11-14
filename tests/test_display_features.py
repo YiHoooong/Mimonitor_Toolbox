@@ -707,42 +707,59 @@ class PresetOrchestrationTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertTrue(any("已不存在" in m for m in logs))
 
-    # ── 编辑 / 新建（无会话，切过去就是当前预设）──
+    # ── 选项 / 新建（无编辑会话，改用「选项」管理大项）──
 
-    def test_edit_applies_the_preset_then_jumps_to_the_picture_page(self):
-        settings = {"presets": [{"id": "p1", "name": "看电影",
-                                 "values": {"picture_mode": 9, "picture_contrast": 70}}]}
+    def test_update_preset_options_filters_values_and_triggers_sync_when_active(self):
+        settings = {
+            "active_preset_id": "p1",
+            "presets": [{
+                "id": "p1",
+                "name": "游戏",
+                "values": {
+                    "picture_mode": 10,
+                    "picture_contrast": 60,
+                    "freesync": 1,
+                    "volume_music_speaker": 50,
+                    "atmosphere_light_switcher_pm2": 2,
+                },
+            }],
+        }
+        noted = []
 
         def run(host):
-            host.begin_preset_edit(preset_id="p1")
+            host._note_picture_change = lambda: noted.append(True)
+            host.update_preset_options("p1", {"audio": False, "screen_light": False})
 
-        host, calls, _ = self._run(settings, True, run)
-        self.assertIn(("put", "picture_mode", "9"), calls)
-        self.assertIn(("put", "picture_contrast", "70"), calls)
+        self._run(settings, True, run)
+        updated = settings["presets"][0]
+        self.assertFalse(updated["options"]["audio"])
+        self.assertFalse(updated["options"]["screen_light"])
+        self.assertIn("picture_mode", updated["values"])
+        self.assertIn("freesync", updated["values"])
+        self.assertNotIn("volume_music_speaker", updated["values"])
+        self.assertNotIn("atmosphere_light_switcher_pm2", updated["values"])
+        self.assertEqual(noted, [True])
+
+    def test_apply_preset_by_id_and_sync_respect_preset_options(self):
+        settings = {
+            "presets": [{
+                "id": "p1",
+                "name": "仅同步音频",
+                "options": {"picture": False, "display_sync": False, "game_tools": False, "screen_light": False, "audio": True},
+                "values": {"mitv.settings.db.sound.device.output_device": 8},
+            }],
+        }
+
+        def run(host):
+            host.apply_preset_by_id("p1")
+            host._read_picture_values = lambda: {"picture_mode": 14, "mitv.settings.db.sound.device.output_device": 5}
+            host._sync_active_preset()
+
+        host, calls, logs = self._run(settings, True, run)
+        self.assertFalse(any("缺" in m for m in logs))
         self.assertEqual(settings["active_preset_id"], "p1")
-        self.assertEqual(host.stack, [host.picture_page])
-
-    def test_edit_on_already_active_preset_only_jumps(self):
-        """已经是当前预设时不该再写一遍设备。"""
-        settings = {"active_preset_id": "p1",
-                    "presets": [{"id": "p1", "name": "A", "values": {"picture_mode": 9}}]}
-
-        def run(host):
-            host.begin_preset_edit(preset_id="p1")
-
-        host, calls, _ = self._run(settings, True, run)
-        self.assertEqual(calls, [])
-        self.assertEqual(host.stack, [host.picture_page])
-
-    def test_edit_is_refused_when_disconnected(self):
-        settings = {"presets": [{"id": "p1", "name": "A", "values": {"picture_mode": 9}}]}
-
-        def run(host):
-            host.begin_preset_edit(preset_id="p1")
-
-        host, calls, _ = self._run(settings, False, run)
-        self.assertEqual(calls, [])
-        self.assertEqual(host.stack, [])
+        self.assertFalse(any(c[0] == "put" and c[1] == "picture_mode" for c in calls))
+        self.assertEqual(settings["presets"][0]["values"], {"mitv.settings.db.sound.device.output_device": 5})
 
     def test_create_preset_saves_current_values_and_activates_it(self):
         settings = {"presets": []}
@@ -1595,7 +1612,7 @@ class SoundOutputTests(unittest.TestCase):
         host._verify_after_preset_apply()
         self.assertEqual(
             refreshed,
-            [(("picturePage", "gamePage", "sourcePage"), True)],
+            [(("picturePage", "gamePage", "sourcePage", "lightPage"), True)],
         )
 
     def test_preset_snapshot_and_restore_round_trips_sound_output(self):
@@ -2252,6 +2269,194 @@ class Hdmi320AndFreeSyncTests(unittest.TestCase):
 
         host_on, _, _ = self._make_host(edid=5, fs_switch=3)
         self.assertEqual(host_on.query_setting_or_jni("freesync"), 1)
+
+
+class DisplayChangeRefreshTests(unittest.TestCase):
+    """Windows 显示变化 / HDR 变化时同时刷新画面和游戏页面。"""
+
+    def _make_host(self):
+        from mimonitor_toolbox.display_features import DisplayFeaturesMixin
+
+        refreshed = []
+        logs = []
+
+        class Host(DisplayFeaturesMixin):
+            adb_connected = True
+            _adb_busy_until = 0.0
+            _display_change_refresh_suppress_until = 0.0
+            _display_change_refresh_pending_reason = "WM_DISPLAYCHANGE"
+            _display_last_mode = None
+            _page_loading = set()
+            _page_loaded = {"picturePage", "gamePage"}
+            _hdr_memory_apply_timer = None
+            _display_change_refresh_timer = None
+            _adjust_hotkey_timers = {}
+            _cycle_hotkey_timers = {}
+
+            def _refresh_pages(self, pages, delay_ms=0, force=False):
+                refreshed.append((tuple(pages), delay_ms, force))
+
+            def log(self, msg):
+                logs.append(msg)
+
+        return Host(), refreshed, logs
+
+    def test_display_change_refresh_updates_picture_and_game_pages(self):
+        host, refreshed, _ = self._make_host()
+        host._refresh_pages_after_display_change()
+        self.assertEqual(refreshed, [(("picturePage", "gamePage"), 0, True)])
+
+        # 断开或被自身模式切换抑制时不触发
+        refreshed.clear()
+        host.adb_connected = False
+        host._refresh_pages_after_display_change()
+        host.adb_connected = True
+        host._suppress_display_change_refresh(5.0)
+        host._refresh_pages_after_display_change()
+        self.assertEqual(refreshed, [])
+
+    def test_hdr_change_refresh_updates_both_picture_and_game_pages(self):
+        host, refreshed, _ = self._make_host()
+        host._refresh_picture_data_after_hdr_change()
+        self.assertEqual(refreshed, [(("picturePage", "gamePage"), 0, True)])
+
+    def test_display_mode_poll_skips_baseline_and_refreshes_on_change(self):
+        host, _, _ = self._make_host()
+        scheduled = []
+        host._schedule_display_change_refresh = (
+            lambda reason="windows_event", delay_ms=900: scheduled.append((reason, delay_ms))
+        )
+
+        # 首次检测到分辨率/刷新率只是建立基线，不触发刷新
+        host._reconcile_display_mode_state((3840, 2160, 160))
+        self.assertEqual(scheduled, [])
+
+        # 同模式下不重复触发
+        host._reconcile_display_mode_state((3840, 2160, 160))
+        self.assertEqual(scheduled, [])
+
+        # OSD 或系统切换导致刷新率/分辨率变化时触发刷新
+        host._reconcile_display_mode_state((1920, 1080, 320))
+        self.assertEqual(scheduled, [("显示模式变化", 200)])
+
+
+class FullPresetIntegrationTests(unittest.TestCase):
+    """全功能预设：手动修改各非画面页设置触发预设自动同步，以及预设期间暂停准星记忆。"""
+
+    def _make_sync_host(self):
+        from mimonitor_toolbox.display_features import DisplayFeaturesMixin
+
+        noted = []
+        refreshed = []
+
+        class FakeAdb:
+            def transaction(self):
+                return nullcontext()
+
+            def get(self, _key, check=False):
+                return "29"
+
+            def put(self, _k, _v, check=False):
+                pass
+
+            def shell(self, _cmd, check=False):
+                return ""
+
+            def jni_set(self, _k, _v, upd=3, check=False):
+                pass
+
+            def refresh_pq(self, check=False):
+                pass
+
+            def set_media_volume(self, *_args, **_kwargs):
+                pass
+
+            def set_media_muted(self, *_args, **_kwargs):
+                pass
+
+            def colorful_led(self, *_args, **_kwargs):
+                pass
+
+        class Host(DisplayFeaturesMixin):
+            adb_connected = True
+            adb = FakeAdb()
+            current_vals = {
+                "picture_mode": 10,
+                "mode_320": 0,
+                "front_sight_index": 0,
+                "volume_music_speaker": 40,
+                "media_muted": 0,
+                "atmosphere_light_switcher_pm2": 4,
+            }
+            _control_rollback_values = {}
+            _adjust_hotkey_pending = {}
+            _adjust_hotkey_timers = {}
+            _adjust_hotkey_resolving = set()
+            _page_loaded = {"picturePage", "gamePage", "sourcePage", "lightPage"}
+            _display_change_refresh_suppress_until = 0.0
+            values_signal = SimpleNamespace(emit=lambda _d: None)
+            logs = []
+
+            def check_connection(self):
+                return True
+
+            def _mark_adb_busy(self, _seconds=2.0):
+                pass
+
+            def _run_adb_action(self, _label, operation, success, failure=None):
+                operation()
+                success()
+
+            def _optimistic_highlight(self, _k, _v):
+                pass
+
+            def _refresh_pages(self, pages, delay_ms=0, force=False):
+                refreshed.append((tuple(pages), delay_ms, force))
+
+            def _note_picture_change(self):
+                noted.append(True)
+
+            def log(self, msg):
+                self.logs.append(msg)
+
+        return Host(), noted
+
+    def test_manual_changes_across_game_menu_audio_light_note_picture_change(self):
+        host, noted = self._make_sync_host()
+
+        host._320(True)
+        host._set_game_feature("front_sight_index", 2, "准星: 2")
+        host._set("monitor_menu_fps_counter", 1, "FPS: 刷新率")
+        host.set_media_volume(55)
+        host.toggle_media_mute(muted=True)
+        host._set_screen_light_mode(2, "纯色")
+        self.assertEqual(len(noted), 6)
+
+        # 输入源切换不应触发预设保存
+        host.source_label = SimpleNamespace(setText=lambda _t: None)
+        host._source_names = {29: "DP"}
+        host._start_source_polling = lambda: None
+        host._set("mitv.tvplayer.hdmi.last.source", 29, "切源")
+        self.assertEqual(len(noted), 6)
+
+    def test_crosshair_memory_suspended_while_preset_active(self):
+        from mimonitor_toolbox.display_features import DisplayFeaturesMixin
+
+        writes = []
+
+        class Host(DisplayFeaturesMixin):
+            adb_connected = True
+            adb = SimpleNamespace(put=lambda k, v, check=False: writes.append((k, v)))
+            current_vals = {"picture_mode": 14, "front_sight_index": 2}
+
+            def memories_suspended_by_preset(self):
+                return True
+
+            def _crosshair_game_mode_only_enabled(self):
+                return True
+
+        Host()._reconcile_crosshair_mode_state()
+        self.assertEqual(writes, [])
 
 
 if __name__ == "__main__":

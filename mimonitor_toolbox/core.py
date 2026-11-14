@@ -50,10 +50,37 @@ def _as_list_of_dicts(raw):
     return [item for item in raw if isinstance(item, dict)]
 
 
+# 「无预设」不是真预设，用一个不会和 new_id 生成的 id 撞车的保留值。
+BASELINE_PRESET_ID = "__baseline__"
+TRAY_PRESET_LIMIT = 4
+
+
+def normalize_tray_preset_ids(raw_ids, presets=None):
+    """规范化托盘预设 id 列表：过滤无效 id、去重并限制最多 4 个。"""
+    if not isinstance(raw_ids, (list, tuple)):
+        return []
+    valid = {BASELINE_PRESET_ID}
+    if isinstance(presets, list):
+        for preset in presets:
+            if isinstance(preset, dict) and isinstance(preset.get("id"), str):
+                valid.add(preset["id"])
+    seen = set()
+    normalized = []
+    for preset_id in raw_ids:
+        if not isinstance(preset_id, str) or preset_id not in valid or preset_id in seen:
+            continue
+        seen.add(preset_id)
+        normalized.append(preset_id)
+        if len(normalized) >= TRAY_PRESET_LIMIT:
+            break
+    return normalized
+
+
 def _load_settings_unlocked():
     defaults = {
         "close_behavior": "tray",
         "never_ask_close": False,
+        "never_show_preset_edit_merged_notice": False,
         "saved_ip": "",
         # 扫描网卡的高级覆盖：Hyper-V 外部虚拟交换机把物理网卡的 IP 搬到了
         # vEthernet 上（物理网卡会"非物理网卡"式地被过滤掉），这两项可以点名
@@ -70,6 +97,7 @@ def _load_settings_unlocked():
         "crosshair_game_mode_only": True,
         "crosshair_memory": None,
         "tray_items": ["picture_mode", "local_dimming", "backlight"],
+        "tray_presets": [],
         "hotkey_countdown_enabled": True,
         "hotkey_countdown_seconds": 0.8,
         "show_volume_osd": False,
@@ -106,6 +134,7 @@ def _load_settings_unlocked():
         "hdr": memory.get("hdr"),
     }
     merged["presets"] = _as_list_of_dicts(merged.get("presets"))
+    merged["tray_presets"] = normalize_tray_preset_ids(merged.get("tray_presets"), merged["presets"])
     merged["auto_tasks"] = _as_list_of_dicts(merged.get("auto_tasks"))
     snapshot = merged.get("preset_snapshot")
     merged["preset_snapshot"] = snapshot if isinstance(snapshot, dict) else None
@@ -324,6 +353,53 @@ GAME_FEATURE_KEYS = (
     "mt_game_scope",
     "mt_game_scope_night",
 )
+MONITOR_MENU_KEYS = (
+    "monitor_menu_fps_counter",
+    "monitor_menu_stopwatch",
+    "monitor_menu_timer",
+)
+SCREEN_LIGHT_KEYS = (
+    "atmosphere_light_switcher_pm2",
+    "atmosphere_light_illumination",
+    "atmosphere_light_color_temp",
+    "atmosphere_light_color_value",
+)
+SCREEN_LIGHT_DEFAULTS = {
+    "atmosphere_light_switcher_pm2": 4,
+    "atmosphere_light_illumination": 9,
+    "atmosphere_light_color_temp": 1,
+    "atmosphere_light_color_value": 0,
+}
+
+
+def write_screen_light_values(adb, mode, illumination, color_temp, color_value):
+    """写入屏幕灯四项 Settings 并通过 ColorfulLedTool 立即生效。"""
+    mode = int(mode)
+    illumination = int(illumination)
+    color_temp = int(color_temp)
+    color_value = int(color_value)
+    if mode not in {0, 1, 2, 3, 4}:
+        raise ValueError(f"屏幕灯模式 {mode} 超出 0-4")
+    if not 0 <= illumination <= 14:
+        raise ValueError(f"屏幕灯亮度 {illumination} 超出 0-14")
+    if color_temp not in {0, 1, 2}:
+        raise ValueError(f"屏幕灯色温 {color_temp} 超出 0-2")
+    if not 0 <= color_value <= 4:
+        raise ValueError(f"屏幕灯颜色 {color_value} 超出 0-4")
+    adb.put("atmosphere_light_switcher_pm2", str(mode), check=True)
+    adb.put("atmosphere_light_illumination", str(illumination), check=True)
+    adb.put("atmosphere_light_color_temp", str(color_temp), check=True)
+    adb.put("atmosphere_light_color_value", str(color_value), check=True)
+    if mode == 0:
+        adb.colorful_led("lighting", illumination, color_temp, check=True)
+    elif mode == 1:
+        adb.colorful_led("ambient", check=True)
+    elif mode == 2:
+        adb.colorful_led("solid", illumination, color_value, check=True)
+    elif mode == 3:
+        adb.colorful_led("cycle", check=True)
+    else:
+        adb.colorful_led("off", check=True)
 GAME_PICTURE_MODES = frozenset(PICTURE_MODE_GROUPS[10]) | {4, 15, 19}
 
 MEMC_SETTINGS_KEY = "tv_picture_advance_video_mjc_effect"

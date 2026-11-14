@@ -65,8 +65,14 @@ from .core import (
 from .network_scan import enumerate_windows_adapter_addresses
 from .presets import (
     BASELINE_PRESET_ID,
+    PRESET_OPTION_GROUPS,
+    TRAY_PRESET_LIMIT,
+    can_enable_tray_preset,
+    filter_values_by_preset_options,
     find_preset,
     new_id,
+    normalize_preset_options,
+    normalize_tray_preset_ids,
     preset_sound_output_label,
     unique_name,
 )
@@ -82,6 +88,7 @@ from .widgets import (
     PageScrollSlider,
     PresetCard,
     PresetNameDialog,
+    PresetOptionsDialog,
     RefreshableComboBox,
     ScanSettingsDialog,
     TrayItemList,
@@ -868,6 +875,27 @@ class PagesMixin:
                 child.setParent(None)
                 child.deleteLater()
 
+    def _tray_preset_ids(self, presets=None):
+        settings = load_settings()
+        preset_list = settings.get("presets") if presets is None else presets
+        return normalize_tray_preset_ids(settings.get("tray_presets"), preset_list)
+
+    def _tray_card_options(self, preset_id, presets=None, tray_ids=None):
+        """构造 PresetCard 托盘开关参数，避免基准卡与普通预设卡重复判定。"""
+        preset_list = self._preset_list() if presets is None else presets
+        enabled_ids = self._tray_preset_ids(preset_list) if tray_ids is None else tray_ids
+        in_tray = preset_id in enabled_ids
+        can_enable = can_enable_tray_preset(preset_id, enabled_ids, preset_list)
+        tooltip = (
+            "" if (in_tray or can_enable)
+            else f"托盘最多添加 {TRAY_PRESET_LIMIT} 个预设，请先关闭一个已有选项"
+        )
+        return {
+            "in_tray": in_tray,
+            "tray_toggle_enabled": in_tray or can_enable,
+            "tray_tooltip": tooltip,
+        }
+
     def _make_baseline_card(self, parent, active):
         """「无预设」= 不用任何预设的普通状态。
 
@@ -876,11 +904,11 @@ class PagesMixin:
         """
         snapshot = load_settings().get("preset_snapshot")
         has_snapshot = bool(isinstance(snapshot, dict) and snapshot.get("values"))
-        # 文案保持一行 —— 卡片只有 240×140，带换行会撑出卡片外
         caption = "不使用任何预设"
         card = PresetCard(BASELINE_PRESET_ID, "无预设", caption, parent,
                           apply_enabled=has_snapshot, editable=False,
-                          active=active, managed=False)
+                          active=active, managed=False,
+                          **self._tray_card_options(BASELINE_PRESET_ID))
         if has_snapshot:
             source = snapshot.get("source") or "预设"
             card.setToolTip(f"点「应用」退回套用「{source}」之前的状态\n"
@@ -888,22 +916,44 @@ class PagesMixin:
         else:
             card.setToolTip("还没有可退回的状态")
         card.apply_requested.connect(lambda _pid: self._preset_restore_baseline())
+        card.tray_toggled.connect(self._preset_toggle_tray)
         return card
 
     def _make_preset_card(self, preset, parent, active=False):
         preset_id = preset.get("id")
-        values = preset.get("values") or {}
+        options = normalize_preset_options(preset.get("options"))
+        values = filter_values_by_preset_options(preset.get("values") or {}, options)
         caption = f"{len(values)} 项设置"
+        enabled_groups = sum(1 for v in options.values() if v)
+        if enabled_groups < len(PRESET_OPTION_GROUPS):
+            caption = f"{caption} · 已选 {enabled_groups}/{len(PRESET_OPTION_GROUPS)} 类"
         sound_label = preset_sound_output_label(values)
         if sound_label:
             caption = f"{caption} · 声音: {sound_label}"
         card = PresetCard(preset_id, preset.get("name") or preset_id,
-                          caption, parent, active=active)
+                          caption, parent, active=active,
+                          **self._tray_card_options(preset_id))
         card.apply_requested.connect(self._preset_apply)
-        card.edit_requested.connect(self._preset_edit)
+        card.options_requested.connect(self._preset_options)
         card.rename_requested.connect(self._preset_rename)
         card.delete_requested.connect(self._preset_delete)
+        card.tray_toggled.connect(self._preset_toggle_tray)
         return card
+
+    def _preset_toggle_tray(self, preset_id, enabled):
+        presets = self._preset_list()
+        tray_ids = self._tray_preset_ids(presets)
+        if enabled:
+            if not can_enable_tray_preset(preset_id, tray_ids, presets):
+                self.log(f"托盘最多添加 {TRAY_PRESET_LIMIT} 个预设")
+                self._preset_sync()
+                return
+            if preset_id not in tray_ids:
+                tray_ids.append(preset_id)
+        else:
+            tray_ids = [item for item in tray_ids if item != preset_id]
+        update_settings({"tray_presets": tray_ids})
+        self._preset_sync()
 
     @staticmethod
     def _task_time(task, key, fallback):
@@ -1091,8 +1141,21 @@ class PagesMixin:
             return
         self.create_preset_from_current(name)
 
-    def _preset_edit(self, preset_id):
-        self.begin_preset_edit(preset_id=preset_id)
+    def _preset_options(self, preset_id):
+        preset = find_preset(self._preset_list(), preset_id)
+        if preset is None:
+            return
+        dialog = PresetOptionsDialog(
+            preset.get("name") or preset_id,
+            preset.get("options"),
+            self,
+        )
+        accepted = dialog.exec()
+        options = dialog.options() if accepted else None
+        dialog.deleteLater()
+        if not accepted:
+            return
+        self.update_preset_options(preset_id, options)
 
     def _preset_rename(self, preset_id):
         presets = self._preset_list()
@@ -1119,7 +1182,9 @@ class PagesMixin:
         box.deleteLater()
         if not accepted:
             return
-        changes = {"presets": [p for p in self._preset_list() if p.get("id") != preset_id]}
+        presets = [p for p in self._preset_list() if p.get("id") != preset_id]
+        tray_ids = [i for i in self._tray_preset_ids(presets) if i != preset_id]
+        changes = {"presets": presets, "tray_presets": tray_ids}
         if self.active_preset_id() == preset_id:
             changes["active_preset_id"] = None
         update_settings(changes)
@@ -1298,9 +1363,8 @@ class PagesMixin:
 
         layout.addWidget(SubtitleLabel("预设模式", container))
         hint = CaptionLabel(
-            "「无预设」表示不使用任何预设；正在使用的预设会标上「已应用」，"
-            "此时在画面设置或声音输出中的改动会自动保存进它。"
-            "点「编辑」进入预览，顶部悬浮条上完成或取消。",
+            "「无预设」表示不使用任何预设；应用某个预设后，它在画面、游戏、屏幕灯或音频中的改动会自动保存进它；"
+            "点击「选项」可选择该预设要保存和接管的大项范围。",
             container,
         )
         hint.setWordWrap(True)

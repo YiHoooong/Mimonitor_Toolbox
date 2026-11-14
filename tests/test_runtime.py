@@ -742,6 +742,30 @@ class StateMachineTests(unittest.TestCase):
         self.assertEqual(calls, ["resume"])
         self.assertIsNotNone(qapp)
 
+    def test_native_display_change_schedules_hdr_check_and_display_refresh(self):
+        qapp = QApplication.instance() or QApplication([])
+        window = main_window.App.__new__(main_window.App)
+        calls = []
+        window._schedule_hdr_memory_check = lambda reason="manual", delay_ms=500: calls.append(("hdr", reason, delay_ms))
+        window._schedule_display_change_refresh = lambda reason="windows_event", delay_ms=900: calls.append(("display", reason, delay_ms))
+        message = ctypes.wintypes.MSG()
+        message.message = main_window.WM_DISPLAYCHANGE
+
+        with mock.patch.object(main_window.sys, "platform", "win32"), \
+                mock.patch.object(main_window, "user32", object()), \
+                mock.patch.object(main_window.FluentWindow, "nativeEvent", return_value=(False, 0)):
+            result = window.nativeEvent(
+                b"windows_generic_MSG",
+                ctypes.addressof(message),
+            )
+
+        self.assertEqual(result, (False, 0))
+        self.assertEqual(
+            calls,
+            [("hdr", "windows_event", 600), ("display", "WM_DISPLAYCHANGE", 900)],
+        )
+        self.assertIsNotNone(qapp)
+
     def test_non_game_feature_cancel_restores_memory_without_adb_action(self):
         dialogs = []
         highlights = []

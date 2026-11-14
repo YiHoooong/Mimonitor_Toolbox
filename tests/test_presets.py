@@ -36,14 +36,45 @@ class FakeAdb:
     def set_sound_output(self, device_id, check=False):
         self._record("set_sound_output", device_id, check)
 
+    def set_media_volume(self, value, unmute_first=False, show_ui=False, check=False):
+        self._record("set_media_volume", value, unmute_first, show_ui, check)
+
+    def set_media_muted(self, muted, show_ui=False, check=False):
+        self._record("set_media_muted", muted, show_ui, check)
+
+    def colorful_led(self, action, *args, check=False):
+        self._record("colorful_led", action, *args, check)
+
     def check_and_heal_jar(self):
         self._record("check_and_heal_jar")
 
 
-def full_values(mode=14, color_temp=1, light_sensor=0, freesync=0, sound_output=8, memc=2):
-    """一套完整可用的值（含 FreeSync、声音输出与运动补偿 —— 均在预设范围内）。"""
+def full_values(
+    mode=14,
+    color_temp=1,
+    light_sensor=0,
+    freesync=0,
+    mode_320=0,
+    sound_output=8,
+    memc=2,
+    front_sight_index=0,
+    mt_game_dynamic_ft=0,
+    mt_game_scope=0,
+    mt_game_scope_night=0,
+    monitor_menu_fps_counter=0,
+    monitor_menu_stopwatch=0,
+    monitor_menu_timer=0,
+    volume_music_speaker=50,
+    media_muted=0,
+    screen_light_mode=4,
+    screen_light_illumination=9,
+    screen_light_color_temp=1,
+    screen_light_color_value=0,
+):
+    """一套完整可用的值（含画面、320Hz/FreeSync、游戏工具、菜单工具、音频与屏幕灯）。"""
     return {
         "freesync": freesync,
+        "mode_320": mode_320,
         "mitv.settings.db.sound.device.output_device": sound_output,
         "picture_mode": mode,
         "tv_picture_light_sensor": light_sensor,
@@ -67,6 +98,19 @@ def full_values(mode=14, color_temp=1, light_sensor=0, freesync=0, sound_output=
         "picture_response_time": 3,
         "tv_picture_advanced_video_color_space": 6,
         "tv_picture_video_color_space": 6,
+        "front_sight_index": front_sight_index,
+        "mt_game_dynamic_ft": mt_game_dynamic_ft,
+        "mt_game_scope": mt_game_scope,
+        "mt_game_scope_night": mt_game_scope_night,
+        "monitor_menu_fps_counter": monitor_menu_fps_counter,
+        "monitor_menu_stopwatch": monitor_menu_stopwatch,
+        "monitor_menu_timer": monitor_menu_timer,
+        "volume_music_speaker": volume_music_speaker,
+        "media_muted": media_muted,
+        "atmosphere_light_switcher_pm2": screen_light_mode,
+        "atmosphere_light_illumination": screen_light_illumination,
+        "atmosphere_light_color_temp": screen_light_color_temp,
+        "atmosphere_light_color_value": screen_light_color_value,
     }
 
 
@@ -78,13 +122,16 @@ class WriteOrderTests(unittest.TestCase):
     """
 
     def test_freesync_is_written_before_picture_mode(self):
-        """FreeSync 开着会把设备锁在游戏模式，必须先把它设成目标值，
-        否则后面写的画面模式会被顶掉。"""
+        """FreeSync 与 320Hz 会切 EDID / 牵动模式锁定，必须都排在画面模式之前。"""
         from mimonitor_toolbox import presets
 
         ids = [item.id for item in presets.PICTURE_ITEMS]
         self.assertEqual(ids[0], "freesync")
-        self.assertEqual(ids[1], "picture_mode")
+        self.assertEqual(ids[1], "mode_320")
+        self.assertEqual(ids[2], "picture_mode")
+        self.assertLess(ids.index("front_sight_index"), ids.index("mt_game_dynamic_ft"))
+        self.assertLess(ids.index("mt_game_scope"), ids.index("mt_game_scope_night"))
+        self.assertLess(ids.index("volume_music_speaker"), ids.index("media_muted"))
 
     def test_freesync_written_before_picture_mode_on_the_wire(self):
         from mimonitor_toolbox import presets
@@ -110,7 +157,9 @@ class WriteOrderTests(unittest.TestCase):
             i for i, call in enumerate(adb.calls)
             if call[0] in ("put", "jni_set")
             and call[1] != "picture_mode"
-            and "freesync" not in call[1] and "adaptive_sync" not in call[1]
+            and "freesync" not in call[1]
+            and "adaptive_sync" not in call[1]
+            and "edid_version" not in call[1]
         ]
         self.assertTrue(other_writes)
         self.assertLess(mode_index, min(other_writes))
@@ -461,13 +510,17 @@ class FreeSyncPresetTests(unittest.TestCase):
                     return {"g_fusion_picture__hdmi_edid_version": self.edid}
                 return {}
 
+        legacy_fs_on = full_values(freesync=1)
+        legacy_fs_on.pop("mode_320")
         adb_on = EdidAwareAdb(edid=6)
-        presets.PICTURE_ITEMS[0].apply(adb_on, full_values(freesync=1))
+        presets.PICTURE_ITEMS[0].apply(adb_on, legacy_fs_on)
         self.assertIn(("jni_set", "g_video__freesync_switch", 3, 3, True), adb_on.calls)
         self.assertIn(("jni_set", "g_fusion_picture__hdmi_edid_version", 5, 3, True), adb_on.calls)
 
+        legacy_fs_off = full_values(freesync=0)
+        legacy_fs_off.pop("mode_320")
         adb_off = EdidAwareAdb(edid=5)
-        presets.PICTURE_ITEMS[0].apply(adb_off, full_values(freesync=0))
+        presets.PICTURE_ITEMS[0].apply(adb_off, legacy_fs_off)
         self.assertIn(("jni_set", "g_video__freesync_switch", 0, 3, True), adb_off.calls)
         self.assertIn(("jni_set", "g_fusion_picture__hdmi_edid_version", 6, 3, True), adb_off.calls)
 
@@ -616,6 +669,289 @@ class MemcPresetTests(unittest.TestCase):
         adb_bad = FakeAdb()
         res_bad = presets.apply_preset(adb_bad, full_values(mode=9, memc=5))
         self.assertIn("运动补偿", [name for name, _ in res_bad.failed])
+
+
+class TrayPresetConfigTests(unittest.TestCase):
+    """托盘预设列表规范化、4 项上限与菜单展示顺序。"""
+
+    def test_normalize_deduplicates_filters_invalid_and_caps_at_limit(self):
+        from mimonitor_toolbox import presets
+
+        all_presets = [
+            {"id": f"p{i}", "name": f"预设{i}", "values": {}} for i in range(1, 7)
+        ]
+        raw = [
+            "p2",
+            "missing",
+            "p2",
+            presets.BASELINE_PRESET_ID,
+            "p1",
+            "p3",
+            "p4",
+        ]
+        normalized = presets.normalize_tray_preset_ids(raw, all_presets)
+        self.assertEqual(
+            normalized,
+            ["p2", presets.BASELINE_PRESET_ID, "p1", "p3"],
+        )
+
+    def test_can_enable_and_menu_order_put_baseline_first(self):
+        from mimonitor_toolbox import presets
+
+        all_presets = [
+            {"id": f"p{i}", "name": f"预设{i}", "values": {}} for i in range(1, 6)
+        ]
+        tray_ids = ["p3", "p1", "p2", presets.BASELINE_PRESET_ID]
+        self.assertFalse(presets.can_enable_tray_preset("p4", tray_ids, all_presets))
+        self.assertFalse(presets.can_enable_tray_preset("missing", tray_ids, all_presets))
+        self.assertTrue(presets.can_enable_tray_preset("p1", tray_ids, all_presets))
+        self.assertEqual(
+            [item["id"] for item in presets.tray_presets_for_menu(tray_ids, all_presets)],
+            [presets.BASELINE_PRESET_ID, "p1", "p2", "p3"],
+        )
+
+
+class Mode320PresetTests(unittest.TestCase):
+    """320Hz 竞技模式纳入预设：HDMI 联动 FreeSync、DP/USB-C 写 dp_edid_version。"""
+
+    def test_hdmi_simultaneous_320_and_freesync_writes_edid_5_in_one_step(self):
+        from mimonitor_toolbox import presets
+
+        class StatefulHdmiAdb(FakeAdb):
+            def __init__(self):
+                super().__init__(source="23")
+                self.edid = 4
+                self.fs = 0
+
+            def jni_batch_get_or_single(self, keys, check=False):
+                out = {}
+                if "g_fusion_picture__hdmi_edid_version" in keys:
+                    out["g_fusion_picture__hdmi_edid_version"] = self.edid
+                if "g_video__freesync_switch" in keys:
+                    out["g_video__freesync_switch"] = self.fs
+                return out
+
+            def jni_set(self, key, val, upd=3, check=False):
+                super().jni_set(key, val, upd=upd, check=check)
+                if key == "g_fusion_picture__hdmi_edid_version":
+                    self.edid = val
+                elif key == "g_video__freesync_switch":
+                    self.fs = val
+
+        adb = StatefulHdmiAdb()
+        result = presets.apply_preset(adb, full_values(mode=10, freesync=1, mode_320=1))
+        self.assertIn("FreeSync", result.applied)
+        self.assertIn("320Hz 竞技模式", result.applied)
+        edid_writes = [c for c in adb.calls if c[0] == "jni_set" and c[1] == "g_fusion_picture__hdmi_edid_version"]
+        self.assertEqual(edid_writes, [("jni_set", "g_fusion_picture__hdmi_edid_version", 5, 3, True)])
+
+    def test_mode_320_only_preserves_existing_freesync_on_hdmi(self):
+        from mimonitor_toolbox import presets
+
+        class EdidAdb(FakeAdb):
+            def jni_batch_get_or_single(self, keys, check=False):
+                return {
+                    "g_fusion_picture__hdmi_edid_version": 2,
+                    "g_video__freesync_switch": 3,
+                }
+
+        values = full_values(mode_320=1)
+        values.pop("freesync")
+        adb = EdidAdb(source="23")
+        result = presets.apply_preset(adb, values)
+        self.assertIn("320Hz 竞技模式", result.applied)
+        self.assertIn("FreeSync", [name for name, _ in result.skipped])
+        self.assertIn(("jni_set", "g_fusion_picture__hdmi_edid_version", 5, 3, True), adb.calls)
+
+    def test_dp_uses_dp_edid_version_and_invalid_value_fails(self):
+        from mimonitor_toolbox import presets
+
+        adb = FakeAdb(source="29")
+        res = presets.apply_preset(adb, full_values(mode_320=1))
+        self.assertIn("320Hz 竞技模式", res.applied)
+        self.assertIn(("jni_set", "g_fusion_picture__dp_edid_version", 3, 3, True), adb.calls)
+
+        adb_bad = FakeAdb(source="29")
+        res_bad = presets.apply_preset(adb_bad, full_values(mode_320=99))
+        self.assertIn("320Hz 竞技模式", [name for name, _ in res_bad.failed])
+
+
+class GameFeatureAndMonitorMenuPresetTests(unittest.TestCase):
+    """游戏页覆盖层（含依赖/模式守护与非游戏模式清零）及显示器菜单工具预设测试。"""
+
+    def test_game_overlays_apply_in_game_mode_with_dependencies(self):
+        from mimonitor_toolbox import presets
+
+        adb = FakeAdb()
+        result = presets.apply_preset(
+            adb,
+            full_values(
+                mode=10,
+                front_sight_index=3,
+                mt_game_dynamic_ft=1,
+                mt_game_scope=5,
+                mt_game_scope_night=1,
+                monitor_menu_fps_counter=2,
+                monitor_menu_stopwatch=1,
+                monitor_menu_timer=300,
+            ),
+        )
+        for label in ("准星", "动态准星", "狙击镜", "狙击镜夜视", "FPS 计数器", "秒表", "定时器"):
+            self.assertIn(label, result.applied)
+        self.assertIn(("put", "front_sight_index", "3", True), adb.calls)
+        self.assertIn(("put", "mt_game_dynamic_ft", "1", True), adb.calls)
+        self.assertIn(("put", "mt_game_scope", "5", True), adb.calls)
+        self.assertIn(("put", "mt_game_scope_night", "1", True), adb.calls)
+        self.assertIn(("put", "monitor_menu_fps_counter", "2", True), adb.calls)
+        self.assertIn(("put", "monitor_menu_stopwatch", "1", True), adb.calls)
+        self.assertIn(("put", "monitor_menu_timer", "300", True), adb.calls)
+
+    def test_non_game_mode_skips_nonzero_overlays_but_clears_zero_and_runs_menu_tools(self):
+        from mimonitor_toolbox import presets
+
+        adb = FakeAdb()
+        result = presets.apply_preset(
+            adb,
+            full_values(
+                mode=14,
+                front_sight_index=2,
+                mt_game_dynamic_ft=1,
+                mt_game_scope=0,
+                mt_game_scope_night=0,
+                monitor_menu_fps_counter=1,
+            ),
+        )
+        skipped = dict(result.skipped)
+        self.assertIn("准星", skipped)
+        self.assertIn("动态准星", skipped)
+        self.assertIn("狙击镜", result.applied)
+        self.assertIn("狙击镜夜视", result.applied)
+        self.assertIn("FPS 计数器", result.applied)
+        self.assertIn(("put", "mt_game_scope", "0", True), adb.calls)
+        self.assertIn(("put", "monitor_menu_fps_counter", "1", True), adb.calls)
+        self.assertNotIn(("put", "front_sight_index", "2", True), adb.calls)
+
+    def test_dependent_game_overlay_skipped_when_parent_off_in_game_mode(self):
+        from mimonitor_toolbox import presets
+
+        adb = FakeAdb()
+        result = presets.apply_preset(
+            adb,
+            full_values(
+                mode=10,
+                front_sight_index=0,
+                mt_game_dynamic_ft=1,
+                mt_game_scope=0,
+                mt_game_scope_night=1,
+            ),
+        )
+        skipped = dict(result.skipped)
+        self.assertIn("动态准星", skipped)
+        self.assertIn("狙击镜夜视", skipped)
+
+    def test_invalid_game_or_menu_value_reports_failure(self):
+        from mimonitor_toolbox import presets
+
+        adb = FakeAdb()
+        result = presets.apply_preset(adb, full_values(mode=14, monitor_menu_timer=45))
+        self.assertIn("定时器", [name for name, _ in result.failed])
+
+
+class AudioAndScreenLightPresetTests(unittest.TestCase):
+    """音量/静音排序、校验及屏幕灯五种模式预设下发测试。"""
+
+    def test_volume_written_before_mute_without_osd_ui(self):
+        from mimonitor_toolbox import presets
+
+        adb = FakeAdb()
+        result = presets.apply_preset(adb, full_values(volume_music_speaker=35, media_muted=1))
+        self.assertIn("音量", result.applied)
+        self.assertIn("静音", result.applied)
+        vol_call = ("set_media_volume", 35, False, False, True)
+        mute_call = ("set_media_muted", True, False, True)
+        self.assertIn(vol_call, adb.calls)
+        self.assertIn(mute_call, adb.calls)
+        self.assertLess(adb.calls.index(vol_call), adb.calls.index(mute_call))
+
+    def test_screen_light_modes_write_settings_and_colorful_led(self):
+        from mimonitor_toolbox import presets
+
+        cases = [
+            (0, 7, 2, 1, ("colorful_led", "lighting", 7, 2, True)),
+            (1, 7, 2, 1, ("colorful_led", "ambient", True)),
+            (2, 11, 0, 3, ("colorful_led", "solid", 11, 3, True)),
+            (3, 7, 2, 1, ("colorful_led", "cycle", True)),
+            (4, 9, 1, 0, ("colorful_led", "off", True)),
+        ]
+        for mode, illum, temp, color_val, expected_led in cases:
+            adb = FakeAdb()
+            result = presets.apply_preset(
+                adb,
+                full_values(
+                    screen_light_mode=mode,
+                    screen_light_illumination=illum,
+                    screen_light_color_temp=temp,
+                    screen_light_color_value=color_val,
+                ),
+            )
+            self.assertIn("屏幕灯", result.applied)
+            self.assertIn(("put", "atmosphere_light_switcher_pm2", str(mode), True), adb.calls)
+            self.assertIn(expected_led, adb.calls)
+
+    def test_invalid_audio_or_light_values_fail(self):
+        from mimonitor_toolbox import presets
+
+        adb = FakeAdb()
+        result = presets.apply_preset(
+            adb,
+            full_values(volume_music_speaker=120, media_muted=2, screen_light_mode=9),
+        )
+        failed = {name for name, _ in result.failed}
+        self.assertEqual(failed, {"音量", "静音", "屏幕灯"})
+
+
+class PresetOptionsGroupTests(unittest.TestCase):
+    """预设大项「选项」筛选：默认全开、未选大项裁剪与跳过、picture 关闭时不报缺项。"""
+
+    def test_normalize_and_filter_respects_enabled_groups(self):
+        from mimonitor_toolbox import presets
+
+        self.assertEqual(
+            [gid for gid, _, _ in presets.PRESET_OPTION_GROUPS],
+            ["picture", "display_sync", "game_tools", "screen_light", "audio"],
+        )
+        self.assertEqual(
+            dict((gid, lbl) for gid, lbl, _ in presets.PRESET_OPTION_GROUPS)["screen_light"],
+            "屏幕灯",
+        )
+        self.assertTrue(all(presets.normalize_preset_options(None).values()))
+
+        vals = full_values(freesync=1, mode_320=1, front_sight_index=2, screen_light_mode=2, volume_music_speaker=30)
+        opts = {"picture": False, "display_sync": True, "game_tools": False, "screen_light": True, "audio": False}
+        filtered = presets.filter_values_by_preset_options(vals, opts)
+        self.assertIn("freesync", filtered)
+        self.assertIn("mode_320", filtered)
+        self.assertIn("atmosphere_light_switcher_pm2", filtered)
+        self.assertNotIn("picture_mode", filtered)
+        self.assertNotIn("front_sight_index", filtered)
+        self.assertNotIn("volume_music_speaker", filtered)
+        self.assertEqual(presets.missing_keys(filtered, options=opts), [])
+
+    def test_apply_preset_skips_unchecked_groups_without_failing(self):
+        from mimonitor_toolbox import presets
+
+        opts = {"picture": False, "display_sync": True, "game_tools": False, "screen_light": True, "audio": False}
+        filtered = presets.filter_values_by_preset_options(
+            full_values(freesync=1, mode_320=1, screen_light_mode=2),
+            opts,
+        )
+        adb = FakeAdb(source="29")
+        result = presets.apply_preset(adb, filtered, options=opts)
+        self.assertEqual(result.failed, [])
+        self.assertEqual(set(result.applied), {"FreeSync", "320Hz 竞技模式", "屏幕灯"})
+        self.assertTrue(any("未启用「画面参数」" in reason for _, reason in result.skipped))
+        self.assertFalse(any(c[0] == "put" and c[1] == "picture_mode" for c in adb.calls))
+        self.assertFalse(any(c[0] == "set_media_volume" for c in adb.calls))
 
 
 if __name__ == "__main__":

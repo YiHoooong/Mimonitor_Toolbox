@@ -364,8 +364,8 @@ def query_windows_hdr_enabled(*, target_device_name=None):
         return None
 
 
-def query_windows_display_refresh_rate(device_name):
-    """查询指定 GDI 显示设备的当前 Windows 输出刷新率 (Hz)，失败或不可用时返回 None。"""
+def _query_windows_display_devmode(device_name):
+    """读取指定 GDI 显示设备的当前 DEVMODEW；失败或不可用时返回 None。"""
     if sys.platform != "win32" or not user32 or not device_name:
         return None
     try:
@@ -376,10 +376,31 @@ def query_windows_display_refresh_rate(device_name):
         dm.dmSize = ctypes.sizeof(_DEVMODEW)
         if not enum_settings(device_name, ENUM_CURRENT_SETTINGS & 0xFFFFFFFF, ctypes.byref(dm)):
             return None
-        freq = int(dm.dmDisplayFrequency)
-        return freq if freq > 1 else None
+        return dm
     except Exception:
         return None
+
+
+def query_windows_display_refresh_rate(device_name):
+    """查询指定 GDI 显示设备的当前 Windows 输出刷新率 (Hz)，失败或不可用时返回 None。"""
+    dm = _query_windows_display_devmode(device_name)
+    if dm is None:
+        return None
+    freq = int(dm.dmDisplayFrequency)
+    return freq if freq > 1 else None
+
+
+def query_windows_display_mode(device_name):
+    """查询指定显示设备的当前分辨率与刷新率签名 (width, height, hz)，不可用时返回 None。"""
+    dm = _query_windows_display_devmode(device_name)
+    if dm is None:
+        return None
+    width = int(dm.dmPelsWidth)
+    height = int(dm.dmPelsHeight)
+    freq = int(dm.dmDisplayFrequency)
+    if width <= 0 or height <= 0:
+        return None
+    return (width, height, freq if freq > 1 else None)
 
 
 def query_target_display_refresh_rate(*, configured_id=None, target_device_name=None):

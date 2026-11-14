@@ -32,6 +32,9 @@ from .adb import (
 )
 from .core import (
     GAME_FEATURE_KEYS,
+    MONITOR_MENU_KEYS,
+    SCREEN_LIGHT_DEFAULTS,
+    SCREEN_LIGHT_KEYS,
     GUARDIAN_ACCESSIBILITY,
     GUARDIAN_LEGACY_PACKAGE,
     GUARDIAN_MAIN_ACTIVITY,
@@ -1623,6 +1626,10 @@ class DeviceFeaturesMixin:
                 if w and w.objectName() == "homePage":
                     self.stackedWidget.setCurrentIndex(i)
                     return
+        if name == "presetPage" and not getattr(self, "_preset_notice_shown_this_session", False):
+            show_notice = getattr(self, "_maybe_show_preset_edit_merged_notice", None)
+            if callable(show_notice):
+                QTimer.singleShot(150, show_notice)
         if name in self._page_data_keys and name not in self._page_loaded and name not in self._page_loading:
             self._refresh_page_data(name)
 
@@ -1637,7 +1644,13 @@ class DeviceFeaturesMixin:
         """
         values = {}
         with self.adb.transaction():
-            keys_str = " ".join(PICTURE_PRESET_SETTINGS_KEYS)
+            preset_settings_keys = (
+                PICTURE_PRESET_SETTINGS_KEYS
+                + GAME_FEATURE_KEYS
+                + MONITOR_MENU_KEYS
+                + SCREEN_LIGHT_KEYS
+            )
+            keys_str = " ".join(preset_settings_keys)
             out = self.adb.shell(
                 f"for k in {keys_str}; do echo $k=$(settings get global $k); done",
                 check=True,
@@ -1659,6 +1672,18 @@ class DeviceFeaturesMixin:
             # FreeSync 也纳入预设：它开着会把设备锁在游戏模式，必须能和画面模式
             # 一起被记录、一起被还原。它没有 settings 键，且走的 MTK 键随输入源
             # 变（DP/USB-C 与 HDMI 不同），所以单独按输入源读。
+            seen_settings = {
+                line.split("=", 1)[0].strip()
+                for line in (out or "").splitlines()
+                if "=" in line
+            }
+            for k in GAME_FEATURE_KEYS + MONITOR_MENU_KEYS:
+                if k in seen_settings:
+                    values.setdefault(k, 0)
+            if "atmosphere_light_switcher_pm2" in seen_settings:
+                for k in SCREEN_LIGHT_KEYS:
+                    values.setdefault(k, SCREEN_LIGHT_DEFAULTS[k])
+
             source = self.adb.get("mitv.tvplayer.hdmi.last.source", check=True)
             fs_key = freesync_jni_key(source)
             fs_raw = self.adb.jni_batch_get_or_single([fs_key], check=True).get(fs_key)
@@ -1668,17 +1693,40 @@ class DeviceFeaturesMixin:
                     check=True,
                 ).get("g_fusion_picture__hdmi_edid_version")
                 if parse_hdmi_edid_int(edid_raw) in HDMI_EDID_KNOWN_VALUES:
-                    values["freesync"] = parse_hdmi_edid_flags(edid_raw, fs_raw)[1]
+                    mode_320_val, fs_val = parse_hdmi_edid_flags(edid_raw, fs_raw)
+                    values["mode_320"] = mode_320_val
+                    values["freesync"] = fs_val
                 elif fs_raw is not None:
                     values["freesync"] = 1 if freesync_is_on(fs_key, fs_raw) else 0
-            elif fs_raw is not None:
-                values["freesync"] = 1 if freesync_is_on(fs_key, fs_raw) else 0
+            else:
+                if fs_raw is not None:
+                    values["freesync"] = 1 if freesync_is_on(fs_key, fs_raw) else 0
+                dp_raw = self.adb.jni_batch_get_or_single(
+                    ["g_fusion_picture__dp_edid_version"],
+                    check=False,
+                ).get("g_fusion_picture__dp_edid_version")
+                try:
+                    if dp_raw is not None:
+                        values["mode_320"] = 1 if int(str(dp_raw).strip()) == 3 else 0
+                except (TypeError, ValueError):
+                    pass
 
-            # 声音输出也纳入预设与快照（不放入 PICTURE_PRESET_SETTINGS_KEYS 以保持画面页键表一致）。
+            # 声音输出、音量与静音一并纳入预设与快照（不放入 PICTURE_PRESET_SETTINGS_KEYS 以保持画面页键表一致）。
             raw_sound = self.adb.get(SOUND_OUTPUT_SETTINGS_KEY, check=True)
             sound_val = normalize_sound_output_value(raw_sound)
             if sound_val is not None:
                 values[SOUND_OUTPUT_SETTINGS_KEY] = sound_val
+            if hasattr(self.adb, "media_volume"):
+                vol = self.adb.media_volume(check=False)
+                try:
+                    if vol is not None and 0 <= int(vol) <= 100:
+                        values["volume_music_speaker"] = int(vol)
+                except (TypeError, ValueError):
+                    pass
+            if hasattr(self.adb, "media_muted"):
+                muted = self.adb.media_muted(check=False)
+                if muted is not None:
+                    values["media_muted"] = 1 if muted else 0
         return values
 
     def _refresh_page_data(self, page_name):

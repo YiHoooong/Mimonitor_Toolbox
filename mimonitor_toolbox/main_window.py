@@ -48,10 +48,12 @@ from .core import (
 from .device_features import DeviceFeaturesMixin
 from .display_features import DisplayFeaturesMixin
 from .pages import PagesMixin
+from .presets import BASELINE_PRESET_ID, tray_presets_for_menu
 from .widgets import (
     CloseConfirmDialog,
     OsdHud,
     CurrentPresetBanner,
+    PresetEditMergedNoticeDialog,
     TrayMenu,
     TrayOptionMenu,
     TraySliderCard,
@@ -174,6 +176,7 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
         self._preset_sync()
         # 顶部指示条：显示当前使用的预设（无按钮）
         self._preset_banner = CurrentPresetBanner(self)
+        self._preset_notice_shown_this_session = False
         QTimer.singleShot(0, self._update_preset_banner)
         QTimer.singleShot(0, self._update_hdr_memory_status_label)
         QTimer.singleShot(0, self._update_freesync_memory_status_label)
@@ -215,6 +218,24 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
             return []
         return [str(i) for i in ids]
 
+    def _tray_presets_for_menu(self):
+        settings = load_settings()
+        return tray_presets_for_menu(
+            settings.get("tray_presets"),
+            settings.get("presets"),
+        )
+
+    def tray_apply_preset(self, preset_id):
+        """从托盘菜单切换预设或退回无预设。"""
+        active_id = self.active_preset_id() if hasattr(self, "active_preset_id") else None
+        current_id = active_id or BASELINE_PRESET_ID
+        if preset_id == current_id:
+            return
+        if preset_id == BASELINE_PRESET_ID:
+            self._preset_restore_baseline()
+        else:
+            self._preset_apply(preset_id)
+
     def _tray_submenu_icon(self, entry_id):
         candidates = {
             "picture_mode": "VIEW", "local_dimming": "BRIGHTNESS",
@@ -241,10 +262,38 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
 
         entries = {e["id"]: e for e in self.tray_entry_catalog()}
         configured = [i for i in self._tray_item_ids() if i in entries]
-        if not configured:
+        preset_entries = self._tray_presets_for_menu()
+        if not configured and not preset_entries:
             empty = Action("还没添加快捷项，去「工具与设置」里挑几个", menu)
             empty.setEnabled(False)
             menu.addAction(empty)
+        if preset_entries:
+            preset_menu = TrayOptionMenu(
+                "预设模式", parent=menu, indicatorType=MenuIndicatorType.RADIO
+            )
+            active_id = self.active_preset_id() if hasattr(self, "active_preset_id") else None
+            selected_id = active_id or BASELINE_PRESET_ID
+            connected = bool(getattr(self, "adb_connected", False))
+            has_snapshot = bool(
+                hasattr(self, "has_preset_snapshot") and self.has_preset_snapshot()
+            )
+            preset_icon = FIF.PALETTE
+            for preset in preset_entries:
+                pid = preset["id"]
+                act = Action(preset_icon, preset["name"], preset_menu)
+                act.setCheckable(True)
+                if connected and pid == selected_id:
+                    act.setChecked(True)
+                if pid == BASELINE_PRESET_ID and active_id is not None and not has_snapshot:
+                    act.setEnabled(False)
+                act.triggered.connect(
+                    lambda _checked=False, target_id=pid: self.tray_apply_preset(target_id)
+                )
+                preset_menu.addAction(act)
+            preset_menu.setIcon(preset_icon.icon())
+            menu.addMenu(preset_menu)
+            if configured:
+                menu.addSeparator()
         for entry_id in configured:
             entry = entries[entry_id]
             current = self.tray_entry_value(entry_id)
@@ -457,7 +506,11 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
                 self._handle_windows_resume,
             ):
                 return True, 1
-            if msg.message in (WM_DISPLAYCHANGE, WM_SETTINGCHANGE):
+            if msg.message == WM_DISPLAYCHANGE:
+                self._schedule_hdr_memory_check("windows_event", delay_ms=600)
+                if hasattr(self, "_schedule_display_change_refresh"):
+                    self._schedule_display_change_refresh("WM_DISPLAYCHANGE", delay_ms=900)
+            elif msg.message == WM_SETTINGCHANGE:
                 self._schedule_hdr_memory_check("windows_event", delay_ms=600)
         return super().nativeEvent(eventType, message)
 
@@ -548,6 +601,8 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
                 self._hdr_memory_apply_timer.stop()
             if hasattr(self, "_hdr_picture_refresh_timer"):
                 self._hdr_picture_refresh_timer.stop()
+            if hasattr(self, "_display_change_refresh_timer"):
+                self._display_change_refresh_timer.stop()
         except Exception:
             pass
         if session_ending:
@@ -573,6 +628,23 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
         self.tray_icon.hide()
         self.cleanup_before_exit()
         QApplication.quit()
+
+    def _maybe_show_preset_edit_merged_notice(self):
+        """进入预设页时弹出一次性更新提示；未勾「不再提示」则下次启动进预设页继续提示。"""
+        if getattr(self, "_cleanup_done", False) or getattr(self, "_preset_notice_shown_this_session", False):
+            return
+        if load_settings().get("never_show_preset_edit_merged_notice", False):
+            self._preset_notice_shown_this_session = True
+            return
+        if not self.isVisible():
+            return
+        self._preset_notice_shown_this_session = True
+        dialog = PresetEditMergedNoticeDialog(self)
+        accepted = dialog.exec()
+        never_show = dialog.never_show_checked()
+        dialog.deleteLater()
+        if accepted and never_show:
+            update_settings({"never_show_preset_edit_merged_notice": True})
 
     def closeEvent(self, event):
         if getattr(self, "is_forcing_exit", False):

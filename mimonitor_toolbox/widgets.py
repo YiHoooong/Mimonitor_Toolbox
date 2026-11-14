@@ -1195,24 +1195,26 @@ class InstallProgressDialog(QDialog):
 # ===== 预设卡片 =====
 
 PRESET_CARD_WIDTH = 240
-PRESET_CARD_HEIGHT = 140
+PRESET_CARD_HEIGHT = 172
 
 
 class PresetCard(SimpleCardWidget):
     """预设卡片。
 
     顶行是名字 + 右上角的重命名 / 删除图标（做成图标按钮而不是右键菜单 ——
-    右键没有可发现性）；底行是「应用 / 编辑」。当前生效的那张，它的「应用」
-    按钮会置灰并改写成「已应用」，不再另画角标。
+    右键没有可发现性）；中间是设置摘要与「在托盘显示」开关；底行是「应用 / 选项」。
+    当前生效的那张，它的「应用」按钮会置灰并改写成「已应用」，不再另画角标。
     """
 
     apply_requested = pyqtSignal(str)
-    edit_requested = pyqtSignal(str)
+    options_requested = pyqtSignal(str)
     rename_requested = pyqtSignal(str)
     delete_requested = pyqtSignal(str)
+    tray_toggled = pyqtSignal(str, bool)
 
     def __init__(self, preset_id, name, caption, parent=None, apply_enabled=True,
-                 editable=True, active=False, managed=True):
+                 editable=True, active=False, managed=True,
+                 in_tray=False, tray_toggle_enabled=True, tray_tooltip=""):
         super().__init__(parent)
         self.preset_id = preset_id
         self.setFixedSize(PRESET_CARD_WIDTH, PRESET_CARD_HEIGHT)
@@ -1240,6 +1242,26 @@ class PresetCard(SimpleCardWidget):
         caption_label = CaptionLabel(caption, self)
         caption_label.setWordWrap(True)
         layout.addWidget(caption_label)
+        layout.addSpacing(2)
+
+        tray_row = QHBoxLayout()
+        tray_row.setSpacing(6)
+        tray_label = CaptionLabel("在托盘显示", self)
+        tray_row.addWidget(tray_label)
+        tray_row.addStretch(1)
+        self.tray_switch = SwitchButton(self)
+        self.tray_switch.setOnText("开")
+        self.tray_switch.setOffText("关")
+        self.tray_switch.setChecked(bool(in_tray))
+        self.tray_switch.setEnabled(bool(tray_toggle_enabled))
+        if tray_tooltip:
+            self.tray_switch.setToolTip(tray_tooltip)
+            tray_label.setToolTip(tray_tooltip)
+        self.tray_switch.checkedChanged.connect(
+            lambda checked: self.tray_toggled.emit(self.preset_id, bool(checked))
+        )
+        tray_row.addWidget(self.tray_switch)
+        layout.addLayout(tray_row)
         layout.addStretch(1)
 
         row = QHBoxLayout()
@@ -1252,10 +1274,10 @@ class PresetCard(SimpleCardWidget):
         apply_btn.clicked.connect(lambda: self.apply_requested.emit(self.preset_id))
         row.addWidget(apply_btn)
         if editable:
-            edit_btn = PushButton("编辑", self)
-            edit_btn.setFixedWidth(72)
-            edit_btn.clicked.connect(lambda: self.edit_requested.emit(self.preset_id))
-            row.addWidget(edit_btn)
+            options_btn = PushButton("选项", self)
+            options_btn.setFixedWidth(72)
+            options_btn.clicked.connect(lambda: self.options_requested.emit(self.preset_id))
+            row.addWidget(options_btn)
         layout.addLayout(row)
 
     def _make_icon_button(self, icon, tooltip, signal):
@@ -1440,6 +1462,94 @@ class PresetNameDialog(MessageBoxBase):
 
     def preset_name(self):
         return self.nameEdit.text().strip()
+
+
+class PresetOptionsDialog(MessageBoxBase):
+    """预设保存大项弹窗：让用户按功能模块选择该预设保存和接管的设置范围。"""
+
+    def __init__(self, preset_name, options, parent=None):
+        super().__init__(parent)
+        from .presets import PRESET_OPTION_GROUPS, normalize_preset_options
+
+        self._switches = {}
+        normalized = normalize_preset_options(options)
+        self.titleLabel = SubtitleLabel(f"预设选项 · {preset_name}", self)
+        hint = CaptionLabel(
+            "勾选此预设要保存和接管的大项；未勾选的大项在切换预设时保持显示器当前状态。",
+            self,
+        )
+        hint.setWordWrap(True)
+        self.viewLayout.addWidget(self.titleLabel)
+        self.viewLayout.addWidget(hint)
+        self.viewLayout.addSpacing(4)
+
+        for group_id, title, desc in PRESET_OPTION_GROUPS:
+            row = QHBoxLayout()
+            row.setSpacing(12)
+            text_col = QVBoxLayout()
+            text_col.setSpacing(2)
+            name_lbl = BodyLabel(title, self)
+            desc_lbl = CaptionLabel(desc, self)
+            desc_lbl.setWordWrap(True)
+            text_col.addWidget(name_lbl)
+            text_col.addWidget(desc_lbl)
+            switch = SwitchButton(self)
+            switch.setOnText("开")
+            switch.setOffText("关")
+            switch.setChecked(bool(normalized.get(group_id, True)))
+            switch.checkedChanged.connect(lambda _v: self._update_save_enabled())
+            row.addLayout(text_col, 1)
+            row.addWidget(switch, 0, Qt.AlignmentFlag.AlignVCenter)
+            self.viewLayout.addLayout(row)
+            self._switches[group_id] = switch
+
+        self._empty_hint = CaptionLabel("请至少保留一个功能大项。", self)
+        self._empty_hint.setStyleSheet("color: #ff6b6b;")
+        self._empty_hint.hide()
+        self.viewLayout.addWidget(self._empty_hint)
+
+        self.widget.setMinimumWidth(480)
+        self.yesButton.setText("保存")
+        self.cancelButton.setText("取消")
+        self._update_save_enabled()
+
+    def _update_save_enabled(self):
+        has_any = any(switch.isChecked() for switch in self._switches.values())
+        self.yesButton.setEnabled(has_any)
+        self._empty_hint.setVisible(not has_any)
+
+    def validate(self):
+        return any(switch.isChecked() for switch in self._switches.values())
+
+    def options(self):
+        return {group_id: switch.isChecked() for group_id, switch in self._switches.items()}
+
+
+class PresetEditMergedNoticeDialog(MessageBoxBase):
+    """更新提示弹窗：说明原「编辑」已并入「应用」并改为「选项」，支持勾选不再提示。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.titleLabel = SubtitleLabel("预设交互更新提示", self)
+        self.bodyLabel = BodyLabel(
+            "原卡片上的「编辑」已与「应用」合并：应用预设后，直接修改各项设置即可自动保存进该预设。\n\n"
+            "按钮位置现已改为「选项」，点击可自定义每条预设包含的大项范围，不想受预设控制的功能取消勾选即可。",
+            self,
+        )
+        self.bodyLabel.setWordWrap(True)
+        self.chk_never_show = CheckBox("不再提示", self)
+
+        self.viewLayout.addWidget(self.titleLabel)
+        self.viewLayout.addWidget(self.bodyLabel)
+        self.viewLayout.addSpacing(4)
+        self.viewLayout.addWidget(self.chk_never_show)
+
+        self.widget.setMinimumWidth(440)
+        self.yesButton.setText("知道了")
+        self.cancelButton.hide()
+
+    def never_show_checked(self):
+        return self.chk_never_show.isChecked()
 
 
 # ===== 自动任务卡片 =====

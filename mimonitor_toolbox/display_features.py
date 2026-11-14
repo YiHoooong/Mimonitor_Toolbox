@@ -36,22 +36,28 @@ from .core import (
     parse_hdmi_edid_int,
     parse_sound_output_value,
     read_hdmi_edid_and_freesync,
+    MONITOR_MENU_KEYS,
     update_settings,
     write_memc_value,
+    write_screen_light_values,
 )
 from .presets import (
     BASELINE_PRESET_ID,
     PICTURE_ITEMS,
     apply_preset,
+    default_preset_options,
+    filter_values_by_preset_options,
     find_active_task,
     find_preset,
     missing_keys,
     new_id,
+    normalize_preset_options,
     unique_name,
 )
 from .widgets import LoadingSpinner, OverlayResizeFilter
 from .windows import (
     query_target_display_refresh_rate,
+    query_windows_display_mode,
     query_windows_hdr_enabled,
     resolve_hdr_target_display,
 )
@@ -81,6 +87,9 @@ class DisplayFeaturesMixin:
         self._hdr_last_state = None
         self._hdr_state_source = None
         self._hdr_windows_state = None
+        self._display_last_mode = None
+        self._display_change_refresh_suppress_until = 0.0
+        self._display_change_refresh_pending_reason = "Windows 显示变化"
         # 页面在 setup_ui 里就枚举过一次显示器并把结果缓存好了（本方法晚于它执行），
         # 这里不能把缓存清掉 —— 否则要等用户展开一次下拉才有目标屏
         self._hdr_target_display_label = getattr(self, "_hdr_target_display_label", None)
@@ -93,6 +102,11 @@ class DisplayFeaturesMixin:
         self._hdr_picture_refresh_timer.setSingleShot(True)
         self._hdr_picture_refresh_timer.timeout.connect(
             lambda: self._refresh_picture_data_after_hdr_change()
+        )
+        self._display_change_refresh_timer = QTimer(self)
+        self._display_change_refresh_timer.setSingleShot(True)
+        self._display_change_refresh_timer.timeout.connect(
+            lambda: self._refresh_pages_after_display_change()
         )
 
     def hotkey_countdown_enabled(self):
@@ -568,7 +582,7 @@ class DisplayFeaturesMixin:
             child.deleteLater()
 
     def _apply_picture_values(self, values, label, before_apply=None,
-                              on_finished=None, quiet=False):
+                              on_finished=None, quiet=False, options=None):
         """把一组画面值按固定顺序写进设备（预设应用与快照恢复共用）。
 
         `before_apply(snapshot)` 非 None 时，表示这是一次"覆盖式"应用：会先在
@@ -588,6 +602,7 @@ class DisplayFeaturesMixin:
             return
         seconds = self._preset_suppress_seconds()
         self._mark_adb_busy(seconds)
+        self._suppress_display_change_refresh(seconds)
         self._local_dimming_memory_suppress_until = time.monotonic() + seconds
         self._show_preset_switching_overlay()
         outcome = {}
@@ -596,7 +611,7 @@ class DisplayFeaturesMixin:
             with self.adb.transaction():
                 if before_apply is not None:
                     before_apply(self._read_picture_values())
-                outcome["result"] = apply_preset(self.adb, values)
+                outcome["result"] = apply_preset(self.adb, values, options=options)
 
         def success():
             self._hide_preset_switching_overlay()
@@ -616,11 +631,20 @@ class DisplayFeaturesMixin:
                     sound_label = getattr(self, "sound_output_label", None)
                     if sound_label is not None:
                         sound_label.setText(format_sound_output_label(sound_val))
+            audio_updates = {
+                key: values[key]
+                for key in ("volume_music_speaker", "media_muted")
+                if key in values
+            }
+            if audio_updates:
+                values_signal = getattr(self, "values_signal", None)
+                if values_signal is not None:
+                    values_signal.emit(audio_updates)
             self._page_loaded.discard("picturePage")
-            # FreeSync 在游戏页，预设会动它，那边的开关也得回读
+            # 预设现已涵盖游戏、音频与屏幕灯设置，应用后需同步回读全部相关页面
             self._page_loaded.discard("gamePage")
-            # 预设也可包含声音输出，应用后同步回读连接与声音页
             self._page_loaded.discard("sourcePage")
+            self._page_loaded.discard("lightPage")
             # 等设备把整批写入消化完再回读 —— 兼作"写入是否真的落下去"的校验，
             # 因为模式切换会重新应用该模式的整套参数。
             QTimer.singleShot(1800, self._verify_after_preset_apply)
@@ -642,7 +666,7 @@ class DisplayFeaturesMixin:
         if self._adb_channel_busy():
             QTimer.singleShot(800, self._verify_after_preset_apply)
             return
-        self._refresh_pages(("picturePage", "gamePage", "sourcePage"), force=True)
+        self._refresh_pages(("picturePage", "gamePage", "sourcePage", "lightPage"), force=True)
 
     def _store_preset_snapshot(self, values, source):
         return update_settings({"preset_snapshot": {
@@ -683,9 +707,10 @@ class DisplayFeaturesMixin:
         if preset is None:
             self.log("预设不存在或已被删除")
             return
-        values = preset.get("values") or {}
+        options = preset.get("options")
+        values = filter_values_by_preset_options(preset.get("values") or {}, options)
         name = preset.get("name") or preset_id
-        missing = missing_keys(values)
+        missing = missing_keys(values, options=options)
         if missing:
             self.log(f"预设「{name}」缺 {len(missing)} 项（{'、'.join(missing)}），只应用已有的项")
         # 只有从「无预设」切进预设时才更新那份值 —— 预设之间互切不该覆盖它，
@@ -702,8 +727,14 @@ class DisplayFeaturesMixin:
             update_settings({"active_preset_id": preset_id})
             self._refresh_preset_views()
 
+        extra = (
+            {"options": options}
+            if options is not None and not all(normalize_preset_options(options).values())
+            else {}
+        )
         self._apply_picture_values(values, f"应用预设「{name}」",
-                                   before_apply=remember, on_finished=finished)
+                                   before_apply=remember, on_finished=finished,
+                                   **extra)
 
     def restore_preset_snapshot(self):
         """退回「无预设」：还原成套预设之前的那套值。"""
@@ -760,9 +791,12 @@ class DisplayFeaturesMixin:
                 return
             presets = load_settings().get("presets") or []
             preset = find_preset(presets, preset_id)
-            if preset is None or preset.get("values") == values:
+            if preset is None:
                 return
-            preset["values"] = values
+            filtered = filter_values_by_preset_options(values, preset.get("options"))
+            if preset.get("values") == filtered:
+                return
+            preset["values"] = filtered
             update_settings({"presets": presets})
             self.log(f"已把当前设置保存进预设「{preset.get('name')}」")
             self._refresh_preset_views()
@@ -796,25 +830,26 @@ class DisplayFeaturesMixin:
             return
         self.stackedWidget.setCurrentWidget(page)
 
-    def begin_preset_edit(self, preset_id):
-        """卡片上的「编辑」：切到该预设并跳到画面设置页去调。
-
-        没有"编辑会话"可言 —— 切过去之后它就是当前预设，之后在画面页的改动
-        会自动写回它。想反悔就点「无预设」退回套预设之前的值。
-        """
-        if not self.check_connection():
+    def update_preset_options(self, preset_id, options):
+        """更新指定预设的大项范围：取消勾选的大项会从该预设 values 中移除。"""
+        presets = load_settings().get("presets") or []
+        preset = find_preset(presets, preset_id)
+        if preset is None:
+            self.log("预设不存在或已被删除")
             return
-        if self.active_preset_id() == preset_id:
-            # 已经是当前预设，直接跳过去调就行
-            self._goto_picture_page()
-            return
-        self.apply_preset_by_id(preset_id)
-        self._goto_picture_page()
+        normalized = normalize_preset_options(options)
+        preset["options"] = normalized
+        preset["values"] = filter_values_by_preset_options(preset.get("values") or {}, normalized)
+        update_settings({"presets": presets})
+        self.log(f"已更新预设「{preset.get('name') or preset_id}」的保存选项")
+        self._refresh_preset_views()
+        if self.active_preset_id() == preset_id and getattr(self, "adb_connected", False):
+            self._note_picture_change()
 
     def create_preset_from_current(self, name):
         """新建预设：以**当前设备设置**为内容创建，并立刻切为当前预设。
 
-        没有"保存"按钮，所以创建必须在这一步完成；之后在画面页的调整会通过
+        没有"保存"按钮，所以创建必须在这一步完成；之后在各设置页的调整会通过
         自动保存继续写进它。
         """
         if not self.check_connection():
@@ -832,7 +867,12 @@ class DisplayFeaturesMixin:
             presets = load_settings().get("presets") or []
             final_name = unique_name(presets, name)
             created_id = new_id(presets, "preset")
-            presets.append({"id": created_id, "name": final_name, "values": values})
+            presets.append({
+                "id": created_id,
+                "name": final_name,
+                "values": values,
+                "options": default_preset_options(),
+            })
             update_settings({"presets": presets, "active_preset_id": created_id})
             self.log(f"已新建预设「{final_name}」，共 {len(values)} 项")
             self._refresh_preset_views()
@@ -934,12 +974,14 @@ class DisplayFeaturesMixin:
             name = "无预设"
             label = "自动任务：改用无预设"
             target_active = None
+            target_options = None
         else:
             preset = find_preset(load_settings().get("presets") or [], preset_id)
             if preset is None:
                 self.log(f"自动任务{window}引用的预设已不存在")
                 return
-            values = preset.get("values") or {}
+            target_options = preset.get("options")
+            values = filter_values_by_preset_options(preset.get("values") or {}, target_options)
             name = preset.get("name") or preset_id
             label = f"自动任务：{name}"
             target_active = preset_id
@@ -964,8 +1006,14 @@ class DisplayFeaturesMixin:
             if hasattr(self, "_refresh_preset_views"):
                 self._refresh_preset_views()
 
+        extra = (
+            {"options": target_options}
+            if target_options is not None and not all(normalize_preset_options(target_options).values())
+            else {}
+        )
         self._apply_picture_values(values, label, before_apply=remember,
-                                   on_finished=finished, quiet=True)
+                                   on_finished=finished, quiet=True,
+                                   **extra)
 
     def _clear_task_snapshot(self, task_id):
         tasks = load_settings().get("auto_tasks") or []
@@ -1379,6 +1427,8 @@ class DisplayFeaturesMixin:
         隐藏是「只要在非游戏模式看到准星就清掉」；还原只在「模式跃迁进入
         游戏模式」时做一次，避免用户用显示器 OSD 主动关掉准星后又被打开。
         """
+        if self.memories_suspended_by_preset():
+            return
         if not self._crosshair_game_mode_only_enabled():
             return
         if not getattr(self, "adb_connected", False):
@@ -1478,6 +1528,22 @@ class DisplayFeaturesMixin:
         except Exception:
             return None
 
+    def _query_windows_display_mode(self):
+        """读取已解析目标屏的当前分辨率与刷新率签名；无目标屏时返回 None。"""
+        device_name = getattr(self, "_hdr_target_device_name", None)
+        if not device_name:
+            return None
+        try:
+            return query_windows_display_mode(device_name)
+        except Exception:
+            return None
+
+    def _suppress_display_change_refresh(self, seconds=3.0):
+        self._display_change_refresh_suppress_until = max(
+            getattr(self, "_display_change_refresh_suppress_until", 0.0),
+            time.monotonic() + seconds,
+        )
+
     def _select_hdr_target_display(self, index):
         ids = getattr(self, "_hdr_target_display_ids", [])
         if not 0 <= index < len(ids):
@@ -1487,6 +1553,7 @@ class DisplayFeaturesMixin:
         self._apply_hdr_target_resolution()
         self._update_hdr_memory_status_label("切换目标显示器")
         self._hdr_last_state = None
+        self._display_last_mode = None
         self._schedule_hdr_memory_check("切换目标显示器", delay_ms=80)
 
     def _poll_hdr_memory_state(self, reason="timer"):
@@ -1502,8 +1569,24 @@ class DisplayFeaturesMixin:
             self._hdr_last_state = None
             self._hdr_state_source = None
             self._update_hdr_memory_status_label("Windows HDR 状态未知")
+        else:
+            self._on_hdr_memory_state_detected(win_state, "Windows HDR")
+
+        mode = self._query_windows_display_mode()
+        if mode is None:
+            self._display_last_mode = None
+        else:
+            self._reconcile_display_mode_state(mode)
+
+    def _reconcile_display_mode_state(self, mode):
+        previous = getattr(self, "_display_last_mode", None)
+        self._display_last_mode = mode
+        if previous is None or mode == previous:
             return
-        self._on_hdr_memory_state_detected(win_state, "Windows HDR")
+        timer = getattr(self, "_display_change_refresh_timer", None)
+        if timer is not None and timer.isActive():
+            return
+        self._schedule_display_change_refresh("显示模式变化", delay_ms=200)
 
     def _on_hdr_memory_state_detected(self, state, source):
         if state is None:
@@ -1546,15 +1629,69 @@ class DisplayFeaturesMixin:
                     is_switch=not is_baseline,
                 )
 
+    def _refresh_display_and_game_pages(self):
+        """同时强制回读画面设置与游戏设置页，使 OSD/系统改动能同步到两边面板。"""
+        targets = ("picturePage", "gamePage")
+        if hasattr(self, "_refresh_pages"):
+            self._refresh_pages(targets, force=True)
+            return
+        for page_name in targets:
+            self._page_loaded.discard(page_name)
+            self._refresh_page_data(page_name)
+
+    def _retry_display_or_hdr_refresh_if_busy(self, callback, retries):
+        apply_timer = getattr(self, "_hdr_memory_apply_timer", None)
+        loading = getattr(self, "_page_loading", set())
+        busy = (
+            (apply_timer is not None and apply_timer.isActive())
+            or self._adb_channel_busy()
+            or ("picturePage" in loading or "gamePage" in loading)
+        )
+        if not busy:
+            return False
+        if retries > 0:
+            QTimer.singleShot(400, lambda r=retries - 1: callback(r))
+        return True
+
+    def _schedule_display_change_refresh(self, reason="windows_event", delay_ms=900):
+        if not getattr(self, "adb_connected", False):
+            return
+        if time.monotonic() < getattr(self, "_display_change_refresh_suppress_until", 0.0):
+            return
+        self._display_change_refresh_pending_reason = reason
+        timer = getattr(self, "_display_change_refresh_timer", None)
+        if timer is not None:
+            timer.stop()
+            timer.start(delay_ms)
+        else:
+            QTimer.singleShot(delay_ms, self._refresh_pages_after_display_change)
+
+    def _refresh_pages_after_display_change(self, retries=8):
+        if not getattr(self, "adb_connected", False):
+            return
+        if time.monotonic() < getattr(self, "_display_change_refresh_suppress_until", 0.0):
+            return
+        if self._retry_display_or_hdr_refresh_if_busy(
+            self._refresh_pages_after_display_change, retries
+        ):
+            return
+        reason = getattr(self, "_display_change_refresh_pending_reason", "Windows 显示变化")
+        self.log(f"检测到 Windows 显示变化（{reason}），刷新画面和游戏页面数据...")
+        self._refresh_display_and_game_pages()
+
     def _schedule_picture_refresh_after_hdr_change(self, state, initial_delay_ms=0, is_switch=True):
         if not getattr(self, "adb_connected", False):
             return
+        display_timer = getattr(self, "_display_change_refresh_timer", None)
+        if display_timer is not None and display_timer.isActive():
+            display_timer.stop()
         state_name = "HDR" if state else "SDR"
         if is_switch:
-            self.log(f"检测到 Windows HDR 切换为 {state_name}，刷新画面数据...")
+            self.log(f"检测到 Windows HDR 切换为 {state_name}，刷新画面和游戏页面数据...")
         else:
-            self.log(f"检测到当前 Windows 为 {state_name}，应用 HDR 记忆并刷新画面数据...")
+            self.log(f"检测到当前 Windows 为 {state_name}，应用 HDR 记忆并刷新画面和游戏页面数据...")
         self._page_loaded.discard("picturePage")
+        self._page_loaded.discard("gamePage")
         QTimer.singleShot(initial_delay_ms, lambda: self._refresh_picture_data_after_hdr_change())
         timer = getattr(self, "_hdr_picture_refresh_timer", None)
         if timer:
@@ -1564,21 +1701,13 @@ class DisplayFeaturesMixin:
     def _refresh_picture_data_after_hdr_change(self, retries=8):
         if not getattr(self, "adb_connected", False):
             return
-        apply_timer = getattr(self, "_hdr_memory_apply_timer", None)
-        if apply_timer and apply_timer.isActive():
-            if retries > 0:
-                QTimer.singleShot(400, lambda r=retries - 1: self._refresh_picture_data_after_hdr_change(r))
-            return
-        if self._adb_channel_busy():
-            if retries > 0:
-                QTimer.singleShot(400, lambda r=retries - 1: self._refresh_picture_data_after_hdr_change(r))
-            return
         self._page_loaded.discard("picturePage")
-        if "picturePage" in getattr(self, "_page_loading", set()):
-            if retries > 0:
-                QTimer.singleShot(400, lambda r=retries - 1: self._refresh_picture_data_after_hdr_change(r))
+        self._page_loaded.discard("gamePage")
+        if self._retry_display_or_hdr_refresh_if_busy(
+            self._refresh_picture_data_after_hdr_change, retries
+        ):
             return
-        self._refresh_page_data("picturePage")
+        self._refresh_display_and_game_pages()
 
     def _update_hdr_memory_status_label(self, source=None):
         label = getattr(self, "hdr_memory_status_label", None)
@@ -1983,6 +2112,8 @@ class DisplayFeaturesMixin:
         def success():
             self.log(m)
             self.current_vals[k] = v
+            if k in MONITOR_MENU_KEYS:
+                self._note_picture_change()
             self._optimistic_highlight(k, v)
             if k == "mitv.tvplayer.hdmi.last.source":
                 self.source_var_text = self._source_names.get(v, f"未知 ({v})")
@@ -2069,6 +2200,7 @@ class DisplayFeaturesMixin:
                 self.adb.set_media_volume(target, unmute_first=should_unmute, show_ui=show_ui, check=True)
 
         def success():
+            self._note_picture_change()
             self.log(f"音量: {target}")
 
         def failure():
@@ -2119,6 +2251,7 @@ class DisplayFeaturesMixin:
                 self.adb.set_media_muted(target_muted, show_ui=show_ui, check=True)
 
         def success():
+            self._note_picture_change()
             self.log(f"静音: {'开' if target_muted else '关'}")
 
         def failure():
@@ -2200,6 +2333,8 @@ class DisplayFeaturesMixin:
             self.current_vals.update(updates)
             for setting, setting_value in updates.items():
                 self._optimistic_highlight(setting, setting_value)
+            if hasattr(self, "_note_picture_change"):
+                self._note_picture_change()
             self.log(message)
             if switch_to_game:
                 self.current_vals["picture_mode"] = 10
@@ -2559,6 +2694,7 @@ class DisplayFeaturesMixin:
     def _320(self, on):
         if not self.check_connection(): return
         self._mark_adb_busy(2.5)
+        self._suppress_display_change_refresh(3.0)
         previous = self._take_control_previous("mode_320")
 
         def operation():
@@ -2587,6 +2723,7 @@ class DisplayFeaturesMixin:
         def success():
             self.log(f"320Hz: {'开' if on else '关'}")
             self.current_vals["mode_320"] = 1 if on else 0
+            self._note_picture_change()
             self._optimistic_highlight("mode_320", 1 if on else 0)
             # 切换 EDID 版本会连带影响刷新率 / FreeSync / 画面参数，延迟刷新画面页和游戏页以回读真实值
             self._refresh_pages(("picturePage", "gamePage"), delay_ms=1500, force=True)
@@ -2600,6 +2737,7 @@ class DisplayFeaturesMixin:
     def _fsync(self, on):
         if not self.check_connection(): return
         self._mark_adb_busy(2.5)
+        self._suppress_display_change_refresh(3.0)
         previous = self._take_control_previous("freesync")
 
         # FreeSync Pro 模式记忆：开启前记录画面模式，关闭时切回（开启后显示器会自动切到游戏模式）
@@ -2675,22 +2813,10 @@ class DisplayFeaturesMixin:
 
         def operation():
             with self.adb.transaction():
-                self.adb.put("atmosphere_light_switcher_pm2", str(mode), check=True)
-                self.adb.put("atmosphere_light_illumination", str(illumination), check=True)
-                self.adb.put("atmosphere_light_color_temp", str(color_temp), check=True)
-                self.adb.put("atmosphere_light_color_value", str(color_value), check=True)
-                if mode == 0:
-                    self.adb.colorful_led("lighting", illumination, color_temp, check=True)
-                elif mode == 1:
-                    self.adb.colorful_led("ambient", check=True)
-                elif mode == 2:
-                    self.adb.colorful_led("solid", illumination, color_value, check=True)
-                elif mode == 3:
-                    self.adb.colorful_led("cycle", check=True)
-                else:
-                    self.adb.colorful_led("off", check=True)
+                write_screen_light_values(self.adb, mode, illumination, color_temp, color_value)
 
         def success():
+            self._note_picture_change()
             self.log(message)
 
         def failure():

@@ -13,6 +13,7 @@ hdr_tone_mapping / check_and_heal_jar 即可），所以可以用假的 adb 直�
 from dataclasses import dataclass, field
 
 from .core import (
+    BASELINE_PRESET_ID,
     CUSTOM_COLOR_TEMP_VALUE,
     HDR_TONE_MAPPING_UI_TO_MTK,
     MEMC_GAME_JNI_KEY,
@@ -20,10 +21,12 @@ from .core import (
     MEMC_SETTINGS_KEY,
     SOUND_OUTPUT_SETTINGS_KEY,
     SOUND_OUTPUT_VALID_VALUES,
+    TRAY_PRESET_LIMIT,
     XIAOMI_TO_MTK_COLOR_TEMP,
     format_sound_output_label,
     hdmi_edid_for,
     is_hdr_tone_mapping_picture_mode,
+    normalize_tray_preset_ids,
     parse_hdmi_edid_flags,
     read_hdmi_edid_and_freesync,
     write_memc_value,
@@ -103,11 +106,16 @@ def _as_int(values, key):
 # ===== 各分项的写序列 =====
 # 每一项都复刻对应界面控件自身的完整写序列，不能只写 settings。
 
+from . import core
+
+
 def _apply_freesync(adb, values):
     """FreeSync 与画面模式是绑在一起的：开着它，设备会被锁在游戏模式。
 
     所以它必须**排在画面模式之前**写 —— 不先把它设成目标值，后面写的画面
     模式会被它顶掉。设备行为见 display_features._fsync 的注释。
+    若预设同时记录了 `mode_320`，HDMI EDID 一步写入目标 (320Hz, FreeSync) 组合，
+    否则保留当前 320Hz 状态。
     """
     wanted = _as_int(values, "freesync") == 1
     source = adb.get("mitv.tvplayer.hdmi.last.source", check=True)
@@ -116,14 +124,47 @@ def _apply_freesync(adb, values):
         edid_raw, _ = read_hdmi_edid_and_freesync(adb, check=True)
         adb.jni_set(key, freesync_on_value(key) if wanted else 0, check=True)
         if edid_raw is not None:
-            is_320_int, _ = parse_hdmi_edid_flags(edid_raw)
+            is_320 = parse_hdmi_edid_flags(edid_raw)[0] == 1
+            if _has_mode_320(values)[0]:
+                try:
+                    mode_320_raw = _as_int(values, "mode_320")
+                except (TypeError, ValueError):
+                    mode_320_raw = None
+                if mode_320_raw in {0, 1}:
+                    is_320 = mode_320_raw == 1
             adb.jni_set(
                 "g_fusion_picture__hdmi_edid_version",
-                hdmi_edid_for(is_320_int == 1, wanted),
+                hdmi_edid_for(is_320, wanted),
                 check=True,
             )
     else:
         adb.jni_set(key, freesync_on_value(key) if wanted else 0, check=True)
+    adb.refresh_pq(check=True)
+
+
+def _apply_mode_320(adb, values):
+    """按当前输入源切 320Hz 竞技模式：HDMI 联动 FreeSync 状态，DP/USB-C 写 dp_edid_version。"""
+    raw = _as_int(values, "mode_320")
+    if raw not in {0, 1}:
+        raise ValueError(f"320Hz 竞技模式 {raw} 超出 0-1")
+    wanted = raw == 1
+    source = adb.get("mitv.tvplayer.hdmi.last.source", check=True)
+    if freesync_jni_key(source) == "g_video__freesync_switch":
+        edid_raw, fs_raw = read_hdmi_edid_and_freesync(adb, check=True)
+        has_fs = _has_freesync(values)[0]
+        if has_fs:
+            fs_on = _as_int(values, "freesync") == 1
+        else:
+            fs_on = parse_hdmi_edid_flags(edid_raw, fs_raw)[1] == 1
+        if has_fs and edid_raw is not None:
+            cur_320, cur_fs = parse_hdmi_edid_flags(edid_raw, fs_raw)
+            if cur_320 == raw and (cur_fs == 1) == fs_on:
+                return
+        if has_fs or (fs_raw is not None and core.parse_hdmi_edid_int(fs_raw) != (3 if fs_on else 0)):
+            adb.jni_set("g_video__freesync_switch", 3 if fs_on else 0, check=True)
+        adb.jni_set("g_fusion_picture__hdmi_edid_version", hdmi_edid_for(wanted, fs_on), check=True)
+    else:
+        adb.jni_set("g_fusion_picture__dp_edid_version", 3 if wanted else 2, check=True)
     adb.refresh_pq(check=True)
 
 
@@ -239,7 +280,11 @@ def _jni_setting(jni_key, setting_key, osd_key=None):
     return apply
 
 
+_has_mode_320 = _has_optional_setting("mode_320", "320Hz 竞技模式")
 _has_memc = _has_optional_setting(MEMC_SETTINGS_KEY, "运动补偿")
+_has_media_volume = _has_optional_setting("volume_music_speaker", "音量")
+_has_media_muted = _has_optional_setting("media_muted", "静音")
+_has_screen_light = _has_optional_setting("atmosphere_light_switcher_pm2", "屏幕灯")
 
 
 def _apply_memc(adb, values):
@@ -248,6 +293,83 @@ def _apply_memc(adb, values):
         raise ValueError(f"运动补偿 {value} 超出 0-4")
     mode = _as_int(values, "picture_mode") if "picture_mode" in values else None
     write_memc_value(adb, mode, value)
+
+
+def _setting_with_pq(key, label, valid_values):
+    """settings + refresh_pq 模板（与游戏工具/显示器菜单写序列一致）。"""
+    allowed = frozenset(valid_values)
+
+    def apply(adb, values):
+        value = _as_int(values, key)
+        if value not in allowed:
+            raise ValueError(f"{label} {value} 不在支持范围 {sorted(allowed)}")
+        adb.put(key, str(value), check=True)
+        adb.refresh_pq(check=True)
+
+    return apply
+
+
+def _game_feature_condition(key, label, valid_values, dep_key=None, dep_label=None):
+    """游戏覆盖层项条件：归零总是下发；非零仅在游戏画面模式（且前置项开启）时下发。"""
+    has_key = _has_optional_setting(key, label)
+    allowed = frozenset(valid_values)
+
+    def check(values):
+        ok, reason = has_key(values)
+        if not ok:
+            return False, reason
+        try:
+            val = _as_int(values, key)
+        except (TypeError, ValueError):
+            return True, ""
+        if val not in allowed or val == 0:
+            return True, ""
+        raw_mode = values.get("picture_mode")
+        if raw_mode is not None:
+            try:
+                mode = int(raw_mode)
+            except (TypeError, ValueError):
+                mode = None
+            if mode is not None and not core.is_game_picture_mode(mode):
+                return False, f"非游戏画面模式，{label}不生效"
+        if dep_key:
+            try:
+                dep_val = _as_int(values, dep_key) if dep_key in values else 0
+            except (TypeError, ValueError):
+                dep_val = 0
+            if dep_val == 0:
+                return False, f"未开「{dep_label}」，{label}不生效"
+        return True, ""
+
+    return check
+
+
+def _apply_media_volume(adb, values):
+    value = _as_int(values, "volume_music_speaker")
+    if not 0 <= value <= 100:
+        raise ValueError(f"音量 {value} 超出 0-100")
+    adb.set_media_volume(value, unmute_first=False, show_ui=False, check=True)
+
+
+def _apply_media_muted(adb, values):
+    value = _as_int(values, "media_muted")
+    if value not in {0, 1}:
+        raise ValueError(f"静音 {value} 超出 0-1")
+    adb.set_media_muted(value == 1, show_ui=False, check=True)
+
+
+def _apply_screen_light(adb, values):
+    def _field(key):
+        raw = values.get(key)
+        return core.SCREEN_LIGHT_DEFAULTS[key] if raw is None else int(raw)
+
+    core.write_screen_light_values(
+        adb,
+        _field("atmosphere_light_switcher_pm2"),
+        _field("atmosphere_light_illumination"),
+        _field("atmosphere_light_color_temp"),
+        _field("atmosphere_light_color_value"),
+    )
 
 
 def _apply_hdr_tone_mapping(adb, values):
@@ -296,8 +418,9 @@ def _needs_hdr_mode(values):
 
 # 顺序即写入顺序。**FreeSync 第一、画面模式第二**，理由见模块文档字符串。
 PICTURE_ITEMS = (
-    # FreeSync 排最前：它开着会把设备锁在游戏模式，必须先把它设成目标值
+    # FreeSync 与 320Hz 排在画面模式之前：它们切 EDID/同步时会牵动模式锁定，必须先到位
     PictureItem("freesync", "FreeSync", _apply_freesync, _has_freesync),
+    PictureItem("mode_320", "320Hz 竞技模式", _apply_mode_320, _has_mode_320),
     PictureItem("picture_mode", "画面模式", _apply_picture_mode),
     PictureItem("light_sensor", "自动调整亮度", _apply_light_sensor),
     PictureItem("backlight", "背光", _apply_backlight),
@@ -330,7 +453,140 @@ PICTURE_ITEMS = (
                      "tv_picture_video_color_space"),
     ),
     PictureItem("sound_output", "声音输出", _apply_sound_output, _has_sound_output),
+    PictureItem(
+        "front_sight_index",
+        "准星",
+        _setting_with_pq("front_sight_index", "准星", (0, 1, 2, 3, 4, 5)),
+        _game_feature_condition("front_sight_index", "准星", (0, 1, 2, 3, 4, 5)),
+    ),
+    PictureItem(
+        "mt_game_dynamic_ft",
+        "动态准星",
+        _setting_with_pq("mt_game_dynamic_ft", "动态准星", (0, 1)),
+        _game_feature_condition(
+            "mt_game_dynamic_ft",
+            "动态准星",
+            (0, 1),
+            dep_key="front_sight_index",
+            dep_label="准星",
+        ),
+    ),
+    PictureItem(
+        "mt_game_scope",
+        "狙击镜",
+        _setting_with_pq("mt_game_scope", "狙击镜", (0, 1, 3, 5, 7, 10)),
+        _game_feature_condition("mt_game_scope", "狙击镜", (0, 1, 3, 5, 7, 10)),
+    ),
+    PictureItem(
+        "mt_game_scope_night",
+        "狙击镜夜视",
+        _setting_with_pq("mt_game_scope_night", "狙击镜夜视", (0, 1)),
+        _game_feature_condition(
+            "mt_game_scope_night",
+            "狙击镜夜视",
+            (0, 1),
+            dep_key="mt_game_scope",
+            dep_label="狙击镜",
+        ),
+    ),
+    PictureItem(
+        "monitor_menu_fps_counter",
+        "FPS 计数器",
+        _setting_with_pq("monitor_menu_fps_counter", "FPS 计数器", (0, 1, 2)),
+        _has_optional_setting("monitor_menu_fps_counter", "FPS 计数器"),
+    ),
+    PictureItem(
+        "monitor_menu_stopwatch",
+        "秒表",
+        _setting_with_pq("monitor_menu_stopwatch", "秒表", (0, 1)),
+        _has_optional_setting("monitor_menu_stopwatch", "秒表"),
+    ),
+    PictureItem(
+        "monitor_menu_timer",
+        "定时器",
+        _setting_with_pq("monitor_menu_timer", "定时器", (0, 60, 300, 1800, 3600)),
+        _has_optional_setting("monitor_menu_timer", "定时器"),
+    ),
+    # 音量排在静音前：即使内部实现清静音状态，随后的静音目标仍会生效。
+    PictureItem("volume_music_speaker", "音量", _apply_media_volume, _has_media_volume),
+    PictureItem("media_muted", "静音", _apply_media_muted, _has_media_muted),
+    PictureItem("screen_light", "屏幕灯", _apply_screen_light, _has_screen_light),
 )
+
+
+# ===== 预设分大项开关（按功能块决定某条预设保存/接管哪些设置） =====
+
+PRESET_OPTION_GROUPS = (
+    ("picture", "画面参数", "画面模式、亮度、背光、对比度、色温/色增益、控光、运动补偿、HDR 色调映射等"),
+    ("display_sync", "显示刷新与同步", "320Hz 竞技模式、FreeSync Premium Pro"),
+    ("game_tools", "游戏辅助工具", "准星、动态准星、狙击镜、夜视、FPS 计数器、秒表、定时器"),
+    ("screen_light", "屏幕灯", "模式、亮度挡位、照明色温与纯色颜色"),
+    ("audio", "音频设置", "声音输出设备、媒体音量与静音"),
+)
+
+_PRESET_GROUP_LABELS = {group_id: label for group_id, label, _ in PRESET_OPTION_GROUPS}
+
+_ITEM_OPTION_GROUP = {
+    "freesync": "display_sync",
+    "mode_320": "display_sync",
+    "front_sight_index": "game_tools",
+    "mt_game_dynamic_ft": "game_tools",
+    "mt_game_scope": "game_tools",
+    "mt_game_scope_night": "game_tools",
+    "monitor_menu_fps_counter": "game_tools",
+    "monitor_menu_stopwatch": "game_tools",
+    "monitor_menu_timer": "game_tools",
+    "screen_light": "screen_light",
+    "sound_output": "audio",
+    "volume_music_speaker": "audio",
+    "media_muted": "audio",
+}
+
+_KEY_OPTION_GROUP = {
+    "freesync": "display_sync",
+    "mode_320": "display_sync",
+    **{key: "game_tools" for key in core.GAME_FEATURE_KEYS + core.MONITOR_MENU_KEYS},
+    **{key: "screen_light" for key in core.SCREEN_LIGHT_KEYS},
+    core.SOUND_OUTPUT_SETTINGS_KEY: "audio",
+    "volume_music_speaker": "audio",
+    "media_muted": "audio",
+}
+
+
+def item_option_group(item_id):
+    """返回 PICTURE_ITEMS 项 id 所属的预设大项。"""
+    return _ITEM_OPTION_GROUP.get(item_id, "picture")
+
+
+def setting_option_group(setting_key):
+    """返回 settings 键所属的预设大项。"""
+    return _KEY_OPTION_GROUP.get(setting_key, "picture")
+
+
+def default_preset_options():
+    """默认全部大项都启用。"""
+    return {group_id: True for group_id, _, _ in PRESET_OPTION_GROUPS}
+
+
+def normalize_preset_options(raw_options):
+    """规范化预设大项开关；缺失字段（旧预设）一律按启用处理。"""
+    normalized = default_preset_options()
+    if isinstance(raw_options, dict):
+        for group_id in normalized:
+            if group_id in raw_options:
+                normalized[group_id] = bool(raw_options[group_id])
+    return normalized
+
+
+def filter_values_by_preset_options(values, raw_options):
+    """只保留该预设「选项」中已启用的大项对应键值。"""
+    if not isinstance(values, dict):
+        return {}
+    opts = normalize_preset_options(raw_options)
+    return {
+        key: val for key, val in values.items()
+        if opts.get(setting_option_group(key), True)
+    }
 
 
 @dataclass
@@ -353,15 +609,25 @@ class ApplyResult:
         return "，".join(parts)
 
 
-def apply_preset(adb, values, on_item=None):
+def apply_preset(adb, values, on_item=None, options=None):
     """按固定顺序把 `values` 逐项写进设备。
 
     单项失败**不中断**后续项（这是产品决定：尽量多写成功，最后汇报哪几项失败），
     所以每项的异常都收敛在它自己的边界上。注意 `adb` 调用内部仍是 check=True ——
     一项的写序列中途失败即整项判失败，不做半项的猜测性修补。
+    若传入 `options`，未勾选的功能大项会在条件检查前直接跳过。
     """
     result = ApplyResult()
+    opts = normalize_preset_options(options) if options is not None else None
     for item in PICTURE_ITEMS:
+        if opts is not None:
+            group_id = item_option_group(item.id)
+            if not opts.get(group_id, True):
+                reason = f"该预设未启用「{_PRESET_GROUP_LABELS.get(group_id, group_id)}」"
+                result.skipped.append((item.label, reason))
+                if on_item:
+                    on_item(item, "skipped", reason)
+                continue
         if item.condition is not None:
             try:
                 should_apply, reason = item.condition(values)
@@ -386,9 +652,30 @@ def apply_preset(adb, values, on_item=None):
     return result
 
 
-# 「无预设」不是真预设，用一个不会和 new_id 生成的 id 撞车的保留值。
-# 放这里而不是 pages.py：自动任务的调度也用它（选「无预设」= 这段时间不用预设）。
-BASELINE_PRESET_ID = "__baseline__"
+# 「无预设」常量从 core 导入并继续在此处导出，保持现有引用兼容。
+
+
+def can_enable_tray_preset(preset_id, tray_ids, presets_list):
+    """返回指定预设是否可勾选「在托盘显示」（已选或未满 4 个上限）。"""
+    if preset_id != BASELINE_PRESET_ID and find_preset(presets_list, preset_id) is None:
+        return False
+    enabled = normalize_tray_preset_ids(tray_ids, presets_list)
+    return preset_id in enabled or len(enabled) < TRAY_PRESET_LIMIT
+
+
+def tray_presets_for_menu(tray_ids, presets_list):
+    """按「无预设优先，其余按预设列表顺序」返回应在托盘菜单显示的预设项。"""
+    enabled = set(normalize_tray_preset_ids(tray_ids, presets_list))
+    items = []
+    if BASELINE_PRESET_ID in enabled:
+        items.append({"id": BASELINE_PRESET_ID, "name": "无预设"})
+    for preset in presets_list or ():
+        if not isinstance(preset, dict):
+            continue
+        preset_id = preset.get("id")
+        if isinstance(preset_id, str) and preset_id in enabled:
+            items.append({"id": preset_id, "name": preset.get("name") or preset_id})
+    return items
 
 
 # ===== 预设的查找与构造 =====
@@ -425,8 +712,10 @@ def unique_name(existing, wanted):
     return f"{wanted} ({index})"
 
 
-def missing_keys(values):
+def missing_keys(values, options=None):
     """预设里缺少哪些必需项 —— 用于保存时提示、应用时预警。"""
+    if options is not None and not normalize_preset_options(options).get("picture", True):
+        return []
     needed = {
         "picture_mode", "tv_picture_light_sensor", "picture_backlight",
         "picture_brightness", "picture_contrast", "picture_saturation",
