@@ -36,8 +36,11 @@ from .core import (
     GUARDIAN_PACKAGE,
     HDR_TONE_MAPPING_MTK_TO_UI,
     MTK_TO_XIAOMI_COLOR_TEMP,
+    SOUND_OUTPUT_SETTINGS_KEY,
+    format_sound_output_label,
     get_guardian_apk_path,
     load_settings,
+    normalize_sound_output_value,
     strip_guardian_package_from_accessibility,
     update_settings,
 )
@@ -162,20 +165,30 @@ class DeviceFeaturesMixin:
                         "mitv.tvplayer.hdmi.last.source",
                         check=True,
                     )
+                    try:
+                        raw_sound = self.adb.get(
+                            SOUND_OUTPUT_SETTINGS_KEY,
+                            check=False,
+                        )
+                    except Exception:
+                        raw_sound = None
+                polled = {}
                 source_text = str(raw_source or "").strip()
-                if not source_text or source_text.lower() in ("null", "n/a"):
+                if source_text and source_text.lower() not in ("null", "n/a"):
+                    try:
+                        polled["mitv.tvplayer.hdmi.last.source"] = int(source_text)
+                    except ValueError:
+                        polled["mitv.tvplayer.hdmi.last.source"] = source_text
+                sound_val = normalize_sound_output_value(raw_sound)
+                if sound_val is not None:
+                    polled[SOUND_OUTPUT_SETTINGS_KEY] = sound_val
+                if not polled:
                     return
-                try:
-                    source = int(source_text)
-                except ValueError:
-                    source = source_text
                 if (
                     getattr(self, "_source_poll_armed", False)
                     and getattr(self, "adb_connected", False)
                 ):
-                    self.values_signal.emit(
-                        {"mitv.tvplayer.hdmi.last.source": source}
-                    )
+                    self.values_signal.emit(polled)
             except Exception:
                 # 尽力同步即可；临时断连由现有保活/重连机制负责。
                 return
@@ -223,7 +236,7 @@ class DeviceFeaturesMixin:
                 ],
                 "jni_mode": True,
             },
-            "sourcePage": {"settings": ["mitv.tvplayer.hdmi.last.source"]},
+            "sourcePage": {"settings": ["mitv.tvplayer.hdmi.last.source", SOUND_OUTPUT_SETTINGS_KEY]},
             "lightPage": {
                 "settings": [
                     "atmosphere_light_switcher_pm2", "atmosphere_light_illumination",
@@ -238,6 +251,7 @@ class DeviceFeaturesMixin:
         self._connection_in_progress = False
         self._adb_busy_until = 0.0
         self._adb_keepalive_checking = False
+        self._adb_server_ever_alive = False
         self._adb_server_monitor_checking = False
         self._adb_server_down_notified = False
         self._adb_server_failure_notified = False
@@ -608,6 +622,8 @@ class DeviceFeaturesMixin:
     def _monitor_adb_server(self):
         if getattr(self, "_cleanup_done", False) or getattr(self, "_windows_session_ending", False):
             return
+        if getattr(self, "_connection_in_progress", False) or getattr(self, "_scan_running", False):
+            return
         if not self.adb.ip:
             return
         if self._adb_server_monitor_checking or time.monotonic() < self._adb_server_retry_after:
@@ -616,13 +632,19 @@ class DeviceFeaturesMixin:
         self._adb_server_monitor_checking = True
         ip = self.adb.ip
         intent_generation = getattr(self, "_connection_intent_generation", 0)
+        was_alive = bool(
+            getattr(self, "_adb_server_ever_alive", False)
+            or getattr(self, "adb_connected", False)
+        )
 
         def do():
             if is_adb_server_alive():
+                self._adb_server_ever_alive = True
                 self.adb_server_event.emit("healthy", "")
                 return
 
-            self.adb_server_event.emit("restarting", "")
+            if was_alive:
+                self.adb_server_event.emit("restarting", "")
             try:
                 with self.adb.transaction():
                     if not self._connection_intent_is_current(intent_generation, ip):
@@ -630,15 +652,22 @@ class DeviceFeaturesMixin:
                         return
                     if not ensure_adb_server():
                         raise RuntimeError("ADB Server 启动后未监听端口")
+                    self._adb_server_ever_alive = True
                     if not self._connection_intent_is_current(intent_generation, ip):
                         self.adb_server_event.emit("cancelled", "")
                         return
                     reconnect_result = adb_run(
                         ["connect", format_adb_serial(ip)], timeout=5
                     )
-                self.adb_server_event.emit("recovered", reconnect_result)
+                if was_alive:
+                    self.adb_server_event.emit("recovered", reconnect_result)
+                else:
+                    self.adb_server_event.emit("healthy", "")
             except Exception as e:
-                self.adb_server_event.emit("failed", str(e))
+                if was_alive:
+                    self.adb_server_event.emit("failed", str(e))
+                else:
+                    self.adb_server_event.emit("cancelled", "")
 
         async_run(do)
 
@@ -701,6 +730,8 @@ class DeviceFeaturesMixin:
 
     def _keep_adb_alive(self):
         if getattr(self, "_cleanup_done", False) or getattr(self, "_windows_session_ending", False):
+            return
+        if getattr(self, "_connection_in_progress", False) or getattr(self, "_scan_running", False):
             return
         if not self.adb.ip:
             return
@@ -854,8 +885,8 @@ class DeviceFeaturesMixin:
 
         self.ip_entry.setText(saved_ip)
         intent_generation = self._invalidate_connection_intent()
-        self.adb.ip = saved_ip
         self._connection_in_progress = True
+        self.adb.ip = saved_ip
         self.status_signal.emit("连接中...")
         self.log(f"启动自动连接: 尝试连接上次设备 {saved_ip}")
 
@@ -864,11 +895,13 @@ class DeviceFeaturesMixin:
                 with self.adb.transaction():
                     if not self._connection_intent_is_current(intent_generation, saved_ip):
                         return
-                    ensure_adb_server()
+                    if ensure_adb_server():
+                        self._adb_server_ever_alive = True
                     ok = self.adb.connect()
                     if not self._connection_intent_is_current(intent_generation, saved_ip):
                         return
                     if ok:
+                        self._adb_server_ever_alive = True
                         self.status_signal.emit("已连接")
                         self.log(f"启动自动连接成功: {saved_ip}")
                         self.adb.check_and_heal_jar()
@@ -901,18 +934,21 @@ class DeviceFeaturesMixin:
         intent_generation = self._invalidate_connection_intent()
         self._cancel_resume_reconnect()
         self._cancel_scan("手动连接")
-        self.adb.ip = ip
         self._connection_in_progress = True
+        self.adb.ip = ip
         self.status_signal.emit("连接中...")
         def do():
             try:
                 with self.adb.transaction():
                     if not self._connection_intent_is_current(intent_generation, ip):
                         return
+                    if ensure_adb_server():
+                        self._adb_server_ever_alive = True
                     ok = self.adb.connect()
                     if not self._connection_intent_is_current(intent_generation, ip):
                         return
                     if ok:
+                        self._adb_server_ever_alive = True
                         self.status_signal.emit("已连接")
                         self.log(f"连接成功: {ip}")
                         update_settings({"saved_ip": ip})
@@ -1416,6 +1452,11 @@ class DeviceFeaturesMixin:
     def _apply_polled_values(self, vals):
         # settings 中的 picture_color_temperature 已经是小米层枚举值；
         # 只有 JNI 的 g_video__clr_temp 读数才需要从 MTK 枚举转换。
+        if SOUND_OUTPUT_SETTINGS_KEY in vals:
+            normalized_sound = normalize_sound_output_value(vals[SOUND_OUTPUT_SETTINGS_KEY])
+            if normalized_sound is not None:
+                vals = dict(vals)
+                vals[SOUND_OUTPUT_SETTINGS_KEY] = normalized_sound
         self.current_vals.update(vals)
         slider_mappings = {
             "picture_backlight": "backlight",
@@ -1457,6 +1498,12 @@ class DeviceFeaturesMixin:
             sid = vals["mitv.tvplayer.hdmi.last.source"]
             self.source_var_text = self._source_names.get(sid, f"未知 ({sid})")
             self.source_label.setText(self.source_var_text)
+
+        if SOUND_OUTPUT_SETTINGS_KEY in vals:
+            sound_val = vals[SOUND_OUTPUT_SETTINGS_KEY]
+            sound_label = getattr(self, "sound_output_label", None)
+            if sound_label is not None:
+                sound_label.setText(format_sound_output_label(sound_val))
 
         update_game_hint = getattr(self, "_update_game_mode_hint", None)
         if callable(update_game_hint):
@@ -1540,6 +1587,12 @@ class DeviceFeaturesMixin:
             fs_raw = self.adb.jni_batch_get_or_single([fs_key], check=True).get(fs_key)
             if fs_raw is not None:
                 values["freesync"] = 1 if freesync_is_on(fs_key, fs_raw) else 0
+
+            # 声音输出也纳入预设与快照（不放入 PICTURE_PRESET_SETTINGS_KEYS 以保持画面页键表一致）。
+            raw_sound = self.adb.get(SOUND_OUTPUT_SETTINGS_KEY, check=True)
+            sound_val = normalize_sound_output_value(raw_sound)
+            if sound_val is not None:
+                values[SOUND_OUTPUT_SETTINGS_KEY] = sound_val
         return values
 
     def _refresh_page_data(self, page_name):
@@ -1573,8 +1626,13 @@ class DeviceFeaturesMixin:
                                 if len(parts) == 2:
                                     k, v = parts[0], parts[1]
                                     if v not in ("", "null", "N/A"):
-                                        try: settings_vals[k] = int(v)
-                                        except (TypeError, ValueError): settings_vals[k] = v
+                                        if k == SOUND_OUTPUT_SETTINGS_KEY:
+                                            sound_val = normalize_sound_output_value(v)
+                                            if sound_val is not None:
+                                                settings_vals[k] = sound_val
+                                        else:
+                                            try: settings_vals[k] = int(v)
+                                            except (TypeError, ValueError): settings_vals[k] = v
 
                     if page_name == "gamePage":
                         for key in GAME_FEATURE_KEYS:

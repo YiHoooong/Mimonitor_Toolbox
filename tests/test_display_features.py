@@ -1416,5 +1416,285 @@ class FreeSyncAutoSaveTests(unittest.TestCase):
                       "FreeSync 进了预设范围，手动开关必须触发自动保存")
 
 
+class SoundOutputTests(unittest.TestCase):
+    """声音输出切换、回滚、托盘目录、热键循环与预设回读同步。"""
+
+    def _make_host(self, current=0, should_fail=False):
+        from contextlib import nullcontext
+
+        from mimonitor_toolbox import core, display_features
+
+        calls = []
+        logs = []
+        highlights = []
+        noted = []
+        polls = []
+        refreshed = []
+
+        class FakeLabel:
+            def __init__(self):
+                self.text = None
+
+            def setText(self, text):
+                self.text = text
+
+        class FakeAdb:
+            def transaction(self):
+                return nullcontext()
+
+            def check_and_heal_jar(self):
+                calls.append(("heal",))
+
+            def set_sound_output(self, device_id, check=False):
+                calls.append(("set_sound_output", device_id, check))
+                if should_fail:
+                    raise RuntimeError("adb failed")
+
+            def put(self, key, value, check=False):
+                calls.append(("put", key, value, check))
+
+            def get(self, key, check=False):
+                calls.append(("get", key, check))
+                return "3"
+
+        class Host(display_features.DisplayFeaturesMixin):
+            adb_connected = True
+            adb = FakeAdb()
+            current_vals = (
+                {core.SOUND_OUTPUT_SETTINGS_KEY: current}
+                if current is not None
+                else {}
+            )
+            state_buttons = {
+                core.SOUND_OUTPUT_SETTINGS_KEY: {0: "btn0", 8: "btn8", 5: "btn5"}
+            }
+            sound_output_label = FakeLabel()
+            _page_loaded = {"picturePage", "gamePage", "sourcePage"}
+            _adb_busy_until = 0.0
+            _cleanup_done = False
+            _control_rollback_values = {}
+
+            def check_connection(self):
+                return self.adb_connected
+
+            def _mark_adb_busy(self, seconds=2.0):
+                pass
+
+            def _adb_channel_busy(self):
+                return False
+
+            def log(self, message):
+                logs.append(message)
+
+            def _optimistic_highlight(self, key, val):
+                highlights.append((key, val))
+
+            def _note_picture_change(self):
+                noted.append(True)
+
+            def _start_source_polling(self):
+                polls.append(True)
+
+            def _refresh_pages(self, pages, delay_ms=0, force=False):
+                refreshed.append((tuple(pages), force))
+
+            def _run_adb_action(self, label, operation, on_success=None, on_failure=None):
+                try:
+                    operation()
+                except Exception:
+                    if on_failure:
+                        on_failure()
+                    return
+                if on_success:
+                    on_success()
+
+        return Host(), calls, logs, highlights, noted, polls, refreshed
+
+    def test_set_sound_output_writes_mtk_and_setting_and_syncs_state(self):
+        from mimonitor_toolbox import core
+
+        host, calls, logs, highlights, noted, polls, _ = self._make_host(current=0)
+        host.set_sound_output(8, "HDMI(eARC)")
+
+        self.assertEqual(
+            calls,
+            [
+                ("heal",),
+                ("set_sound_output", 8, True),
+                ("put", core.SOUND_OUTPUT_SETTINGS_KEY, "8", True),
+            ],
+        )
+        self.assertEqual(host.current_vals[core.SOUND_OUTPUT_SETTINGS_KEY], 8)
+        self.assertEqual(host.sound_output_label.text, "HDMI(eARC)")
+        self.assertIn((core.SOUND_OUTPUT_SETTINGS_KEY, 8), highlights)
+        self.assertEqual(noted, [True])
+        self.assertEqual(polls, [True])
+        self.assertIn("声音输出: HDMI(eARC)", logs)
+
+    def test_set_sound_output_failure_rolls_back_previous_value(self):
+        from mimonitor_toolbox import core
+
+        host, _, _, highlights, noted, _, _ = self._make_host(
+            current=0, should_fail=True
+        )
+        host.set_sound_output(5, "耳机孔")
+
+        self.assertEqual(host.current_vals[core.SOUND_OUTPUT_SETTINGS_KEY], 0)
+        self.assertEqual(host.sound_output_label.text, "本机扬声器")
+        self.assertEqual(highlights[-1], (core.SOUND_OUTPUT_SETTINGS_KEY, 0))
+        self.assertEqual(noted, [])
+
+    def test_get_sound_output_normalizes_arc_3_to_8(self):
+        host, calls, _, _, _, _, _ = self._make_host()
+        self.assertEqual(host._get_sound_output(check=True), 8)
+        self.assertEqual(
+            calls[-1],
+            ("get", "mitv.settings.db.sound.device.output_device", True),
+        )
+
+    def test_tray_catalog_value_and_apply_option(self):
+        from mimonitor_toolbox import core
+
+        host, calls, _, _, _, _, _ = self._make_host(current="3")
+        entry = host.tray_entry("sound_output")
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["kind"], "options")
+        self.assertEqual(entry["options"], core.SOUND_OUTPUT_OPTIONS)
+        self.assertEqual(host.tray_entry_value("sound_output"), 8)
+
+        host.tray_apply_option("sound_output", 5)
+        self.assertEqual(host.current_vals[core.SOUND_OUTPUT_SETTINGS_KEY], 5)
+        self.assertIn(("set_sound_output", 5, True), calls)
+
+    def test_hotkey_cycle_stages_next_sound_output(self):
+        from mimonitor_toolbox import core
+
+        host, _, _, _, _, _, _ = self._make_host(current=0)
+        host._cycle_hotkey_pending = {}
+        staged = []
+        host._stage_cycle_hotkey_action = (
+            lambda action, sk, options, label, exec_fn: staged.append(
+                (action, sk, list(options), label)
+            )
+        )
+        host.trigger_hotkey_action("sound_output_cycle")
+        self.assertEqual(
+            staged,
+            [(
+                "sound_output_cycle",
+                core.SOUND_OUTPUT_SETTINGS_KEY,
+                core.SOUND_OUTPUT_OPTIONS,
+                "声音输出",
+            )],
+        )
+
+    def test_preset_verify_refreshes_source_page(self):
+        host, _, _, _, _, _, refreshed = self._make_host()
+        host._verify_after_preset_apply()
+        self.assertEqual(
+            refreshed,
+            [(("picturePage", "gamePage", "sourcePage"), True)],
+        )
+
+    def test_preset_snapshot_and_restore_round_trips_sound_output(self):
+        from contextlib import nullcontext
+
+        from mimonitor_toolbox import core, display_features
+
+        calls = []
+        settings = {
+            "active_preset_id": None,
+            "preset_snapshot": None,
+            "presets": [{
+                "id": "p_earc",
+                "name": "观影",
+                "values": {
+                    "picture_mode": 9,
+                    core.SOUND_OUTPUT_SETTINGS_KEY: 8,
+                },
+            }],
+        }
+
+        class FakeAdb:
+            def transaction(self):
+                return nullcontext()
+
+            def check_and_heal_jar(self):
+                calls.append(("heal",))
+
+            def set_sound_output(self, device_id, check=False):
+                calls.append(("set_sound_output", device_id))
+
+            def put(self, key, value, check=False):
+                calls.append(("put", key, value))
+
+            def jni_set(self, key, val, upd=3, check=False):
+                calls.append(("jni_set", key, val))
+
+            def refresh_pq(self, check=False):
+                calls.append(("refresh_pq",))
+
+            def get(self, key, check=False):
+                return "23"
+
+        class Host(display_features.DisplayFeaturesMixin):
+            adb_connected = True
+            adb = FakeAdb()
+            current_vals = {}
+            state_buttons = {}
+            _page_loaded = {"picturePage", "gamePage", "sourcePage"}
+            _adb_busy_until = 0.0
+            _cleanup_done = False
+
+            def check_connection(self):
+                return True
+
+            def _mark_adb_busy(self, seconds=2.0):
+                pass
+
+            def log(self, message):
+                pass
+
+            def _read_picture_values(self):
+                return {
+                    "picture_mode": 14,
+                    core.SOUND_OUTPUT_SETTINGS_KEY: 0,
+                }
+
+            def _show_preset_switching_overlay(self):
+                pass
+
+            def _hide_preset_switching_overlay(self):
+                pass
+
+            def _refresh_preset_views(self):
+                pass
+
+            def _run_adb_action(self, label, operation, on_success=None, on_failure=None):
+                operation()
+                if on_success:
+                    on_success()
+
+        host = Host()
+        with mock.patch.object(
+            display_features, "load_settings", side_effect=lambda: dict(settings)
+        ), mock.patch.object(
+            display_features, "update_settings", side_effect=settings.update
+        ), mock.patch.object(display_features, "QTimer"):
+            host.apply_preset_by_id("p_earc")
+            self.assertEqual(
+                settings["preset_snapshot"]["values"][core.SOUND_OUTPUT_SETTINGS_KEY],
+                0,
+            )
+            self.assertIn(("set_sound_output", 8), calls)
+            self.assertIn(("put", core.SOUND_OUTPUT_SETTINGS_KEY, "8"), calls)
+            self.assertNotIn("sourcePage", host._page_loaded)
+
+            calls.clear()
+            host.restore_preset_snapshot()
+            self.assertIn(("set_sound_output", 0), calls)
+            self.assertIn(("put", core.SOUND_OUTPUT_SETTINGS_KEY, "0"), calls)
+
+
 if __name__ == "__main__":
     unittest.main()

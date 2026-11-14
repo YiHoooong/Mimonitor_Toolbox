@@ -40,6 +40,7 @@ from .adb import (
 from .core import (
     ADJUSTABLE_HOTKEY_PARAMS,
     HOTKEY_EXTRA_VK,
+    SOUND_OUTPUT_SETTINGS_KEY,
     get_log_dir,
     load_settings,
     update_settings,
@@ -219,7 +220,7 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
             "picture_mode": "VIEW", "local_dimming": "BRIGHTNESS",
             "color_space": "PALETTE", "color_temp": "CONSTRACT",
             "response_time": "SPEED_HIGH", "freesync": "SYNC",
-            "input_source": "LINK", "backlight": "BRIGHTNESS",
+            "input_source": "LINK", "sound_output": "VOLUME", "backlight": "BRIGHTNESS",
             "black_level": "PHOTO", "contrast": "CONSTRACT",
             "saturation": "PALETTE", "hue": "PALETTE",
             "sharpness": "ZOOM", "red_gain": "PALETTE",
@@ -772,6 +773,13 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
         else:
             subprocess.Popen(["xdg-open", log_dir])
 
+    def _sync_source_page_connection_state(self):
+        connected = bool(getattr(self, "adb_connected", False))
+        state_buttons = getattr(self, "state_buttons", {})
+        for key in ("mitv.tvplayer.hdmi.last.source", SOUND_OUTPUT_SETTINGS_KEY):
+            for btn in state_buttons.get(key, {}).values():
+                btn.setEnabled(connected)
+
     def _on_status(self, text):
         text = normalize_status_text(text)
         self.status_label.setText(text)
@@ -779,6 +787,10 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
         is_scan_status = text.startswith("扫描")
         if not is_scan_status:
             self.adb_connected = is_connected_status_text(text)
+            if was_connected != self.adb_connected:
+                sync_source_conn = getattr(self, "_sync_source_page_connection_state", None)
+                if callable(sync_source_conn):
+                    sync_source_conn()
             # 连接状态变化时清除页面缓存
             if was_connected and not self.adb_connected:
                 self._stop_source_polling()
@@ -792,8 +804,8 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
                 page = self.stackedWidget.currentWidget()
                 if page:
                     self._on_page_changed(self.stackedWidget.currentIndex())
-                # 连接后预加载画面页与游戏页数据（无论当前停在哪一页），切换过去时无需再等读取
-                self._refresh_pages(("picturePage", "gamePage"), delay_ms=800)
+                # 连接后预加载画面页、游戏页与信号源与音频页数据（无论当前停在哪一页）
+                self._refresh_pages(("picturePage", "gamePage", "sourcePage"), delay_ms=800)
                 # 检测 4K 状态
                 QTimer.singleShot(1500, self._check_4k_state)
                 # 首次连接后同步 ADB 保活守护状态，工具页卡片不需要再手动点检测

@@ -100,6 +100,7 @@ final class AppState: ObservableObject {
     @Published var scannedDeviceModels: [String: String] = [:]
     @Published var selectedDevice: String = ""
     @Published var activeSource: String = "未知"
+    @Published var activeSoundOutput: String = "未知"
     @Published var loadedPages: Set<String> = []
     @Published var isBusy: Bool = false
     /// 正在刷新的页面，用于显示 loading 遮罩
@@ -525,6 +526,7 @@ final class AppState: ObservableObject {
                     self.loadedPages = []
                     self.loadingPages = []
                     self.activeSource = "未知"
+                    self.activeSoundOutput = "未知"
                     self.hdrLastState = nil
                     // scannedDevices 只存在内存里、不持久化：重启后列表是空的，
                     // 虽然自动连上了保存的 IP，下拉框却还显示占位符。
@@ -537,9 +539,10 @@ final class AppState: ObservableObject {
                         self.scannedDevices.insert(ip, at: 0)
                         self.selectedDevice = ip
                     }
-                    // 与原版一致：连接后只预刷画面和游戏两页，其余切过去时懒加载
+                    // 连接后预刷画面、游戏与信号源（信号源页只读 settings，约 80ms，确保菜单栏和快捷键同步）
                     self.refreshPage("picture")
                     self.refreshPage("game")
+                    self.refreshPage("source")
                     self.pollHdrState(force: true)
                     self.checkAutomaticTasks()
                     self.check4KState()
@@ -595,6 +598,7 @@ final class AppState: ObservableObject {
         loadedPages = []
         loadingPages = []
         activeSource = "未知"
+        activeSoundOutput = "未知"
         hdrLastState = nil
         stopSourcePolling()
         if !ip.isEmpty {
@@ -779,6 +783,10 @@ final class AppState: ObservableObject {
             var settingsVals: [String: String] = [:]
             if !settingsKeys.isEmpty {
                 settingsVals = self.adb.settingsGetBatch(settingsKeys)
+                if let rawSound = settingsVals[RegisterMap.soundOutputKey],
+                   let normalizedSound = RegisterMap.normalizeSoundOutput(rawSound) {
+                    settingsVals[RegisterMap.soundOutputKey] = String(normalizedSound)
+                }
             }
             if !settingsVals.isEmpty {
                 DispatchQueue.main.async {
@@ -826,10 +834,17 @@ final class AppState: ObservableObject {
                     self.reconcileCrosshairModeState()
                 }
 
-                if page == "source",
-                   let s = settingsVals["mitv.tvplayer.hdmi.last.source"],
-                   let n = Int(s.trimmingCharacters(in: .whitespacesAndNewlines)) {
-                    self.activeSource = RegisterMap.sourceNames[n] ?? s
+                if page == "source" {
+                    if let s = settingsVals["mitv.tvplayer.hdmi.last.source"],
+                       let n = Int(s.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                        self.activeSource = RegisterMap.sourceNames[n] ?? s
+                    }
+                    if let rawSound = settingsVals[RegisterMap.soundOutputKey],
+                       let soundId = RegisterMap.normalizeSoundOutput(rawSound) {
+                        self.activeSoundOutput = RegisterMap.soundOutputNames[soundId] ?? "\(soundId)"
+                    } else {
+                        self.activeSoundOutput = "未知"
+                    }
                 }
                 self.loadingPages.remove(page)
                 if let t0 = self.pageAppearTimes[page] {
@@ -1244,6 +1259,37 @@ final class AppState: ObservableObject {
         }
     }
 
+    func setSoundOutput(_ value: Int) {
+        guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
+        guard isConnected else { return log("未连接") }
+        guard let normalized = RegisterMap.normalizeSoundOutput(value) else {
+            return log("未知声音输出选项: \(value)")
+        }
+        let name = RegisterMap.soundOutputNames[normalized] ?? "\(normalized)"
+        let prevRaw = currentValues[RegisterMap.soundOutputKey]
+        let prevActive = activeSoundOutput
+        let request = connectionIntent.generation
+        let targetSerial = adb.serial
+
+        currentValues[RegisterMap.soundOutputKey] = String(normalized)
+        activeSoundOutput = name
+        log("声音输出: \(name)")
+
+        runPictureChange {
+            do {
+                try self.adb.setSoundOutput(normalized, target: targetSerial)
+                try self.adb.checkedShell("settings put global \(RegisterMap.soundOutputKey) \(normalized)", target: targetSerial)
+            } catch {
+                DispatchQueue.main.async {
+                    guard self.connectionIntent.isCurrent(request) else { return }
+                    self.currentValues[RegisterMap.soundOutputKey] = prevRaw
+                    self.activeSoundOutput = prevActive
+                    self.log("声音输出切换失败: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
     // MARK: - 屏幕灯
 
     func setLightMode(_ value: Int) {
@@ -1370,17 +1416,29 @@ final class AppState: ObservableObject {
         let connectionRequest = connectionIntent.generation
         let pollRequest = pageRefreshIntent.begin("sourcePoll")
         runBackground {
-            let raw = self.adb.settingsGet("mitv.tvplayer.hdmi.last.source")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard let n = Int(raw), let name = RegisterMap.sourceNames[n] else { return }
+            let vals = self.adb.settingsGetBatch(PageDataKeys.sourceSettings)
+            guard !vals.isEmpty else { return }
             DispatchQueue.main.async {
                 guard self.sourcePollArmed, self.isConnected,
                       self.connectionIntent.isCurrent(connectionRequest),
                       self.pageRefreshIntent.isCurrent("sourcePoll", pollRequest) else { return }
-                self.currentValues["mitv.tvplayer.hdmi.last.source"] = String(n)
-                if self.activeSource != name {
-                    self.activeSource = name
-                    self.log("信号源变化: \(name)")
+                if let rawSource = vals["mitv.tvplayer.hdmi.last.source"],
+                   let n = Int(rawSource.trimmingCharacters(in: .whitespacesAndNewlines)),
+                   let name = RegisterMap.sourceNames[n] {
+                    self.currentValues["mitv.tvplayer.hdmi.last.source"] = String(n)
+                    if self.activeSource != name {
+                        self.activeSource = name
+                        self.log("信号源变化: \(name)")
+                    }
+                }
+                if let rawSound = vals[RegisterMap.soundOutputKey],
+                   let soundId = RegisterMap.normalizeSoundOutput(rawSound),
+                   let soundName = RegisterMap.soundOutputNames[soundId] {
+                    self.currentValues[RegisterMap.soundOutputKey] = String(soundId)
+                    if self.activeSoundOutput != soundName {
+                        self.activeSoundOutput = soundName
+                        self.log("声音输出变化: \(soundName)")
+                    }
                 }
             }
         }
@@ -1990,6 +2048,7 @@ final class AppState: ObservableObject {
         case "dynamic_definition":  return intValue("picture_dynamic_definition", default: -1)
         case "hdr_tone_mapping":    return intValue("settings_display_hdr_color_tone", default: -1)
         case "source":              return intValue("mitv.tvplayer.hdmi.last.source", default: -1)
+        case "sound_output":        return intValue(RegisterMap.soundOutputKey, default: -1)
         case "freesync":            return intValue("freesync", default: -1)
         case "light_sensor":        return intValue("tv_picture_light_sensor", default: -1)
         case "backlight":           return intValue("picture_backlight", default: -1)
@@ -2015,6 +2074,7 @@ final class AppState: ObservableObject {
         case "dynamic_definition":  setDynamicDefinition(value)
         case "hdr_tone_mapping":    setHdrToneMapping(value)
         case "source":              setSource(value)
+        case "sound_output":        setSoundOutput(value)
         case "freesync":            setFreesync(value == 1)
         case "light_sensor":        setLightSensor(value == 1)
         case "light_mode":          setLightMode(value)
@@ -2150,6 +2210,7 @@ final class AppState: ObservableObject {
         case "response_time_cycle": cycleResponseTime()
         case "freesync_toggle": toggleFreesync()
         case "input_source_cycle": cycleSource()
+        case "sound_output_cycle": cycleSoundOutput()
         default: break
         }
     }
@@ -2282,6 +2343,14 @@ final class AppState: ObservableObject {
                   valueKey: "mitv.tvplayer.hdmi.last.source",
                   nameFor: { RegisterMap.sourceNames[$0] ?? "\($0)" }) { [weak self] v in
             self?.setSource(v)
+        }
+    }
+
+    private func cycleSoundOutput() {
+        cycleStep(actionId: "sound_output_cycle", label: "声音输出", order: [0, 8, 5],
+                  valueKey: RegisterMap.soundOutputKey,
+                  nameFor: { RegisterMap.soundOutputNames[$0] ?? "\($0)" }) { [weak self] v in
+            self?.setSoundOutput(v)
         }
     }
 

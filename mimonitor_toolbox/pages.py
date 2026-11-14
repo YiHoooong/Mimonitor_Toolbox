@@ -54,12 +54,20 @@ from .core import (
     ADJUSTABLE_HOTKEY_PARAMS,
     HOTKEY_KEYS,
     HOTKEY_MODIFIERS,
+    SOUND_OUTPUT_OPTIONS,
+    SOUND_OUTPUT_SETTINGS_KEY,
     bundled_resource_path,
     load_settings,
     update_settings,
 )
 from .network_scan import enumerate_windows_adapter_addresses
-from .presets import BASELINE_PRESET_ID, find_preset, new_id, unique_name
+from .presets import (
+    BASELINE_PRESET_ID,
+    find_preset,
+    new_id,
+    preset_sound_output_label,
+    unique_name,
+)
 from .windows import list_windows_displays
 from .widgets import (
     TRAY_ROW_HEIGHT,
@@ -117,7 +125,7 @@ class PagesMixin:
         self.addSubInterface(self.home_page, FIF.HOME, "主页 & 连接")
         self.addSubInterface(self.picture_page, FIF.PALETTE, "画面设置")
         self.addSubInterface(self.game_page, FIF.GAME, "游戏模式")
-        self.addSubInterface(self.source_page, FIF.SYNC, "信号源切换")
+        self.addSubInterface(self.source_page, FIF.SYNC, "信号源与音频")
         self.addSubInterface(self.light_page, FIF.BRIGHTNESS, "屏幕灯")
         self.addSubInterface(self.tray_page, FIF.MENU, "托盘菜单")
         self.addSubInterface(self.preset_page, FIF.SAVE, "预设模式")
@@ -468,14 +476,20 @@ class PagesMixin:
         return scroll
 
     def _make_source_page(self):
+        scroll = ScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+
         container = QWidget()
+        container.setObjectName("Container")
+        container.setStyleSheet("#Container { background: transparent; }")
         layout = QVBoxLayout(container)
         layout.setContentsMargins(40, 30, 40, 30)
         layout.setSpacing(20)
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         title_row = QHBoxLayout()
-        title = SubtitleLabel("信号源切换", container)
+        title = SubtitleLabel("信号源与音频", container)
 
         title_row.addWidget(title)
         title_row.addStretch(1)
@@ -489,6 +503,10 @@ class PagesMixin:
         card_layout.setContentsMargins(20, 20, 20, 20)
         card_layout.setSpacing(15)
 
+        source_card_title = BodyLabel("输入信号源", card)
+        source_card_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card_layout.addWidget(source_card_title)
+
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(12)
         btn_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -500,7 +518,7 @@ class PagesMixin:
             b = ToggleButton(n, card)
             b.setCheckable(True)
             b.setFixedSize(120, 45)
-            b.clicked.connect(lambda checked=False, val=v, name=n: self._set("mitv.tvplayer.hdmi.last.source", val, name))
+            b.clicked.connect(lambda checked=False, val=v, name=n: self._on_source_button_clicked(val, name))
             btn_layout.addWidget(b)
             self.state_buttons["mitv.tvplayer.hdmi.last.source"][v] = b
 
@@ -524,7 +542,70 @@ class PagesMixin:
         status_layout.addWidget(self.source_label)
 
         layout.addWidget(status_card)
-        return container
+
+        # Sound Output Card
+        sound_card = SimpleCardWidget(container)
+        sound_layout = QVBoxLayout(sound_card)
+        sound_layout.setContentsMargins(20, 20, 20, 20)
+        sound_layout.setSpacing(15)
+
+        sound_card_title = BodyLabel("声音输出", sound_card)
+        sound_card_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sound_layout.addWidget(sound_card_title)
+
+        sound_btn_layout = QHBoxLayout()
+        sound_btn_layout.setSpacing(12)
+        sound_btn_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        if SOUND_OUTPUT_SETTINGS_KEY not in self.state_buttons:
+            self.state_buttons[SOUND_OUTPUT_SETTINGS_KEY] = {}
+
+        for v, n in SOUND_OUTPUT_OPTIONS:
+            b = ToggleButton(n, sound_card)
+            b.setCheckable(True)
+            b.setFixedSize(168, 45)
+            b.clicked.connect(lambda checked=False, val=v, name=n: self._on_sound_output_clicked(val, name))
+            sound_btn_layout.addWidget(b)
+            self.state_buttons[SOUND_OUTPUT_SETTINGS_KEY][v] = b
+
+        sound_layout.addLayout(sound_btn_layout)
+        layout.addWidget(sound_card)
+
+        # Active Sound Output Status Card
+        sound_status_card = SimpleCardWidget(container)
+        sound_status_layout = QVBoxLayout(sound_status_card)
+        sound_status_layout.setContentsMargins(20, 20, 20, 20)
+        sound_status_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        sound_lbl = BodyLabel("当前声音输出", sound_status_card)
+        sound_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sound_status_layout.addWidget(sound_lbl)
+
+        self.sound_output_label = TitleLabel("未知", sound_status_card)
+        self.sound_output_label.setStyleSheet("color: #00bcd4; font-size: 32px; font-weight: bold; margin-top: 10px;")
+        self.sound_output_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sound_status_layout.addWidget(self.sound_output_label)
+
+        layout.addWidget(sound_status_card)
+
+        sync_conn = getattr(self, "_sync_source_page_connection_state", None)
+        if callable(sync_conn):
+            sync_conn()
+
+        scroll.setWidget(container)
+        return scroll
+
+    def _on_source_button_clicked(self, val, name):
+        self._set("mitv.tvplayer.hdmi.last.source", val, name)
+        if not getattr(self, "adb_connected", False) and hasattr(self, "_optimistic_highlight"):
+            current = getattr(self, "current_vals", {}).get("mitv.tvplayer.hdmi.last.source")
+            self._optimistic_highlight("mitv.tvplayer.hdmi.last.source", current)
+
+    def _on_sound_output_clicked(self, val, name):
+        self.set_sound_output(val, name)
+        if not getattr(self, "adb_connected", False) and hasattr(self, "_optimistic_highlight"):
+            current = getattr(self, "current_vals", {}).get(SOUND_OUTPUT_SETTINGS_KEY)
+            self._optimistic_highlight(SOUND_OUTPUT_SETTINGS_KEY, current)
 
     def _make_light_page(self):
         scroll = ScrollArea(self)
@@ -756,8 +837,12 @@ class PagesMixin:
     def _make_preset_card(self, preset, parent, active=False):
         preset_id = preset.get("id")
         values = preset.get("values") or {}
+        caption = f"{len(values)} 项设置"
+        sound_label = preset_sound_output_label(values)
+        if sound_label:
+            caption = f"{caption} · 声音: {sound_label}"
         card = PresetCard(preset_id, preset.get("name") or preset_id,
-                          f"{len(values)} 项设置", parent, active=active)
+                          caption, parent, active=active)
         card.apply_requested.connect(self._preset_apply)
         card.edit_requested.connect(self._preset_edit)
         card.rename_requested.connect(self._preset_rename)
@@ -1158,7 +1243,7 @@ class PagesMixin:
         layout.addWidget(SubtitleLabel("预设模式", container))
         hint = CaptionLabel(
             "「无预设」表示不使用任何预设；正在使用的预设会标上「已应用」，"
-            "此时在画面设置页的改动会自动保存进它。"
+            "此时在画面设置或声音输出中的改动会自动保存进它。"
             "点「编辑」进入预览，顶部悬浮条上完成或取消。",
             container,
         )
@@ -1590,7 +1675,8 @@ class PagesMixin:
             ("color_temp_cycle", "色温 循环切换"),
             ("response_time_cycle", "响应时间 循环切换"),
             ("freesync_toggle", "FreeSync 开关切换"),
-            ("input_source_cycle", "信号源 循环切换")
+            ("input_source_cycle", "信号源 循环切换"),
+            ("sound_output_cycle", "声音输出 循环切换"),
         ]
         
         def add_hotkey_row(row_layout_parent, label_text, action_name):

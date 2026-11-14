@@ -287,6 +287,28 @@ class ConnectByDeviceStateTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(state, "offline")
 
+    def test_set_sound_output_uses_tvservice_without_settings_put(self):
+        from mimonitor_toolbox import adb as adb_runtime
+
+        calls = []
+
+        def fake_shell(command, check=False):
+            calls.append((command, check))
+            return "Result: Parcel(00000000    '....')"
+
+        client = adb_runtime.Adb("192.168.1.9")
+        with mock.patch.object(client, "shell", side_effect=fake_shell):
+            client.set_sound_output(8, check=True)
+
+        self.assertEqual(len(calls), 1)
+        command, check = calls[0]
+        self.assertTrue(check)
+        self.assertIn("service call TvService 3 s16", command)
+        self.assertIn("MtkDirectTool", command)
+        self.assertIn("setSoundOutput", command)
+        self.assertIn("8", command)
+        self.assertNotIn("settings put", command)
+
 
 if __name__ == "__main__":
     unittest.main()

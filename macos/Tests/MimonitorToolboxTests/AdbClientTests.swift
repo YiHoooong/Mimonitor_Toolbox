@@ -114,4 +114,13 @@ final class AdbClientTests: XCTestCase {
 
         XCTAssertEqual(client.disconnect(ip: "192.168.1.20"), "disconnect\n192.168.1.20:5555\n")
     }
+
+    func testSetSoundOutputUsesTvServiceAndChecksErrors() throws {
+        try fake("printf '%s\\n' \"$@\"\n") { client in
+            XCTAssertNoThrow(try client.setSoundOutput(8))
+        }
+        try fake("echo 'Parcel: Exception occurred'; exit 0\n") { client in
+            XCTAssertThrowsError(try client.setSoundOutput(5))
+        }
+    }
 }

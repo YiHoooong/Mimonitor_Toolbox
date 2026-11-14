@@ -17,6 +17,14 @@ It provides:
 - `setColorGains <red> <green> <blue>` for custom color temperature gain
 - `setHdrToneMapping <mtkValue> [isUpdate]` for HDR tone mapping; this mirrors
   Xiaomi's native path by also calling `IMiTVProvider.setHdrAttr(4, value)`
+- `setSoundOutput <deviceId>` switches audio output device (`0`=本机扬声器, `3`=ARC,
+  `5`=耳机孔, `8`=HDMI(eARC)) via `IAudioService` (`xmSetForceUse`,
+  `setHdmiSystemAudioSupported`, `setWiredDeviceConnectionState`), `AudioSystem`
+  parameters (`xiaomi_switch_device`, `switch_output_device`), and `ITvService`
+  state/sticky broadcast (`saveSoundOutputDevice` tx 32 + `broadcastSoundOutputDeviceChanged` tx 33).
+  Does not modify `Settings.Global` (which must be updated via `adb shell settings put global`).
+- `getSoundOutput` reads current `IAudioService` `xmGetForceUse(1)`,
+  `isHdmiSystemAudioSupported()`, `xmfeaspdifdet`, and `ITvService.getSoundOutputDevice()` (tx 34).
 
 The color gain command uses the factory white-balance API
 `MtkTvFApiDisplay.setWbGainOffsetEx(...)` so red, green, and blue are committed

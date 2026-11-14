@@ -5,13 +5,15 @@ import MimonitorPresetCore
 
 final class AdbPresetDeviceTests: XCTestCase {
     private func device(incomplete: Bool = false, customTemperature: Bool = false, staleTemperature: Bool = false,
-                        invalidTemperature: Bool = false,
+                        invalidTemperature: Bool = false, soundOutput: String? = nil,
+                        dropSoundOutputUpdates: Bool = false,
                         test: (AdbPresetDevice) throws -> Void) throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("preset-device-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let executable = directory.appendingPathComponent("adb")
         let updates = directory.appendingPathComponent("settings-updates")
+        let soundLine = soundOutput.map { "'\(PicturePresetPlan.soundOutputKey)=\($0)' " } ?? ""
         try Data().write(to: updates)
         let script = """
         #!/bin/sh
@@ -23,10 +25,13 @@ final class AdbPresetDeviceTests: XCTestCase {
               'picture_hue=49' 'picture_sharpness=30' 'picture_color_temperature=\(customTemperature && !staleTemperature ? "3" : "1")' \
               'picture_red_gain=1024' 'picture_green_gain=1024' 'picture_blue_gain=1024' \
               'picture_local_dimming=3' 'picture_dynamic_definition=0' 'picture_response_time=2' \
-              'tv_picture_advanced_video_color_space=6'
+              'tv_picture_advanced_video_color_space=6' \(soundLine)
             cat '\(updates.path)' ;;
           'settings put global '*)
             set -- $4
+            if [ "\(dropSoundOutputUpdates ? 1 : 0)" = "1" ] && [ "$4" = "\(PicturePresetPlan.soundOutputKey)" ]; then
+              exit 0
+            fi
             printf '%s=%s\\n' "$4" "$5" >> '\(updates.path)' ;;
           *batchGet*)
             printf '%s\\n' 'g_disp__disp_back_light=52' 'g_video__vid_gamut_mapping_mode=6' \
@@ -103,5 +108,23 @@ final class AdbPresetDeviceTests: XCTestCase {
 
     func testCaptureRejectsUnknownHardwareTemperatureInsteadOfUsingSettingsMirror() throws {
         try device(invalidTemperature: true) { device in XCTAssertThrowsError(try device.capture()) }
+    }
+
+    func testSoundOutputCaptureApplyAndReadbackVerification() throws {
+        try device(soundOutput: "0") { device in
+            var values = try device.capture()
+            XCTAssertEqual(values[PicturePresetPlan.soundOutputKey], "0")
+            values[PicturePresetPlan.soundOutputKey] = "8"
+            let report = try device.apply(values)
+            XCTAssertTrue(report.ok)
+            XCTAssertTrue(report.applied.contains("声音输出"))
+        }
+        try device(soundOutput: "0", dropSoundOutputUpdates: true) { device in
+            var values = try device.capture()
+            values[PicturePresetPlan.soundOutputKey] = "5"
+            let report = try device.apply(values)
+            XCTAssertFalse(report.ok)
+            XCTAssertTrue(report.failed.contains { $0.hasPrefix("声音输出:") })
+        }
     }
 }

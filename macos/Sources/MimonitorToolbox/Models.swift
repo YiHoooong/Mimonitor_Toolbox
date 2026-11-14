@@ -39,6 +39,15 @@ enum RegisterMap {
     static let modeNames: [Int: String] = [14: "标准", 10: "游戏", 9: "电影"]
     /// 输入源 id -> 名称
     static let sourceNames: [Int: String] = [23: "HDMI 1", 24: "HDMI 2", 29: "DP", 30: "USB-C"]
+    /// 声音输出设备 id -> 名称（3 为历史 ARC 值，统一按 eARC 展示）
+    static let soundOutputNames: [Int: String] = [0: "本机扬声器", 8: "HDMI(eARC)", 5: "耳机孔", 3: "HDMI(eARC)"]
+    static let soundOutputKey = PicturePresetPlan.soundOutputKey
+    static func normalizeSoundOutput(_ value: Int) -> Int? {
+        PicturePresetPlan.normalizeSoundOutput(value)
+    }
+    static func normalizeSoundOutput(_ raw: String) -> Int? {
+        PicturePresetPlan.normalizeSoundOutput(raw)
+    }
     /// 游戏画面模式集合（用于判断是否处于游戏模式）
     /// 模式分组（移植自 core.py PICTURE_MODE_GROUPS）：同一组内的模式在 UI 上算同一类。
     static let pictureModeGroups: [Int: Set<Int>] = [
@@ -121,7 +130,7 @@ enum PageDataKeys {
         "monitor_menu_fps_counter", "monitor_menu_stopwatch", "monitor_menu_timer",
         "mitv.tvplayer.hdmi.last.source",
     ]
-    static let sourceSettings = ["mitv.tvplayer.hdmi.last.source"]
+    static let sourceSettings = ["mitv.tvplayer.hdmi.last.source", RegisterMap.soundOutputKey]
     static let lightSettings = [
         "atmosphere_light_switcher_pm2", "atmosphere_light_illumination",
         "atmosphere_light_color_temp", "atmosphere_light_color_value",
@@ -185,6 +194,11 @@ enum OptionLists {
         .init(label: "HDMI 1", value: 23), .init(label: "HDMI 2", value: 24),
         .init(label: "DP", value: 29), .init(label: "USB-C", value: 30),
     ]
+    static let soundOutput: [Option] = [
+        .init(label: "本机扬声器", value: 0),
+        .init(label: "HDMI(eARC)", value: 8),
+        .init(label: "耳机孔", value: 5),
+    ]
     static let lightMode: [Option] = [
         .init(label: "关闭", value: 4), .init(label: "照明", value: 0), .init(label: "纯色", value: 2),
         .init(label: "屏幕同色", value: 1), .init(label: "七彩梦境", value: 3),
@@ -212,7 +226,7 @@ enum Page: String, CaseIterable, Identifiable, Hashable {
         case .presets: return "预设模式"
         case .autoTasks: return "自动任务"
         case .game: return "游戏模式"
-        case .source: return "信号源切换"
+        case .source: return "信号源与音频"
         case .light: return "屏幕灯"
         // macOS 独有的一页：Windows 原版没有菜单栏这个概念（那边是托盘图标）
         case .menuBar: return "菜单栏"

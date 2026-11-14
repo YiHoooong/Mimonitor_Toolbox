@@ -628,6 +628,15 @@ final class AdbClient {
         shell(buildTvserviceCommand(jar: jar, args: ["MtkDirectTool", "setColorGains", red, green, blue]))
     }
 
+    func setSoundOutput(_ deviceId: Int, target: String? = nil) throws {
+        let jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
+        let resolvedTarget = (target?.isEmpty == false) ? target! : serial
+        try checkedShell(
+            buildTvserviceCommand(jar: jar, args: ["MtkDirectTool", "setSoundOutput", String(deviceId)]),
+            target: resolvedTarget
+        )
+    }
+
     private func jniBatchCommand(keys: [String]) -> String? {
         let safeKeys = keys.filter { !$0.isEmpty && $0.allSatisfy { $0.isLetter || $0.isNumber || $0 == "_" } }
         guard !safeKeys.isEmpty else { return nil }

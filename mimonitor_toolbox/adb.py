@@ -466,6 +466,14 @@ class Adb:
             jar, ["MtkDirectTool", "setHdrToneMapping", val, upd]
         )
         return self.shell(command, check=check)
+    def set_sound_output(self, device_id, check=False):
+        """通过 TvService 3 调用 MtkDirectTool 切换音频输出设备（不在此处写 Settings.Global）。"""
+        _adb_log(f"set_sound_output = {device_id}")
+        jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
+        command = build_tvservice_app_process_command(
+            jar, ["MtkDirectTool", "setSoundOutput", int(device_id)]
+        )
+        return self.shell(command, check=check)
     def jni_set_color_gains(self, red, green, blue, check=False):
         _adb_log(f"jni_set_color_gains r={red} g={green} b={blue}")
         jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"

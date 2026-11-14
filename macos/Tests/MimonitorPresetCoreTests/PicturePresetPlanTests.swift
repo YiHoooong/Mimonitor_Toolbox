@@ -96,4 +96,36 @@ final class PicturePresetPlanTests: XCTestCase {
         XCTAssertNil(values["settings_display_hdr_color_tone"])
         XCTAssertNil(values["freesync"])
     }
+
+    func testSoundOutputNormalizesLegacyArcAndAppliesBeforeSettings() {
+        let normalized = PicturePresetPlan.normalize(
+            settings: [PicturePresetPlan.soundOutputKey: "3"], jni: [:], source: "29")
+        XCTAssertEqual(normalized[PicturePresetPlan.soundOutputKey], "8")
+
+        let rejected = PicturePresetPlan.normalize(
+            settings: [PicturePresetPlan.soundOutputKey: "99"], jni: [:], source: "29")
+        XCTAssertNil(rejected[PicturePresetPlan.soundOutputKey])
+
+        var changed = values
+        changed[PicturePresetPlan.soundOutputKey] = "3"
+        var commands: [PresetCommand] = []
+        let report = PicturePresetPlan.apply(changed, source: "29") { commands.append($0) }
+        XCTAssertTrue(report.ok)
+        XCTAssertEqual(report.applied.count, 17)
+        XCTAssertTrue(report.applied.contains("声音输出"))
+        XCTAssertEqual(Array(commands.suffix(2)), [
+            .soundOutput("8"),
+            .setting(PicturePresetPlan.soundOutputKey, "8"),
+        ])
+    }
+
+    func testInvalidSoundOutputFailsWithoutCallingDevice() {
+        var changed = values
+        changed[PicturePresetPlan.soundOutputKey] = "99"
+        var commands: [PresetCommand] = []
+        let report = PicturePresetPlan.apply(changed, source: "29") { commands.append($0) }
+        XCTAssertFalse(report.ok)
+        XCTAssertEqual(report.failed.count, 1)
+        XCTAssertFalse(commands.contains { if case .soundOutput = $0 { return true }; return false })
+    }
 }

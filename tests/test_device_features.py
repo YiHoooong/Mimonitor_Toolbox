@@ -241,6 +241,8 @@ class SourcePollingTests(unittest.TestCase):
 
             def get(self, key, check=False):
                 reads.append((key, check))
+                if key == "mitv.settings.db.sound.device.output_device":
+                    return "3"
                 return "29"
 
         class Host(device_features.DeviceFeaturesMixin):
@@ -268,11 +270,19 @@ class SourcePollingTests(unittest.TestCase):
 
         self.assertEqual(
             reads,
-            [("mitv.tvplayer.hdmi.last.source", True)],
+            [
+                ("mitv.tvplayer.hdmi.last.source", True),
+                ("mitv.settings.db.sound.device.output_device", False),
+            ],
         )
         self.assertEqual(
             host.values_signal.events,
-            [({"mitv.tvplayer.hdmi.last.source": 29},)],
+            [(
+                {
+                    "mitv.tvplayer.hdmi.last.source": 29,
+                    "mitv.settings.db.sound.device.output_device": 8,
+                },
+            )],
         )
         self.assertFalse(host._source_poll_checking)
 
@@ -1180,6 +1190,56 @@ class WindowsResumeReconnectTests(unittest.TestCase):
 
         self.assertNotIn(["connect", "192.168.5.205:5555"], commands)
 
+    def test_server_monitor_and_keepalive_skip_while_connecting_or_scanning(self):
+        host = ReconnectHost()
+        host.adb_connected = False
+        host._adb_server_monitor_checking = False
+        host._adb_server_retry_after = 0.0
+        host._adb_keepalive_checking = False
+        host._adb_busy_until = 0.0
+        host.adb_server_event = FakeSignal()
+
+        with mock.patch.object(device_features, "is_adb_server_alive", return_value=False) as alive, \
+                mock.patch.object(device_features, "adb_device_state") as state, \
+                mock.patch.object(device_features, "async_run", side_effect=lambda fn: fn()):
+            host._connection_in_progress = True
+            host._scan_running = False
+            host._monitor_adb_server()
+            host._keep_adb_alive()
+
+            host._connection_in_progress = False
+            host._scan_running = True
+            host._monitor_adb_server()
+            host._keep_adb_alive()
+
+        alive.assert_not_called()
+        state.assert_not_called()
+        self.assertEqual(host.adb_server_event.events, [])
+
+    def test_server_monitor_warms_quietly_on_cold_start_then_alerts_if_killed_later(self):
+        host = ReconnectHost()
+        host.adb_connected = False
+        host._adb_server_ever_alive = False
+        host._adb_server_monitor_checking = False
+        host._adb_server_retry_after = 0.0
+        host.adb_server_event = FakeSignal()
+
+        with mock.patch.object(device_features, "is_adb_server_alive", side_effect=[False, False]), \
+                mock.patch.object(device_features, "ensure_adb_server", return_value=True), \
+                mock.patch.object(device_features, "adb_run", return_value="connected"), \
+                mock.patch.object(device_features, "async_run", side_effect=lambda fn: fn()):
+            host._monitor_adb_server()
+            self.assertEqual(host.adb_server_event.events, [("healthy", "")])
+            self.assertTrue(host._adb_server_ever_alive)
+
+            host.adb_server_event.events.clear()
+            host._adb_server_monitor_checking = False
+            host._monitor_adb_server()
+            self.assertEqual(
+                host.adb_server_event.events,
+                [("restarting", ""), ("recovered", "connected")],
+            )
+
     def test_manual_connect_worker_aborts_when_disconnect_finishes_first(self):
         host = ReconnectHost()
         host._connection_in_progress = False
@@ -1421,6 +1481,160 @@ class GuardianHealthTests(unittest.TestCase):
     def test_adb_disabled_is_unhealthy(self):
         status = self._status(adb_enabled="0")
         self.assertFalse(status["ok"])
+
+
+class SoundOutputDevicePipelineTests(unittest.TestCase):
+    """声音输出在 sourcePage 键表、预设快照采集及轮询应用中的行为。"""
+
+    def test_source_page_includes_sound_output_key(self):
+        from mimonitor_toolbox import core
+
+        class Probe(device_features.DeviceFeaturesMixin):
+            pass
+
+        probe = Probe()
+        probe.initialize_device_features()
+        self.assertIn(
+            core.SOUND_OUTPUT_SETTINGS_KEY,
+            probe._page_data_keys["sourcePage"]["settings"],
+        )
+
+    def test_read_picture_values_captures_and_normalizes_sound_output(self):
+        from mimonitor_toolbox import core
+
+        class FakeAdb:
+            def transaction(self):
+                return nullcontext()
+
+            def shell(self, _cmd, check=False):
+                return "picture_mode=14\npicture_contrast=50\n"
+
+            def jni_batch_get_or_single(self, keys, check=False):
+                if keys == ["g_video__freesync_switch"]:
+                    return {"g_video__freesync_switch": "0"}
+                return {}
+
+            def get(self, key, check=False):
+                if key == core.SOUND_OUTPUT_SETTINGS_KEY:
+                    return "3"
+                return "23"
+
+        class Host(device_features.DeviceFeaturesMixin):
+            adb = FakeAdb()
+
+        vals = Host()._read_picture_values()
+        self.assertEqual(vals[core.SOUND_OUTPUT_SETTINGS_KEY], 8)
+
+    def test_apply_polled_values_normalizes_arc_and_updates_label_and_buttons(self):
+        from mimonitor_toolbox import core
+
+        highlighted = []
+
+        class FakeLabel:
+            def __init__(self):
+                self.text = None
+
+            def setText(self, text):
+                self.text = text
+
+        class Host(device_features.DeviceFeaturesMixin):
+            current_vals = {}
+            sliders = {}
+            state_buttons = {
+                core.SOUND_OUTPUT_SETTINGS_KEY: {0: "btn0", 8: "btn8", 5: "btn5"}
+            }
+            sound_output_label = FakeLabel()
+
+            def _highlight_btn(self, btn, active):
+                highlighted.append((btn, active))
+
+        host = Host()
+        host._apply_polled_values({core.SOUND_OUTPUT_SETTINGS_KEY: "3"})
+        self.assertEqual(host.current_vals[core.SOUND_OUTPUT_SETTINGS_KEY], 8)
+        self.assertEqual(host.sound_output_label.text, "HDMI(eARC)")
+        self.assertEqual(
+            highlighted,
+            [("btn0", False), ("btn8", True), ("btn5", False)],
+        )
+
+    def test_source_poll_still_emits_source_if_sound_output_fails(self):
+        from mimonitor_toolbox import core
+
+        page = SimpleNamespace(objectName=lambda: "sourcePage")
+
+        class FakeAdb:
+            def transaction(self):
+                return nullcontext()
+
+            def get(self, key, check=False):
+                if key == core.SOUND_OUTPUT_SETTINGS_KEY:
+                    raise RuntimeError("not supported")
+                return "24"
+
+        class Host(device_features.DeviceFeaturesMixin):
+            adb_connected = True
+            _cleanup_done = False
+            _windows_session_ending = False
+            _source_poll_armed = True
+            _source_poll_checking = False
+            stackedWidget = SimpleNamespace(currentWidget=lambda: page)
+            adb = FakeAdb()
+            values_signal = FakeSignal()
+
+            def _adb_channel_busy(self):
+                return False
+
+        host = Host()
+        with mock.patch.object(device_features, "async_run", side_effect=lambda fn: fn()):
+            host._poll_source_state()
+
+        self.assertEqual(
+            host.values_signal.events,
+            [({"mitv.tvplayer.hdmi.last.source": 24},)],
+        )
+
+    def test_refresh_source_page_normalizes_arc_sound_output(self):
+        from mimonitor_toolbox import core
+
+        class FakeAdb:
+            def transaction(self):
+                return nullcontext()
+
+            def shell(self, _cmd):
+                return (
+                    "mitv.tvplayer.hdmi.last.source=23\n"
+                    f"{core.SOUND_OUTPUT_SETTINGS_KEY}=3\n"
+                )
+
+        class Host(device_features.DeviceFeaturesMixin):
+            pass
+
+        host = Host()
+        host.initialize_device_features()
+        host.adb_connected = True
+        host.adb = FakeAdb()
+        host.values_signal = FakeSignal()
+        host.page_refresh_finished = FakeSignal()
+        host._page_loading = set()
+        host._page_loaded = set()
+        host._mark_adb_busy = lambda _s=4.0: None
+        host._show_loading_overlay = lambda _p: None
+        host.log = lambda _m: None
+
+        with mock.patch.object(device_features, "async_run", side_effect=lambda fn: fn()):
+            host._refresh_page_data("sourcePage")
+
+        self.assertEqual(
+            host.values_signal.events,
+            [({
+                "mitv.tvplayer.hdmi.last.source": 23,
+                core.SOUND_OUTPUT_SETTINGS_KEY: 8,
+            },)],
+        )
+        self.assertEqual(
+            host.page_refresh_finished.events,
+            [("sourcePage", True)],
+        )
 
 
 if __name__ == "__main__":

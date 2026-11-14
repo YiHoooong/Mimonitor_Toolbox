@@ -81,6 +81,8 @@ final class AdbPresetDevice: PresetDevice {
                     shell = adb.buildTvserviceCommand(jar: jar, args: ["MtkDirectTool", "setColorGains", r, g, b])
                 case .hdrToneMapping(let value):
                     shell = adb.buildTvserviceCommand(jar: jar, args: ["MtkDirectTool", "setHdrToneMapping", value, "3"])
+                case .soundOutput(let value):
+                    shell = adb.buildTvserviceCommand(jar: jar, args: ["MtkDirectTool", "setSoundOutput", value])
                 case .refresh:
                     shell = "am broadcast -a com.xiaomi.mitv.action.PIC_MODE_CHANGED --ei picmode 7"
                 }
@@ -95,6 +97,10 @@ final class AdbPresetDevice: PresetDevice {
                         guard let expected = values[key] else { return false }
                         if key == "picture_mode", let e = Int(expected), let a = Int(actual[key] ?? ""),
                            RegisterMap.pictureModeGroups[e]?.contains(a) == true { return false }
+                        if key == PicturePresetPlan.soundOutputKey,
+                           let normalized = PicturePresetPlan.normalizeSoundOutput(expected) {
+                            return actual[key] != String(normalized)
+                        }
                         return actual[key] != expected
                     }
                     if !mismatches.isEmpty {
@@ -117,5 +123,6 @@ final class AdbPresetDevice: PresetDevice {
         ("精密控光", ["picture_local_dimming"]), ("HDR 色调映射", ["settings_display_hdr_color_tone"]),
         ("动态清晰度", ["picture_dynamic_definition"]), ("灰阶响应时间", ["picture_response_time"]),
         ("色域", ["tv_picture_advanced_video_color_space"]),
+        ("声音输出", [PicturePresetPlan.soundOutputKey]),
     ]
 }

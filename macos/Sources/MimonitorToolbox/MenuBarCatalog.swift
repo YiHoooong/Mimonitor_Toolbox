@@ -56,6 +56,7 @@ enum MenuBarCatalog {
             Option(label: "DP", value: 29),
             Option(label: "USB-C", value: 30),
         ])),
+        MenuBarEntry(id: "sound_output", label: "声音输出", kind: .options(OptionLists.soundOutput)),
         MenuBarEntry(id: "freesync", label: "FreeSync", kind: .options([
             Option(label: "关", value: 0),
             Option(label: "开", value: 1),

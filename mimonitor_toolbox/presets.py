@@ -15,7 +15,10 @@ from dataclasses import dataclass, field
 from .core import (
     CUSTOM_COLOR_TEMP_VALUE,
     HDR_TONE_MAPPING_UI_TO_MTK,
+    SOUND_OUTPUT_SETTINGS_KEY,
+    SOUND_OUTPUT_VALID_VALUES,
     XIAOMI_TO_MTK_COLOR_TEMP,
+    format_sound_output_label,
     is_hdr_tone_mapping_picture_mode,
 )
 
@@ -108,6 +111,37 @@ def _has_freesync(values):
         # 早于本功能的预设没记这一项。不能猜，保持设备现状并说明。
         return False, "这条预设没有记录 FreeSync（保存于旧版本），保持现状"
     return True, ""
+
+
+def _has_sound_output(values):
+    if SOUND_OUTPUT_SETTINGS_KEY not in values:
+        return False, "这条预设没有记录声音输出（保存于旧版本），保持现状"
+    raw = values.get(SOUND_OUTPUT_SETTINGS_KEY)
+    if raw is None or (
+        isinstance(raw, str) and raw.strip().lower() in ("", "null", "none", "n/a")
+    ):
+        return False, "这条预设没有记录声音输出（保存于旧版本），保持现状"
+    return True, ""
+
+
+def _apply_sound_output(adb, values):
+    device_id = _as_int(values, SOUND_OUTPUT_SETTINGS_KEY)
+    if device_id not in SOUND_OUTPUT_VALID_VALUES:
+        raise ValueError(f"不支持的声音输出设备 ID: {device_id}")
+    adb.check_and_heal_jar()
+    adb.set_sound_output(device_id, check=True)
+    adb.put(SOUND_OUTPUT_SETTINGS_KEY, str(device_id), check=True)
+
+
+def preset_sound_output_label(preset_or_values):
+    """返回预设中的声音输出展示文本；旧预设未记录时返回 None。"""
+    values = preset_or_values.get("values") if isinstance(preset_or_values, dict) and "values" in preset_or_values else preset_or_values
+    if not isinstance(values, dict):
+        return None
+    has_val, _ = _has_sound_output(values)
+    if not has_val:
+        return None
+    return format_sound_output_label(values.get(SOUND_OUTPUT_SETTINGS_KEY))
 
 
 def _apply_picture_mode(adb, values):
@@ -253,6 +287,7 @@ PICTURE_ITEMS = (
                      "tv_picture_advanced_video_color_space",
                      "tv_picture_video_color_space"),
     ),
+    PictureItem("sound_output", "声音输出", _apply_sound_output, _has_sound_output),
 )
 
 

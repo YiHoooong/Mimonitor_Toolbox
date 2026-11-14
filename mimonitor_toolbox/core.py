@@ -221,6 +221,46 @@ MTK_TO_XIAOMI_COLOR_TEMP = {v: k for k, v in XIAOMI_TO_MTK_COLOR_TEMP.items()}
 HDR_TONE_MAPPING_UI_TO_MTK = {0: 5, 1: 0, 2: 2, 3: 1}
 HDR_TONE_MAPPING_MTK_TO_UI = {v: k for k, v in HDR_TONE_MAPPING_UI_TO_MTK.items()}
 CUSTOM_COLOR_TEMP_VALUE = 3
+SOUND_OUTPUT_SETTINGS_KEY = "mitv.settings.db.sound.device.output_device"
+SOUND_OUTPUT_OPTIONS = [(0, "本机扬声器"), (8, "HDMI(eARC)"), (5, "耳机孔")]
+SOUND_OUTPUT_ARC_COMPAT_VALUE = 3
+SOUND_OUTPUT_EARC_VALUE = 8
+SOUND_OUTPUT_NAMES = {
+    0: "本机扬声器",
+    8: "HDMI(eARC)",
+    5: "耳机孔",
+    SOUND_OUTPUT_ARC_COMPAT_VALUE: "HDMI(eARC)",
+}
+SOUND_OUTPUT_VALID_VALUES = frozenset(SOUND_OUTPUT_NAMES.keys())
+
+
+def parse_sound_output_value(value):
+    """解析声音输出设备原始值为整数，空值或非法值返回 None。"""
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in ("null", "none", "n/a"):
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def normalize_sound_output_value(value):
+    """规范化声音输出设备值：将兼容值 3 归类到 8 (HDMI(eARC))，无效值返回 None。"""
+    parsed = parse_sound_output_value(value)
+    if parsed == SOUND_OUTPUT_ARC_COMPAT_VALUE:
+        return SOUND_OUTPUT_EARC_VALUE
+    return parsed
+
+
+def format_sound_output_label(value):
+    """返回声音输出设备值对应的展示文本。"""
+    parsed = parse_sound_output_value(value)
+    if parsed is None:
+        return "未知"
+    return SOUND_OUTPUT_NAMES.get(parsed, f"未知 ({parsed})")
 HOTKEY_MODIFIERS = ["无", "Ctrl + Alt", "Ctrl + Shift", "Alt + Shift", "Win + Shift"]
 HOTKEY_KEYS = ["无"] + [f"F{i}" for i in range(1, 13)] + [str(i) for i in range(0, 10)] + list("ABCDEFGHIJKLMNOPQRSTUVWXYZ") + ["+", "-", "PageUp", "PageDown", "↑", "↓", "←", "→"]
 HOTKEY_EXTRA_VK = {"+": 0xBB, "-": 0xBD, "PageUp": 0x21, "PageDown": 0x22, "↑": 0x26, "↓": 0x28, "←": 0x25, "→": 0x27}

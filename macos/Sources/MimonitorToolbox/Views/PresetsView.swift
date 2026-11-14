@@ -11,7 +11,7 @@ struct PresetsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 Text("预设模式").font(.title2.bold())
-                Text("从当前显示器设置创建预设。应用后，在画面页、快捷键或菜单栏中的调整会自动保存到当前预设。")
+                Text("从当前显示器设置创建预设。应用后，在画面页、声音输出、快捷键或菜单栏中的调整会自动保存到当前预设。")
                     .foregroundColor(.secondary)
                 Text("菜单栏已加入 \(state.presetConfiguration.menuBarPresets.count)/4 个预设（含无预设）。")
                     .font(.callout).foregroundColor(.secondary)
@@ -102,7 +102,18 @@ struct PresetsView: View {
     private func summary(_ preset: PicturePreset) -> String {
         let mode = Int(preset.values["picture_mode"] ?? "") ?? -1
         let modeName = RegisterMap.sceneNames[mode] ?? "模式 \(mode)"
-        return "\(modeName) · 背光 \(preset.values["picture_backlight"] ?? "—") · 对比度 \(preset.values["picture_contrast"] ?? "—") · FreeSync \(preset.values["freesync"] == "1" ? "开" : "关")"
+        var parts = [
+            modeName,
+            "背光 \(preset.values["picture_backlight"] ?? "—")",
+            "对比度 \(preset.values["picture_contrast"] ?? "—")",
+            "FreeSync \(preset.values["freesync"] == "1" ? "开" : "关")",
+        ]
+        if let rawSound = preset.values[RegisterMap.soundOutputKey],
+           let soundId = RegisterMap.normalizeSoundOutput(rawSound),
+           let soundName = RegisterMap.soundOutputNames[soundId] {
+            parts.append("声音 \(soundName)")
+        }
+        return parts.joined(separator: " · ")
     }
 }
 

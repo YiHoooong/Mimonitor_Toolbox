@@ -6,10 +6,13 @@ public enum PresetCommand: Equatable {
     case refresh
     case colorGains(String, String, String)
     case hdrToneMapping(String)
+    case soundOutput(String)
 }
 
 /// Native Swift port of the device's picture write sequences. No process/language bridge.
 public enum PicturePresetPlan {
+    public static let soundOutputKey = "mitv.settings.db.sound.device.output_device"
+    public static let validSoundOutputs: Set<Int> = [0, 5, 8]
     public static let colorTempToMtk = [0: 1, 1: 2, 2: 3, 3: 0, 4: 4, 5: 5, 8: 6]
     public static let hdrToneMappingToMtk = [0: 5, 1: 0, 2: 2, 3: 1]
     public static let hdrModes: Set<Int> = [11, 12, 13, 15, 16, 17, 18, 19, 22, 23,
@@ -63,7 +66,20 @@ public enum PicturePresetPlan {
             let onValue = fsKey == "g_video__freesync_switch" ? 3 : 1
             if value == 0 || value == onValue { values["freesync"] = value == onValue ? "1" : "0" }
         }
+        if let raw = settings[soundOutputKey], let value = normalizeSoundOutput(raw) {
+            values[soundOutputKey] = String(value)
+        }
         return values
+    }
+
+    public static func normalizeSoundOutput(_ value: Int) -> Int? {
+        let normalized = value == 3 ? 8 : value
+        return validSoundOutputs.contains(normalized) ? normalized : nil
+    }
+
+    public static func normalizeSoundOutput(_ raw: String) -> Int? {
+        guard let value = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)) else { return nil }
+        return normalizeSoundOutput(value)
     }
 
     public static func apply(_ values: [String: String], source: String,
@@ -149,6 +165,16 @@ public enum PicturePresetPlan {
         jniSetting("灰阶响应时间", "g_video__vid_od_response_time", "picture_response_time", range: 1...3)
         jniSetting("色域", "g_video__vid_gamut_mapping_mode", "tv_picture_advanced_video_color_space",
                    alias: "tv_picture_video_color_space", range: 0...7)
+        if values[soundOutputKey] != nil {
+            item("声音输出") {
+                let rawValue = try number(soundOutputKey)
+                guard let normalized = normalizeSoundOutput(rawValue) else {
+                    throw PresetError("\(soundOutputKey) 的值 \(rawValue) 无效")
+                }
+                let valueText = String(normalized)
+                return [.soundOutput(valueText), .setting(soundOutputKey, valueText)]
+            }
+        }
         return report
     }
 }

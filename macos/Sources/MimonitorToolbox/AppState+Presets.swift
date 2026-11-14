@@ -278,6 +278,7 @@ extension AppState {
                 if refresh, self.isConnected, self.connectionIntent.isCurrent(request) {
                     self.forceRefreshPage("picture")
                     self.forceRefreshPage("game")
+                    self.forceRefreshPage("source")
                 }
                 if let hudToken {
                     let result = HUDOperationResult.completion(

@@ -15,10 +15,16 @@ from .core import (
     LOCAL_DIMMING_NAMES,
     PICTURE_MODE_GROUPS,
     PICTURE_SCENE_NAMES,
+    SOUND_OUTPUT_OPTIONS,
+    SOUND_OUTPUT_SETTINGS_KEY,
+    SOUND_OUTPUT_VALID_VALUES,
     XIAOMI_TO_MTK_COLOR_TEMP,
+    format_sound_output_label,
     is_game_picture_mode,
     is_hdr_tone_mapping_picture_mode,
     load_settings,
+    normalize_sound_output_value,
+    parse_sound_output_value,
     update_settings,
 )
 from .presets import (
@@ -145,7 +151,13 @@ class DisplayFeaturesMixin:
                 [(23, "HDMI 1"), (24, "HDMI 2"), (29, "DP"), (30, "USBC")],
                 "信号源切换",
                 lambda val, name: self._set("mitv.tvplayer.hdmi.last.source", val, f"信号源: {name}")
-            )
+            ),
+            "sound_output": (
+                SOUND_OUTPUT_SETTINGS_KEY,
+                list(SOUND_OUTPUT_OPTIONS),
+                "声音输出",
+                lambda val, name: self.set_sound_output(val, name),
+            ),
         }
 
     def tray_entry_catalog(self):
@@ -191,6 +203,8 @@ class DisplayFeaturesMixin:
         raw = getattr(self, "current_vals", {}).get(key)
         if raw in (None, "", "null", "N/A"):
             return None
+        if entry_id == "sound_output":
+            return normalize_sound_output_value(raw)
         try:
             return int(raw)
         except (TypeError, ValueError):
@@ -234,6 +248,7 @@ class DisplayFeaturesMixin:
             "response_time_cycle": catalog["response_time"],
             "freesync_toggle": catalog["freesync"],
             "input_source_cycle": catalog["input_source"],
+            "sound_output_cycle": catalog["sound_output"],
         }
 
         if action not in actions_map:
@@ -568,9 +583,18 @@ class DisplayFeaturesMixin:
             for name, error in result.failed:
                 self.log(f"  · 失败 {name}：{error}")
             self.current_vals.update(values)
+            if SOUND_OUTPUT_SETTINGS_KEY in values:
+                sound_val = normalize_sound_output_value(values[SOUND_OUTPUT_SETTINGS_KEY])
+                if sound_val is not None:
+                    self.current_vals[SOUND_OUTPUT_SETTINGS_KEY] = sound_val
+                    sound_label = getattr(self, "sound_output_label", None)
+                    if sound_label is not None:
+                        sound_label.setText(format_sound_output_label(sound_val))
             self._page_loaded.discard("picturePage")
             # FreeSync 在游戏页，预设会动它，那边的开关也得回读
             self._page_loaded.discard("gamePage")
+            # 预设也可包含声音输出，应用后同步回读连接与声音页
+            self._page_loaded.discard("sourcePage")
             # 等设备把整批写入消化完再回读 —— 兼作"写入是否真的落下去"的校验，
             # 因为模式切换会重新应用该模式的整套参数。
             QTimer.singleShot(1800, self._verify_after_preset_apply)
@@ -592,7 +616,7 @@ class DisplayFeaturesMixin:
         if self._adb_channel_busy():
             QTimer.singleShot(800, self._verify_after_preset_apply)
             return
-        self._refresh_pages(("picturePage", "gamePage"), force=True)
+        self._refresh_pages(("picturePage", "gamePage", "sourcePage"), force=True)
 
     def _store_preset_snapshot(self, values, source):
         return update_settings({"preset_snapshot": {
@@ -1922,6 +1946,56 @@ class DisplayFeaturesMixin:
                 self._optimistic_highlight(k, previous)
 
         self._run_adb_action(m.split(":", 1)[0], operation, success, failure)
+
+    def _get_sound_output(self, check=False):
+        """读取当前声音输出设备并规范化（3 兼容归类到 8）。"""
+        raw = self.adb.get(SOUND_OUTPUT_SETTINGS_KEY, check=check)
+        return normalize_sound_output_value(raw)
+
+    def set_sound_output(self, value, name=None):
+        """切换声音输出设备，同步更新持久化键值、界面状态与当前激活预设。"""
+        if not self.check_connection():
+            return
+        device_id = parse_sound_output_value(value)
+        if device_id is None or device_id not in SOUND_OUTPUT_VALID_VALUES:
+            self.log(f"不支持的声音输出设备: {value}")
+            return
+
+        display_val = normalize_sound_output_value(device_id)
+        label_name = name or format_sound_output_label(display_val)
+        self._mark_adb_busy(2.5)
+        state_key = SOUND_OUTPUT_SETTINGS_KEY
+        previous = self._take_control_previous(state_key)
+
+        def operation():
+            with self.adb.transaction():
+                self.adb.check_and_heal_jar()
+                self.adb.set_sound_output(device_id, check=True)
+                self.adb.put(state_key, str(device_id), check=True)
+
+        def success():
+            self._note_picture_change()
+            self.log(f"声音输出: {label_name}")
+            self.current_vals[state_key] = display_val
+            self._optimistic_highlight(state_key, display_val)
+            sound_label = getattr(self, "sound_output_label", None)
+            if sound_label is not None:
+                sound_label.setText(format_sound_output_label(display_val))
+            start_poll = getattr(self, "_start_source_polling", None)
+            if callable(start_poll):
+                start_poll()
+
+        def failure():
+            if previous is not None:
+                self.current_vals[state_key] = previous
+                self._optimistic_highlight(state_key, previous)
+                sound_label = getattr(self, "sound_output_label", None)
+                if sound_label is not None:
+                    sound_label.setText(format_sound_output_label(previous))
+
+        self._run_adb_action("声音输出", operation, success, failure)
+
+    _set_sound_output = set_sound_output
 
     def _confirm_switch_to_game_mode(self, feature_name):
         w = MessageBox(

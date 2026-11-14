@@ -35,7 +35,7 @@ enum HotkeyLists {
     ]
 }
 
-/// 8 个循环切换动作（对应原版 tools 页 actions_list）
+/// 9 个循环切换动作（对应原版 tools 页 actions_list）
 let hotkeyActions: [(id: String, label: String)] = [
     ("picture_mode_cycle", "画面模式 循环切换"),
     ("local_dimming_cycle", "精密控光 循环切换"),
@@ -45,6 +45,7 @@ let hotkeyActions: [(id: String, label: String)] = [
     ("response_time_cycle", "响应时间 循环切换"),
     ("freesync_toggle", "FreeSync 开关切换"),
     ("input_source_cycle", "信号源 循环切换"),
+    ("sound_output_cycle", "声音输出 循环切换"),
 ]
 
 /// 可调参数（对应 core.py ADJUSTABLE_HOTKEY_PARAMS）

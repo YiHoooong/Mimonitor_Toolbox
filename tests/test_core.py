@@ -122,5 +122,46 @@ class CleanupStaleExtractDirsTests(unittest.TestCase):
         self.assertTrue(dll_path.exists())
 
 
+class SoundOutputHelpersTests(unittest.TestCase):
+    """声音输出常量、兼容归一化（3 -> 8）与展示文案映射。"""
+
+    def test_constants_and_options(self):
+        from mimonitor_toolbox import core
+
+        self.assertEqual(
+            core.SOUND_OUTPUT_SETTINGS_KEY,
+            "mitv.settings.db.sound.device.output_device",
+        )
+        self.assertEqual(
+            core.SOUND_OUTPUT_OPTIONS,
+            [(0, "本机扬声器"), (8, "HDMI(eARC)"), (5, "耳机孔")],
+        )
+        self.assertEqual(core.SOUND_OUTPUT_NAMES[3], "HDMI(eARC)")
+
+    def test_parse_and_normalize_sound_output_value(self):
+        from mimonitor_toolbox import core
+
+        self.assertEqual(core.normalize_sound_output_value("0"), 0)
+        self.assertEqual(core.normalize_sound_output_value("8"), 8)
+        self.assertEqual(core.normalize_sound_output_value(5), 5)
+        self.assertEqual(core.normalize_sound_output_value("3"), 8)
+        self.assertEqual(core.parse_sound_output_value("3"), 3)
+        self.assertIsNone(core.normalize_sound_output_value(None))
+        self.assertIsNone(core.normalize_sound_output_value("null"))
+        self.assertIsNone(core.normalize_sound_output_value(""))
+        self.assertIsNone(core.normalize_sound_output_value("bad"))
+        self.assertIsNone(core.normalize_sound_output_value(True))
+
+    def test_format_sound_output_label(self):
+        from mimonitor_toolbox import core
+
+        self.assertEqual(core.format_sound_output_label(0), "本机扬声器")
+        self.assertEqual(core.format_sound_output_label(8), "HDMI(eARC)")
+        self.assertEqual(core.format_sound_output_label("3"), "HDMI(eARC)")
+        self.assertEqual(core.format_sound_output_label(5), "耳机孔")
+        self.assertEqual(core.format_sound_output_label(99), "未知 (99)")
+        self.assertEqual(core.format_sound_output_label(None), "未知")
+
+
 if __name__ == "__main__":
     unittest.main()

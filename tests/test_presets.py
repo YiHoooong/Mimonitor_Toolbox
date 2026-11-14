@@ -33,14 +33,18 @@ class FakeAdb:
     def hdr_tone_mapping(self, val, upd=3, check=False):
         self._record("hdr_tone_mapping", val, upd, check)
 
+    def set_sound_output(self, device_id, check=False):
+        self._record("set_sound_output", device_id, check)
+
     def check_and_heal_jar(self):
         self._record("check_and_heal_jar")
 
 
-def full_values(mode=14, color_temp=1, light_sensor=0, freesync=0):
-    """一套完整可用的值（含 FreeSync —— 它也在预设范围内）。"""
+def full_values(mode=14, color_temp=1, light_sensor=0, freesync=0, sound_output=8):
+    """一套完整可用的值（含 FreeSync 与声音输出 —— 均在预设范围内）。"""
     return {
         "freesync": freesync,
+        "mitv.settings.db.sound.device.output_device": sound_output,
         "picture_mode": mode,
         "tv_picture_light_sensor": light_sensor,
         "picture_backlight": 52,
@@ -481,6 +485,64 @@ class FreeSyncPresetTests(unittest.TestCase):
         touched = [c for c in adb.calls if c[0] == "jni_set"
                    and ("freesync" in str(c[1]) or "adaptive_sync" in str(c[1]))]
         self.assertEqual(touched, [], "没记录 FreeSync 时不该去动它的键")
+
+
+class SoundOutputPresetTests(unittest.TestCase):
+    """声音输出纳入预设：支持应用、旧预设兼容跳过、异常值报错及摘要格式化。"""
+
+    def test_sound_output_writes_mtk_and_persists_global_setting(self):
+        from mimonitor_toolbox import core, presets
+
+        adb = FakeAdb()
+        result = presets.apply_preset(adb, full_values(sound_output=5))
+
+        self.assertIn("声音输出", result.applied)
+        self.assertEqual(result.failed, [])
+        self.assertIn(("check_and_heal_jar",), adb.calls)
+        self.assertIn(("set_sound_output", 5, True), adb.calls)
+        self.assertIn(("put", core.SOUND_OUTPUT_SETTINGS_KEY, "5", True), adb.calls)
+        self.assertLess(
+            adb.calls.index(("set_sound_output", 5, True)),
+            adb.calls.index(("put", core.SOUND_OUTPUT_SETTINGS_KEY, "5", True)),
+        )
+
+    def test_legacy_preset_without_sound_output_is_skipped_not_failed(self):
+        from mimonitor_toolbox import core, presets
+
+        values = full_values()
+        del values[core.SOUND_OUTPUT_SETTINGS_KEY]
+        adb = FakeAdb()
+        result = presets.apply_preset(adb, values)
+
+        self.assertIn("声音输出", [name for name, _ in result.skipped])
+        self.assertNotIn("声音输出", result.applied)
+        self.assertEqual(result.failed, [])
+        self.assertFalse(any(c[0] == "set_sound_output" for c in adb.calls))
+
+    def test_arc_compat_value_3_is_accepted_and_invalid_value_fails(self):
+        from mimonitor_toolbox import presets
+
+        adb_ok = FakeAdb()
+        res_ok = presets.apply_preset(adb_ok, full_values(sound_output=3))
+        self.assertIn("声音输出", res_ok.applied)
+        self.assertIn(("set_sound_output", 3, True), adb_ok.calls)
+
+        adb_bad = FakeAdb()
+        res_bad = presets.apply_preset(adb_bad, full_values(sound_output=99))
+        self.assertIn("声音输出", [name for name, _ in res_bad.failed])
+
+    def test_preset_sound_output_label_formats_and_handles_legacy(self):
+        from mimonitor_toolbox import core, presets
+
+        self.assertEqual(
+            presets.preset_sound_output_label({"values": {core.SOUND_OUTPUT_SETTINGS_KEY: 8}}),
+            "HDMI(eARC)",
+        )
+        self.assertEqual(
+            presets.preset_sound_output_label({core.SOUND_OUTPUT_SETTINGS_KEY: "3"}),
+            "HDMI(eARC)",
+        )
+        self.assertIsNone(presets.preset_sound_output_label({"values": {"picture_mode": 14}}))
 
 
 if __name__ == "__main__":
