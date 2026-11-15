@@ -31,6 +31,7 @@ from .adb import (
     unignore_scan_ip,
 )
 from .core import (
+    CONNECTION_MODE_DAEMON,
     GAME_FEATURE_KEYS,
     MONITOR_MENU_KEYS,
     SCREEN_LIGHT_DEFAULTS,
@@ -46,10 +47,14 @@ from .core import (
     MEMC_SETTINGS_KEY,
     MTK_TO_XIAOMI_COLOR_TEMP,
     SOUND_OUTPUT_SETTINGS_KEY,
+    emit_detail_log,
+    format_connection_mode_label,
+    format_page_display_name,
     format_sound_output_label,
     get_guardian_apk_path,
     load_settings,
     memc_jni_key_for_mode,
+    normalize_connection_mode,
     normalize_sound_output_value,
     parse_hdmi_edid_flags,
     parse_hdmi_edid_int,
@@ -74,6 +79,52 @@ from .widgets import InstallProgressDialog, OverlayResizeFilter
 _global_overlay_filter = None
 CREATE_NEW_CONSOLE = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
 RESUME_DISCOVERY_INTERVAL_SECONDS = 30.0
+
+
+def _is_daemon_adb(adb):
+    """严格判断 adb 是否处于 Hybrid Daemon 模式（兼容 mock.Mock 与简化替身）。"""
+    checker = getattr(adb, "is_daemon_mode", None)
+    return callable(checker) and checker() is True
+
+
+def _adb_has_cleared_ip(adb):
+    """判断支持 ip 属性的 ADB 客户端是否已清空连接目标。"""
+    return bool(
+        adb is not None
+        and hasattr(adb, "ip")
+        and not str(getattr(adb, "ip", "") or "").strip()
+    )
+
+
+def _assign_snapshot_setting(target, key, raw):
+    """按配置键语义解析并写入快照字段。"""
+    if raw in (None, "", "null", "N/A"):
+        return
+    if key == SOUND_OUTPUT_SETTINGS_KEY:
+        sound_val = normalize_sound_output_value(raw)
+        if sound_val is not None:
+            target[key] = sound_val
+        return
+    try:
+        target[key] = int(raw)
+    except (TypeError, ValueError):
+        target[key] = raw
+
+
+def _warm_daemon_for_adb(adb, log_fn=None, reason="连接"):
+    """在 Hybrid Daemon 模式下预热设备常驻服务，失败时自动回退 ADB。"""
+    if not _is_daemon_adb(adb) or not callable(getattr(adb, "ensure_daemon", None)):
+        return False
+    if not str(getattr(adb, "ip", "") or "").strip():
+        return False
+    adb._daemon_retry_after = 0.0
+    ready = bool(adb.ensure_daemon(check=False))
+    if callable(log_fn):
+        if ready:
+            log_fn(f"{reason}完成：混合加速 (Daemon) 已就绪")
+        else:
+            log_fn(f"{reason}后 Daemon 启动未就绪，已自动回退兼容模式 (ADB)")
+    return ready
 
 
 def apply_picture_jni_overrides(settings_vals, jni_batch_vals):
@@ -183,29 +234,61 @@ class DeviceFeaturesMixin:
         def do():
             try:
                 with self.adb.transaction():
-                    raw_source = self.adb.get(
-                        "mitv.tvplayer.hdmi.last.source",
-                        check=True,
-                    )
-                    try:
-                        raw_sound = self.adb.get(
-                            SOUND_OUTPUT_SETTINGS_KEY,
-                            check=False,
-                        )
-                    except Exception:
-                        raw_sound = None
+                    raw_source = None
+                    raw_sound = None
                     raw_volume = None
-                    if hasattr(self.adb, "media_volume"):
-                        try:
-                            raw_volume = self.adb.media_volume(check=False)
-                        except Exception:
-                            raw_volume = None
                     raw_muted = None
-                    if hasattr(self.adb, "media_muted"):
+                    snap = None
+                    if (
+                        _is_daemon_adb(self.adb)
+                        and callable(getattr(self.adb, "daemon_query", None))
+                    ):
                         try:
-                            raw_muted = self.adb.media_muted(check=False)
+                            snap = self.adb.daemon_query(
+                                settings_keys=("mitv.tvplayer.hdmi.last.source", SOUND_OUTPUT_SETTINGS_KEY),
+                                flags=("volume", "muted"),
+                                check=False,
+                            )
                         except Exception:
-                            raw_muted = None
+                            snap = None
+                    if snap is not None and "mitv.tvplayer.hdmi.last.source" in (snap.get("settings") or {}):
+                        settings_map = snap.get("settings") or {}
+                        flags_map = snap.get("flags") or {}
+                        raw_source = settings_map.get("mitv.tvplayer.hdmi.last.source")
+                        raw_sound = settings_map.get(SOUND_OUTPUT_SETTINGS_KEY)
+                        raw_vol_text = flags_map.get("volume")
+                        if raw_vol_text is not None:
+                            try:
+                                vol_num = int(raw_vol_text)
+                                if 0 <= vol_num <= 100:
+                                    raw_volume = vol_num
+                            except (TypeError, ValueError):
+                                pass
+                        raw_muted_text = flags_map.get("muted")
+                        if raw_muted_text in ("0", "1"):
+                            raw_muted = raw_muted_text == "1"
+                    else:
+                        raw_source = self.adb.get(
+                            "mitv.tvplayer.hdmi.last.source",
+                            check=True,
+                        )
+                        try:
+                            raw_sound = self.adb.get(
+                                SOUND_OUTPUT_SETTINGS_KEY,
+                                check=False,
+                            )
+                        except Exception:
+                            raw_sound = None
+                        if hasattr(self.adb, "media_volume"):
+                            try:
+                                raw_volume = self.adb.media_volume(check=False)
+                            except Exception:
+                                raw_volume = None
+                        if hasattr(self.adb, "media_muted"):
+                            try:
+                                raw_muted = self.adb.media_muted(check=False)
+                            except Exception:
+                                raw_muted = None
                 polled = {}
                 source_text = str(raw_source or "").strip()
                 if source_text and source_text.lower() not in ("null", "n/a"):
@@ -241,6 +324,11 @@ class DeviceFeaturesMixin:
     def initialize_device_features(self):
         """初始化设备连接、扫描和页面加载所需的共享状态。"""
         self.adb = Adb("")
+        conn_mode = normalize_connection_mode(load_settings().get("connection_mode"))
+        if hasattr(self.adb, "set_connection_mode"):
+            self.adb.set_connection_mode(conn_mode)
+        else:
+            self.adb.connection_mode = conn_mode
         self._source_names = {
             23: "HDMI 1", 24: "HDMI 2", 29: "DP", 30: "USBC",
             "23": "HDMI 1", "24": "HDMI 2", "29": "DP", "30": "USBC",
@@ -477,6 +565,40 @@ class DeviceFeaturesMixin:
 
         async_run(do)
 
+    def _warm_daemon_sync(self, reason="连接"):
+        """在 Hybrid Daemon 模式下预热设备常驻服务，失败时自动回退 ADB。"""
+        return _warm_daemon_for_adb(self.adb, getattr(self, "log", None), reason=reason)
+
+    def _warm_daemon_async(self, reason="切换"):
+        """异步预热常驻 Daemon（供主线程回调后调用）。"""
+        if not _is_daemon_adb(self.adb):
+            return
+        ip = str(getattr(self.adb, "ip", "") or "").strip()
+        if not ip:
+            return
+        intent_generation = getattr(self, "_connection_intent_generation", 0)
+
+        def do():
+            if not self._connection_intent_is_current(intent_generation, ip):
+                return
+            _warm_daemon_for_adb(self.adb, getattr(self, "log", None), reason=reason)
+
+        async_run(do)
+
+    def set_connection_mode(self, mode):
+        """切换并持久化连接模式（兼容模式 ADB / 混合加速 Daemon）。"""
+        normalized = normalize_connection_mode(mode)
+        update_settings({"connection_mode": normalized})
+        if hasattr(self.adb, "set_connection_mode"):
+            self.adb.set_connection_mode(normalized)
+        else:
+            self.adb.connection_mode = normalized
+        if hasattr(self, "_update_connection_mode_button"):
+            self._update_connection_mode_button(normalized)
+        self.log(f"连接模式已切换为: {format_connection_mode_label(normalized)}")
+        if normalized == CONNECTION_MODE_DAEMON and getattr(self, "adb_connected", False):
+            self._warm_daemon_async(reason="模式切换")
+
     def _finish_resume_reconnect_attempt(self, generation, attempt, ok, detail):
         if generation != getattr(self, "_resume_reconnect_generation", -1):
             return
@@ -493,6 +615,8 @@ class DeviceFeaturesMixin:
             unignore_scan_ip(getattr(self.adb, "ip", ""))
             self.status_signal.emit(f"已连接: {detail}")
             self.log(f"唤醒后连接已恢复: {detail}")
+            if hasattr(self, "_warm_daemon_async"):
+                self._warm_daemon_async(reason="唤醒重连")
             return
 
         if attempt < 5:
@@ -745,6 +869,9 @@ class DeviceFeaturesMixin:
             return
 
         if event == "restarting":
+            adb_obj = getattr(self, "adb", None)
+            if hasattr(adb_obj, "_reset_daemon_state"):
+                adb_obj._reset_daemon_state()
             if not self._adb_server_down_notified:
                 self._adb_server_down_notified = True
                 message = "检测到 ADB 进程被杀死，正在重启"
@@ -762,6 +889,9 @@ class DeviceFeaturesMixin:
 
         self._adb_server_monitor_checking = False
         if event == "recovered":
+            adb_obj = getattr(self, "adb", None)
+            if hasattr(adb_obj, "_reset_daemon_state"):
+                adb_obj._reset_daemon_state()
             self._adb_server_retry_after = 0.0
             self._adb_server_failure_notified = False
             self._adb_server_down_notified = False
@@ -841,6 +971,13 @@ class DeviceFeaturesMixin:
                             "显示器休眠或临时断连",
                         )
                         return
+                    if (
+                        _is_daemon_adb(self.adb)
+                        and getattr(self.adb, "_daemon_ready", True) is False
+                    ):
+                        _warm_daemon_for_adb(self.adb, getattr(self, "log", None), reason="保活")
+                        if not self._connection_intent_is_current(intent_generation, ip):
+                            return
                     self.status_signal.emit(f"已连接: {m or ip}")
             finally:
                 self._adb_keepalive_checking = False
@@ -914,20 +1051,40 @@ class DeviceFeaturesMixin:
             )
 
     def disconnect_adb(self):
-        self._invalidate_connection_intent()
+        intent_generation = self._invalidate_connection_intent()
         self._cancel_resume_reconnect()
         self._connected_on_current_network = False
         self._stop_source_polling()
-        if self.adb.ip:
-            self.log(f"正在断开与 {self.adb.ip} 的连接...")
-            ip = self.adb.ip
-            self.adb.ip = ""
+        was_connected = bool(getattr(self, "adb_connected", False))
+        was_connecting = bool(getattr(self, "_connection_in_progress", False))
+        was_resuming = bool(getattr(self, "_resume_reconnect_active", False))
+        self._connection_in_progress = False
+        self._connect_generation = intent_generation
+        if hasattr(self.adb, "_reset_daemon_state"):
+            self.adb._reset_daemon_state()
+        ip = str(getattr(self.adb, "ip", "") or "").strip()
+        self.adb.ip = ""
+        status_signal = getattr(self, "status_signal", None)
+        if (
+            status_signal is not None
+            and not getattr(self, "_scan_running", False)
+            and (ip or was_connected or was_connecting or was_resuming)
+        ):
+            status_signal.emit("未连接")
+        if ip:
+            self.log(f"正在断开与 {ip} 的连接...")
 
             def do():
+                if getattr(self, "_connection_intent_generation", 0) != intent_generation:
+                    return
                 adb_run(["disconnect", format_adb_serial(ip)])
-                self.status_signal.emit("未连接")
+                if getattr(self, "_connection_intent_generation", 0) != intent_generation:
+                    return
                 self.log("连接已断开")
+
             async_run(do)
+        elif was_connected or was_connecting or was_resuming:
+            self.log("连接已断开")
 
     def _auto_connect_on_startup(self):
         # 和其它周期定时器一样先看清理标记：它由 QTimer.singleShot(900) 排程，
@@ -946,6 +1103,7 @@ class DeviceFeaturesMixin:
 
         self.ip_entry.setText(saved_ip)
         intent_generation = self._invalidate_connection_intent()
+        self._connect_generation = intent_generation
         self._connection_in_progress = True
         self.adb.ip = saved_ip
         self.status_signal.emit("连接中...")
@@ -979,13 +1137,17 @@ class DeviceFeaturesMixin:
                         self._connected_on_current_network = True
                         self._resume_target_available = None
                         self._resume_discovery_exhausted = False
+                        _warm_daemon_for_adb(self.adb, getattr(self, "log", None), reason="自动连接")
+                        if not self._connection_intent_is_current(intent_generation, saved_ip):
+                            return
                         self.status_signal.emit(f"已连接: {m or saved_ip}")
                     else:
                         self.log(f"启动自动连接失败: {saved_ip}，开始扫描内网")
                         self.status_signal.emit("未连接")
                         self.auto_scan_signal.emit()
             finally:
-                self._connection_in_progress = False
+                if getattr(self, "_connect_generation", intent_generation) == intent_generation:
+                    self._connection_in_progress = False
 
         async_run(do)
 
@@ -999,6 +1161,7 @@ class DeviceFeaturesMixin:
         intent_generation = self._invalidate_connection_intent()
         self._cancel_resume_reconnect()
         self._cancel_scan("手动连接")
+        self._connect_generation = intent_generation
         self._connection_in_progress = True
         self.adb.ip = ip
         self.status_signal.emit("连接中...")
@@ -1031,13 +1194,17 @@ class DeviceFeaturesMixin:
                         self._connected_on_current_network = True
                         self._resume_target_available = None
                         self._resume_discovery_exhausted = False
+                        _warm_daemon_for_adb(self.adb, getattr(self, "log", None), reason="手动连接")
+                        if not self._connection_intent_is_current(intent_generation, ip):
+                            return
                         self.status_signal.emit(f"已连接: {m or ip}")
                     else:
                         self.status_signal.emit("连接失败")
                         self.message_signal.emit("error", "错误", "连接显示器失败，请检查IP和网络连接！")
                         self.log("连接失败")
             finally:
-                self._connection_in_progress = False
+                if getattr(self, "_connect_generation", intent_generation) == intent_generation:
+                    self._connection_in_progress = False
         async_run(do)
 
     def _cancel_scan(self, reason):
@@ -1650,83 +1817,181 @@ class DeviceFeaturesMixin:
                 + MONITOR_MENU_KEYS
                 + SCREEN_LIGHT_KEYS
             )
-            keys_str = " ".join(preset_settings_keys)
-            out = self.adb.shell(
-                f"for k in {keys_str}; do echo $k=$(settings get global $k); done",
-                check=True,
-            )
-            for line in out.split("\n"):
-                key, sep, raw = line.strip().partition("=")
-                if not sep or not key:
-                    continue
-                if raw in ("", "null", "N/A"):
-                    continue
+            used_daemon = False
+            if (
+                _is_daemon_adb(self.adb)
+                and callable(getattr(self.adb, "daemon_query", None))
+            ):
+                query_settings = tuple(
+                    dict.fromkeys(
+                        preset_settings_keys
+                        + ("mitv.tvplayer.hdmi.last.source", SOUND_OUTPUT_SETTINGS_KEY)
+                    )
+                )
+                query_jni = tuple(
+                    dict.fromkeys(
+                        tuple(PICTURE_PRESET_JNI_KEYS)
+                        + (
+                            "g_video__freesync_switch",
+                            "g_fusion_picture__hdmi_edid_version",
+                            "g_video__dp_adaptive_sync",
+                            "g_fusion_picture__dp_edid_version",
+                        )
+                    )
+                )
                 try:
-                    values[key] = int(raw)
-                except (TypeError, ValueError):
-                    values[key] = raw
+                    snap = self.adb.daemon_query(
+                        settings_keys=query_settings,
+                        jni_keys=query_jni,
+                        flags=("volume", "muted"),
+                        check=False,
+                    )
+                except Exception:
+                    snap = None
+                if snap is not None and any(
+                    k in (snap.get("jni") or {}) for k in PICTURE_PRESET_JNI_KEYS
+                ):
+                    used_daemon = True
+                    settings_map = snap.get("settings") or {}
+                    jni_map = dict(snap.get("jni") or {})
+                    flags_map = snap.get("flags") or {}
+                    for key in preset_settings_keys:
+                        _assign_snapshot_setting(values, key, settings_map.get(key))
+                    apply_picture_jni_overrides(values, jni_map)
+                    seen_settings = set(settings_map.keys())
+                    for k in GAME_FEATURE_KEYS + MONITOR_MENU_KEYS:
+                        if k in seen_settings:
+                            values.setdefault(k, 0)
+                    if "atmosphere_light_switcher_pm2" in seen_settings:
+                        for k in SCREEN_LIGHT_KEYS:
+                            values.setdefault(k, SCREEN_LIGHT_DEFAULTS[k])
+                    source = settings_map.get("mitv.tvplayer.hdmi.last.source")
+                    if source is None:
+                        source = self.adb.get("mitv.tvplayer.hdmi.last.source", check=True)
+                    fs_key = freesync_jni_key(source)
+                    fs_raw = jni_map.get(fs_key)
+                    if fs_raw is None:
+                        fs_raw = self.adb.jni_batch_get_or_single([fs_key], check=True).get(fs_key)
+                    if fs_key == "g_video__freesync_switch":
+                        edid_raw = jni_map.get("g_fusion_picture__hdmi_edid_version")
+                        if edid_raw is None:
+                            edid_raw = self.adb.jni_batch_get_or_single(
+                                ["g_fusion_picture__hdmi_edid_version"],
+                                check=True,
+                            ).get("g_fusion_picture__hdmi_edid_version")
+                        if parse_hdmi_edid_int(edid_raw) in HDMI_EDID_KNOWN_VALUES:
+                            mode_320_val, fs_val = parse_hdmi_edid_flags(edid_raw, fs_raw)
+                            values["mode_320"] = mode_320_val
+                            values["freesync"] = fs_val
+                        elif fs_raw is not None:
+                            values["freesync"] = 1 if freesync_is_on(fs_key, fs_raw) else 0
+                    else:
+                        if fs_raw is not None:
+                            values["freesync"] = 1 if freesync_is_on(fs_key, fs_raw) else 0
+                        dp_raw = jni_map.get("g_fusion_picture__dp_edid_version")
+                        if dp_raw is None:
+                            dp_raw = self.adb.jni_batch_get_or_single(
+                                ["g_fusion_picture__dp_edid_version"],
+                                check=False,
+                            ).get("g_fusion_picture__dp_edid_version")
+                        try:
+                            if dp_raw is not None:
+                                values["mode_320"] = 1 if int(str(dp_raw).strip()) == 3 else 0
+                        except (TypeError, ValueError):
+                            pass
+                    raw_sound = settings_map.get(SOUND_OUTPUT_SETTINGS_KEY)
+                    if raw_sound is None:
+                        raw_sound = self.adb.get(SOUND_OUTPUT_SETTINGS_KEY, check=True)
+                    sound_val = normalize_sound_output_value(raw_sound)
+                    if sound_val is not None:
+                        values[SOUND_OUTPUT_SETTINGS_KEY] = sound_val
+                    raw_vol = flags_map.get("volume")
+                    if raw_vol is None and hasattr(self.adb, "media_volume"):
+                        raw_vol = self.adb.media_volume(check=False)
+                    if raw_vol is not None:
+                        try:
+                            vol_int = int(raw_vol)
+                            if 0 <= vol_int <= 100:
+                                values["volume_music_speaker"] = vol_int
+                        except (TypeError, ValueError):
+                            pass
+                    raw_muted = flags_map.get("muted")
+                    if raw_muted in ("0", "1"):
+                        values["media_muted"] = 1 if raw_muted == "1" else 0
+                    elif hasattr(self.adb, "media_muted"):
+                        muted = self.adb.media_muted(check=False)
+                        if muted is not None:
+                            values["media_muted"] = 1 if muted else 0
 
-            jni_vals = self.adb.jni_batch_get_or_single(PICTURE_PRESET_JNI_KEYS, check=True)
-            apply_picture_jni_overrides(values, jni_vals)
-
-            # FreeSync 也纳入预设：它开着会把设备锁在游戏模式，必须能和画面模式
-            # 一起被记录、一起被还原。它没有 settings 键，且走的 MTK 键随输入源
-            # 变（DP/USB-C 与 HDMI 不同），所以单独按输入源读。
-            seen_settings = {
-                line.split("=", 1)[0].strip()
-                for line in (out or "").splitlines()
-                if "=" in line
-            }
-            for k in GAME_FEATURE_KEYS + MONITOR_MENU_KEYS:
-                if k in seen_settings:
-                    values.setdefault(k, 0)
-            if "atmosphere_light_switcher_pm2" in seen_settings:
-                for k in SCREEN_LIGHT_KEYS:
-                    values.setdefault(k, SCREEN_LIGHT_DEFAULTS[k])
-
-            source = self.adb.get("mitv.tvplayer.hdmi.last.source", check=True)
-            fs_key = freesync_jni_key(source)
-            fs_raw = self.adb.jni_batch_get_or_single([fs_key], check=True).get(fs_key)
-            if fs_key == "g_video__freesync_switch":
-                edid_raw = self.adb.jni_batch_get_or_single(
-                    ["g_fusion_picture__hdmi_edid_version"],
+            if not used_daemon:
+                keys_str = " ".join(preset_settings_keys)
+                out = self.adb.shell(
+                    f"for k in {keys_str}; do echo $k=$(settings get global $k); done",
                     check=True,
-                ).get("g_fusion_picture__hdmi_edid_version")
-                if parse_hdmi_edid_int(edid_raw) in HDMI_EDID_KNOWN_VALUES:
-                    mode_320_val, fs_val = parse_hdmi_edid_flags(edid_raw, fs_raw)
-                    values["mode_320"] = mode_320_val
-                    values["freesync"] = fs_val
-                elif fs_raw is not None:
-                    values["freesync"] = 1 if freesync_is_on(fs_key, fs_raw) else 0
-            else:
-                if fs_raw is not None:
-                    values["freesync"] = 1 if freesync_is_on(fs_key, fs_raw) else 0
-                dp_raw = self.adb.jni_batch_get_or_single(
-                    ["g_fusion_picture__dp_edid_version"],
-                    check=False,
-                ).get("g_fusion_picture__dp_edid_version")
-                try:
-                    if dp_raw is not None:
-                        values["mode_320"] = 1 if int(str(dp_raw).strip()) == 3 else 0
-                except (TypeError, ValueError):
-                    pass
+                )
+                for line in out.split("\n"):
+                    key, sep, raw = line.strip().partition("=")
+                    if not sep or not key:
+                        continue
+                    _assign_snapshot_setting(values, key, raw)
 
-            # 声音输出、音量与静音一并纳入预设与快照（不放入 PICTURE_PRESET_SETTINGS_KEYS 以保持画面页键表一致）。
-            raw_sound = self.adb.get(SOUND_OUTPUT_SETTINGS_KEY, check=True)
-            sound_val = normalize_sound_output_value(raw_sound)
-            if sound_val is not None:
-                values[SOUND_OUTPUT_SETTINGS_KEY] = sound_val
-            if hasattr(self.adb, "media_volume"):
-                vol = self.adb.media_volume(check=False)
-                try:
-                    if vol is not None and 0 <= int(vol) <= 100:
-                        values["volume_music_speaker"] = int(vol)
-                except (TypeError, ValueError):
-                    pass
-            if hasattr(self.adb, "media_muted"):
-                muted = self.adb.media_muted(check=False)
-                if muted is not None:
-                    values["media_muted"] = 1 if muted else 0
+                jni_vals = self.adb.jni_batch_get_or_single(PICTURE_PRESET_JNI_KEYS, check=True)
+                apply_picture_jni_overrides(values, jni_vals)
+
+                seen_settings = {
+                    line.split("=", 1)[0].strip()
+                    for line in (out or "").splitlines()
+                    if "=" in line
+                }
+                for k in GAME_FEATURE_KEYS + MONITOR_MENU_KEYS:
+                    if k in seen_settings:
+                        values.setdefault(k, 0)
+                if "atmosphere_light_switcher_pm2" in seen_settings:
+                    for k in SCREEN_LIGHT_KEYS:
+                        values.setdefault(k, SCREEN_LIGHT_DEFAULTS[k])
+
+                source = self.adb.get("mitv.tvplayer.hdmi.last.source", check=True)
+                fs_key = freesync_jni_key(source)
+                fs_raw = self.adb.jni_batch_get_or_single([fs_key], check=True).get(fs_key)
+                if fs_key == "g_video__freesync_switch":
+                    edid_raw = self.adb.jni_batch_get_or_single(
+                        ["g_fusion_picture__hdmi_edid_version"],
+                        check=True,
+                    ).get("g_fusion_picture__hdmi_edid_version")
+                    if parse_hdmi_edid_int(edid_raw) in HDMI_EDID_KNOWN_VALUES:
+                        mode_320_val, fs_val = parse_hdmi_edid_flags(edid_raw, fs_raw)
+                        values["mode_320"] = mode_320_val
+                        values["freesync"] = fs_val
+                    elif fs_raw is not None:
+                        values["freesync"] = 1 if freesync_is_on(fs_key, fs_raw) else 0
+                else:
+                    if fs_raw is not None:
+                        values["freesync"] = 1 if freesync_is_on(fs_key, fs_raw) else 0
+                    dp_raw = self.adb.jni_batch_get_or_single(
+                        ["g_fusion_picture__dp_edid_version"],
+                        check=False,
+                    ).get("g_fusion_picture__dp_edid_version")
+                    try:
+                        if dp_raw is not None:
+                            values["mode_320"] = 1 if int(str(dp_raw).strip()) == 3 else 0
+                    except (TypeError, ValueError):
+                        pass
+
+                raw_sound = self.adb.get(SOUND_OUTPUT_SETTINGS_KEY, check=True)
+                sound_val = normalize_sound_output_value(raw_sound)
+                if sound_val is not None:
+                    values[SOUND_OUTPUT_SETTINGS_KEY] = sound_val
+                if hasattr(self.adb, "media_volume"):
+                    vol = self.adb.media_volume(check=False)
+                    try:
+                        if vol is not None and 0 <= int(vol) <= 100:
+                            values["volume_music_speaker"] = int(vol)
+                    except (TypeError, ValueError):
+                        pass
+                if hasattr(self.adb, "media_muted"):
+                    muted = self.adb.media_muted(check=False)
+                    if muted is not None:
+                        values["media_muted"] = 1 if muted else 0
         return values
 
     def _refresh_page_data(self, page_name):
@@ -1735,10 +2000,12 @@ class DeviceFeaturesMixin:
         if page_name in self._page_loading:
             return
         refresh_seq = getattr(self, "_picture_mode_switch_seq", 0) if page_name == "picturePage" else None
+        page_label = format_page_display_name(page_name)
         self._page_loading.add(page_name)
+        self._page_loading_busy_deadline = time.monotonic() + 4.0
         self._mark_adb_busy(4.0)
         self._show_loading_overlay(page_name)
-        self.log(f"正在刷新 {page_name} 数据...")
+        emit_detail_log(self, f"正在刷新「{page_label}」数据...")
 
         def do():
             loaded = False
@@ -1749,88 +2016,184 @@ class DeviceFeaturesMixin:
 
                 # 页面中的多项读取必须来自同一设备快照，避免写操作穿插后混合新旧值。
                 with self.adb.transaction():
-                    settings_keys = cfg.get("settings", [])
-                    if settings_keys:
-                        keys_str = " ".join(settings_keys)
-                        cmd = f"for k in {keys_str}; do echo $k=$(settings get global $k); done"
-                        res = self.adb.shell(cmd)
-                        for line in res.split("\n"):
-                            if "=" in line:
-                                parts = line.strip().split("=", 1)
-                                if len(parts) == 2:
-                                    k, v = parts[0], parts[1]
-                                    if v not in ("", "null", "N/A"):
-                                        if k == SOUND_OUTPUT_SETTINGS_KEY:
-                                            sound_val = normalize_sound_output_value(v)
-                                            if sound_val is not None:
-                                                settings_vals[k] = sound_val
-                                        else:
-                                            try: settings_vals[k] = int(v)
-                                            except (TypeError, ValueError): settings_vals[k] = v
+                    settings_keys = list(cfg.get("settings", []))
+                    jni_keys = list(cfg.get("jni", []))
+                    used_daemon = False
 
-                    if page_name == "gamePage":
-                        for key in GAME_FEATURE_KEYS:
-                            settings_vals.setdefault(key, 0)
-
-                    if page_name == "sourcePage":
-                        if hasattr(self.adb, "media_volume"):
-                            try:
-                                vol = self.adb.media_volume(check=False)
-                            except Exception:
-                                vol = None
-                            if vol is not None:
-                                settings_vals["volume_music_speaker"] = int(vol)
-                        if hasattr(self.adb, "media_muted"):
-                            try:
-                                muted = self.adb.media_muted(check=False)
-                            except Exception:
-                                muted = None
-                            if muted is not None:
-                                settings_vals["media_muted"] = 1 if muted else 0
-
-                    jni_batch_vals = {}
-                    jni_keys = cfg.get("jni", [])
-                    if jni_keys:
-                        jni_batch_vals = self.adb.jni_batch_get_or_single(jni_keys)
-
-                    # 画面页各项以 JNI 回读为准（口径与预设快照采集一致）
-                    jni_vals.update(apply_picture_jni_overrides(settings_vals, jni_batch_vals))
-
-                    # 读取 JNI 模式 (game page)
-                    if cfg.get("jni_mode"):
-                        src = settings_vals.get("mitv.tvplayer.hdmi.last.source")
-                        if src in (29, 30):
-                            mode_vals = self.adb.jni_batch_get_or_single([
+                    if (
+                        _is_daemon_adb(self.adb)
+                        and callable(getattr(self.adb, "daemon_query", None))
+                    ):
+                        query_jni = list(jni_keys)
+                        if cfg.get("jni_mode"):
+                            for k in (
                                 "g_fusion_picture__dp_edid_version",
                                 "g_video__dp_adaptive_sync",
-                            ])
-                            try:
-                                jni_vals["mode_320"] = (
-                                    1 if int(mode_vals.get("g_fusion_picture__dp_edid_version")) == 3 else 0
-                                )
-                            except (TypeError, ValueError): pass
-                            try:
-                                jni_vals["freesync"] = (
-                                    1 if int(mode_vals.get("g_video__dp_adaptive_sync")) == 1 else 0
-                                )
-                            except (TypeError, ValueError): pass
-                        else:
-                            mode_vals = self.adb.jni_batch_get_or_single([
                                 "g_fusion_picture__hdmi_edid_version",
                                 "g_video__freesync_switch",
-                            ])
-                            edid_raw = mode_vals.get("g_fusion_picture__hdmi_edid_version")
-                            fs_raw = mode_vals.get("g_video__freesync_switch")
-                            mode_320_val, freesync_val = parse_hdmi_edid_flags(edid_raw, fs_raw)
-                            edid_int = parse_hdmi_edid_int(edid_raw)
-                            fs_int = parse_hdmi_edid_int(fs_raw)
-                            if edid_int is not None:
-                                jni_vals["mode_320"] = mode_320_val
-                            if edid_int in HDMI_EDID_KNOWN_VALUES or fs_int is not None:
-                                jni_vals["freesync"] = freesync_val
+                            ):
+                                if k not in query_jni:
+                                    query_jni.append(k)
+                        flags = ("volume", "muted") if page_name == "sourcePage" else ()
+                        try:
+                            snap = self.adb.daemon_query(
+                                settings_keys=settings_keys,
+                                jni_keys=query_jni,
+                                flags=flags,
+                                check=False,
+                            )
+                        except Exception:
+                            snap = None
+                        if (
+                            snap is not None
+                            and (not settings_keys or bool(snap.get("settings")))
+                            and (not jni_keys or bool(snap.get("jni")))
+                        ):
+                            used_daemon = True
+                            settings_map = snap.get("settings") or {}
+                            jni_map = dict(snap.get("jni") or {})
+                            flags_map = snap.get("flags") or {}
+                            for k in settings_keys:
+                                _assign_snapshot_setting(settings_vals, k, settings_map.get(k))
+                            if page_name == "gamePage":
+                                for key in GAME_FEATURE_KEYS:
+                                    settings_vals.setdefault(key, 0)
+                            if page_name == "sourcePage":
+                                raw_vol = flags_map.get("volume")
+                                if raw_vol is not None:
+                                    try:
+                                        vol_int = int(raw_vol)
+                                        if 0 <= vol_int <= 100:
+                                            settings_vals["volume_music_speaker"] = vol_int
+                                    except (TypeError, ValueError):
+                                        pass
+                                elif hasattr(self.adb, "media_volume"):
+                                    try:
+                                        vol = self.adb.media_volume(check=False)
+                                    except Exception:
+                                        vol = None
+                                    if vol is not None:
+                                        settings_vals["volume_music_speaker"] = int(vol)
+                                raw_muted = flags_map.get("muted")
+                                if raw_muted in ("0", "1"):
+                                    settings_vals["media_muted"] = 1 if raw_muted == "1" else 0
+                                elif hasattr(self.adb, "media_muted"):
+                                    try:
+                                        muted = self.adb.media_muted(check=False)
+                                    except Exception:
+                                        muted = None
+                                    if muted is not None:
+                                        settings_vals["media_muted"] = 1 if muted else 0
+
+                            jni_batch_vals = {k: jni_map[k] for k in jni_keys if k in jni_map}
+                            jni_vals.update(apply_picture_jni_overrides(settings_vals, jni_batch_vals))
+
+                            if cfg.get("jni_mode"):
+                                src = settings_vals.get("mitv.tvplayer.hdmi.last.source")
+                                if src in (29, 30):
+                                    try:
+                                        dp_edid = jni_map.get("g_fusion_picture__dp_edid_version")
+                                        if dp_edid is not None:
+                                            jni_vals["mode_320"] = 1 if int(dp_edid) == 3 else 0
+                                    except (TypeError, ValueError):
+                                        pass
+                                    try:
+                                        dp_as = jni_map.get("g_video__dp_adaptive_sync")
+                                        if dp_as is not None:
+                                            jni_vals["freesync"] = 1 if int(dp_as) == 1 else 0
+                                    except (TypeError, ValueError):
+                                        pass
+                                else:
+                                    edid_raw = jni_map.get("g_fusion_picture__hdmi_edid_version")
+                                    fs_raw = jni_map.get("g_video__freesync_switch")
+                                    mode_320_val, freesync_val = parse_hdmi_edid_flags(edid_raw, fs_raw)
+                                    edid_int = parse_hdmi_edid_int(edid_raw)
+                                    fs_int = parse_hdmi_edid_int(fs_raw)
+                                    if edid_int is not None:
+                                        jni_vals["mode_320"] = mode_320_val
+                                    if edid_int in HDMI_EDID_KNOWN_VALUES or fs_int is not None:
+                                        jni_vals["freesync"] = freesync_val
+
+                    if not used_daemon:
+                        if _adb_has_cleared_ip(self.adb):
+                            return
+                        if settings_keys:
+                            keys_str = " ".join(settings_keys)
+                            cmd = f"for k in {keys_str}; do echo $k=$(settings get global $k); done"
+                            res = self.adb.shell(cmd)
+                            if (
+                                _adb_has_cleared_ip(self.adb)
+                                or adb_text_has_disconnected_marker(res)
+                            ):
+                                return
+                            for line in res.split("\n"):
+                                if "=" in line:
+                                    parts = line.strip().split("=", 1)
+                                    if len(parts) == 2:
+                                        _assign_snapshot_setting(settings_vals, parts[0], parts[1])
+
+                        if page_name == "gamePage":
+                            for key in GAME_FEATURE_KEYS:
+                                settings_vals.setdefault(key, 0)
+
+                        if page_name == "sourcePage":
+                            if hasattr(self.adb, "media_volume"):
+                                try:
+                                    vol = self.adb.media_volume(check=False)
+                                except Exception:
+                                    vol = None
+                                if vol is not None:
+                                    settings_vals["volume_music_speaker"] = int(vol)
+                            if hasattr(self.adb, "media_muted"):
+                                try:
+                                    muted = self.adb.media_muted(check=False)
+                                except Exception:
+                                    muted = None
+                                if muted is not None:
+                                    settings_vals["media_muted"] = 1 if muted else 0
+
+                        jni_batch_vals = {}
+                        if jni_keys:
+                            jni_batch_vals = self.adb.jni_batch_get_or_single(jni_keys)
+
+                        jni_vals.update(apply_picture_jni_overrides(settings_vals, jni_batch_vals))
+
+                        if cfg.get("jni_mode"):
+                            src = settings_vals.get("mitv.tvplayer.hdmi.last.source")
+                            if src in (29, 30):
+                                mode_vals = self.adb.jni_batch_get_or_single([
+                                    "g_fusion_picture__dp_edid_version",
+                                    "g_video__dp_adaptive_sync",
+                                ])
+                                try:
+                                    jni_vals["mode_320"] = (
+                                        1 if int(mode_vals.get("g_fusion_picture__dp_edid_version")) == 3 else 0
+                                    )
+                                except (TypeError, ValueError): pass
+                                try:
+                                    jni_vals["freesync"] = (
+                                        1 if int(mode_vals.get("g_video__dp_adaptive_sync")) == 1 else 0
+                                    )
+                                except (TypeError, ValueError): pass
+                            else:
+                                mode_vals = self.adb.jni_batch_get_or_single([
+                                    "g_fusion_picture__hdmi_edid_version",
+                                    "g_video__freesync_switch",
+                                ])
+                                edid_raw = mode_vals.get("g_fusion_picture__hdmi_edid_version")
+                                fs_raw = mode_vals.get("g_video__freesync_switch")
+                                mode_320_val, freesync_val = parse_hdmi_edid_flags(edid_raw, fs_raw)
+                                edid_int = parse_hdmi_edid_int(edid_raw)
+                                fs_int = parse_hdmi_edid_int(fs_raw)
+                                if edid_int is not None:
+                                    jni_vals["mode_320"] = mode_320_val
+                                if edid_int in HDMI_EDID_KNOWN_VALUES or fs_int is not None:
+                                    jni_vals["freesync"] = freesync_val
 
                 if page_name == "picturePage" and refresh_seq != getattr(self, "_picture_mode_switch_seq", 0):
                     self.log("已丢弃过期的画面设置刷新结果")
+                    return
+                if _adb_has_cleared_ip(self.adb):
                     return
 
                 # 应用数据到 UI
@@ -1840,9 +2203,9 @@ class DeviceFeaturesMixin:
                     self.jni_values_signal.emit(jni_vals)
 
                 loaded = True
-                self.log("页面数据刷新完成")
+                emit_detail_log(self, f"「{page_label}」数据刷新完成")
             except Exception as e:
-                self.log(f"页面数据刷新失败: {e}")
+                self.log(f"「{page_label}」数据刷新失败: {e}")
                 print(f"Page data refresh error: {e}")
             finally:
                 self.page_refresh_finished.emit(page_name, loaded)
@@ -1853,6 +2216,14 @@ class DeviceFeaturesMixin:
         if loaded:
             self._page_loaded.add(page_name)
         self._page_loading.discard(page_name)
+        # 页面刷新在 Daemon 模式下通常百毫秒内结束；若无更高优先级的长任务持锁，
+        # 立即释放 4 秒保护窗，避免后续验证回读被自己卡住。
+        if (
+            not self._page_loading
+            and getattr(self, "_adb_busy_until", 0.0)
+            <= getattr(self, "_page_loading_busy_deadline", 0.0) + 0.05
+        ):
+            self._adb_busy_until = 0.0
         self._hide_loading_overlay(page_name)
 
     def _show_loading_overlay(self, page_name):

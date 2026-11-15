@@ -29,6 +29,7 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QButtonGroup,
     QDialog,
     QStyledItemDelegate,
     QStyle,
@@ -60,6 +61,7 @@ from qfluentwidgets import (
     MessageBoxBase,
     PrimaryPushButton,
     PushButton,
+    RadioButton,
     RoundMenu,
     SimpleCardWidget,
     Slider,
@@ -74,6 +76,12 @@ from qfluentwidgets import (
 )
 from qfluentwidgets.common import getFont
 
+from .core import (
+    CONNECTION_MODE_ADB,
+    CONNECTION_MODE_DAEMON,
+    CONNECTION_MODE_LABELS,
+    normalize_connection_mode,
+)
 from .network_scan import adapter_matches_device_rule, select_scan_networks
 from .windows import user32
 
@@ -1966,3 +1974,108 @@ class ScanSettingsDialog(MessageBoxBase):
     def force_subnets(self):
         """手输的强制网段（原始文本，解析留给扫描侧，坏值只记日志）。"""
         return self.split_rule_text(self.subnetEdit.text())
+
+
+class ConnectionModeDialog(MessageBoxBase):
+    """连接模式切换弹窗：在兼容模式 (ADB) 与混合加速 (Daemon) 间切换并附说明。"""
+
+    _MODE_DESCRIPTIONS = (
+        (
+            CONNECTION_MODE_ADB,
+            "默认模式 · 逐条 ADB 命令",
+            "每项查询和修改都通过标准 ADB 命令逐条下发，兼容性最稳；适合排查异常或受限固件环境。",
+        ),
+        (
+            CONNECTION_MODE_DAEMON,
+            "常驻代理 · 批量与汇总加速",
+            "在显示器端常驻轻量 MtkDirectTool 服务，单次汇总回读全页参数并批量打包下发预设与调节；通道异常时自动回退兼容模式。",
+        ),
+    )
+
+    def __init__(self, current_mode=CONNECTION_MODE_ADB, parent=None):
+        super().__init__(parent)
+        self._selected = normalize_connection_mode(current_mode)
+        self._radios = {}
+        self._cards = {}
+        self._group = QButtonGroup(self)
+
+        self.titleLabel = SubtitleLabel("连接模式", self)
+        hint = CaptionLabel(
+            "选择电脑端与显示器之间的控制与查询通道；切换后立即生效并保存到本地配置。",
+            self,
+        )
+        hint.setWordWrap(True)
+        self.viewLayout.addWidget(self.titleLabel)
+        self.viewLayout.addWidget(hint)
+        self.viewLayout.addSpacing(6)
+
+        for mode, badge_text, desc_text in self._MODE_DESCRIPTIONS:
+            card = SimpleCardWidget(self)
+            card.setCursor(Qt.CursorShape.PointingHandCursor)
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(14, 12, 14, 12)
+            card_layout.setSpacing(6)
+
+            header_row = QHBoxLayout()
+            header_row.setSpacing(8)
+            radio = RadioButton(CONNECTION_MODE_LABELS[mode], card)
+            radio.setChecked(mode == self._selected)
+            self._group.addButton(radio)
+            radio.toggled.connect(
+                lambda checked, m=mode: self._on_mode_selected(m) if checked else None
+            )
+            badge = CaptionLabel(badge_text, card)
+            badge.setTextColor(QColor(110, 110, 110), QColor(255, 255, 255, 160))
+            header_row.addWidget(radio)
+            header_row.addStretch(1)
+            header_row.addWidget(badge)
+
+            desc = CaptionLabel(desc_text, card)
+            desc.setWordWrap(True)
+            desc.setTextColor(QColor(95, 95, 95), QColor(255, 255, 255, 185))
+
+            card_layout.addLayout(header_row)
+            card_layout.addWidget(desc)
+            card.mouseReleaseEvent = (
+                lambda event, m=mode: (
+                    self.select_mode(m)
+                    if event.button() == Qt.MouseButton.LeftButton
+                    else None
+                )
+            )
+
+            self._radios[mode] = radio
+            self._cards[mode] = card
+            self.viewLayout.addWidget(card)
+
+        self.widget.setMinimumWidth(520)
+        self.yesButton.setText("确定")
+        self.cancelButton.setText("取消")
+        self._refresh_card_styles()
+
+    def _on_mode_selected(self, mode):
+        self._selected = normalize_connection_mode(mode)
+        self._refresh_card_styles()
+
+    def _refresh_card_styles(self):
+        dark = isDarkTheme()
+        for mode, card in self._cards.items():
+            if mode == self._selected:
+                border = "#4cc2ff" if dark else "#0078d4"
+                bg = "rgba(76, 194, 255, 0.08)" if dark else "rgba(0, 120, 212, 0.06)"
+                card.setStyleSheet(
+                    f"SimpleCardWidget {{ border: 1.5px solid {border}; background-color: {bg}; border-radius: 8px; }}"
+                )
+            else:
+                card.setStyleSheet("")
+
+    def select_mode(self, mode):
+        normalized = normalize_connection_mode(mode)
+        radio = self._radios.get(normalized)
+        if radio is not None and not radio.isChecked():
+            radio.setChecked(True)
+        else:
+            self._on_mode_selected(normalized)
+
+    def selected_mode(self):
+        return self._selected

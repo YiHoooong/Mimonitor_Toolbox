@@ -59,7 +59,9 @@ from .core import (
     SOUND_OUTPUT_OPTIONS,
     SOUND_OUTPUT_SETTINGS_KEY,
     bundled_resource_path,
+    format_connection_mode_label,
     load_settings,
+    normalize_connection_mode,
     update_settings,
 )
 from .network_scan import enumerate_windows_adapter_addresses
@@ -83,6 +85,7 @@ from .widgets import (
     AddTaskCard,
     AutoTaskCard,
     AutoTaskOptionsDialog,
+    ConnectionModeDialog,
     FlowContainer,
     NoWheelSlider,
     PageScrollSlider,
@@ -144,6 +147,35 @@ class PagesMixin:
 
         # Hide return (back) button
         self.navigationInterface.setReturnButtonVisible(False)
+
+    def _update_connection_mode_button(self, mode=None):
+        btn = getattr(self, "conn_mode_btn", None)
+        if btn is None:
+            return
+        if mode is None:
+            mode = getattr(getattr(self, "adb", None), "connection_mode", None)
+            if mode is None:
+                mode = load_settings().get("connection_mode")
+        normalized = normalize_connection_mode(mode)
+        btn.setText(f"连接模式: {format_connection_mode_label(normalized)}")
+
+    def _open_connection_mode_dialog(self):
+        current = getattr(getattr(self, "adb", None), "connection_mode", None)
+        if current is None:
+            current = load_settings().get("connection_mode")
+        dialog = ConnectionModeDialog(current, self)
+        try:
+            if not dialog.exec():
+                return
+            chosen = dialog.selected_mode()
+        finally:
+            dialog.deleteLater()
+        setter = getattr(self, "set_connection_mode", None)
+        if callable(setter):
+            setter(chosen)
+        else:
+            update_settings({"connection_mode": chosen})
+            self._update_connection_mode_button(chosen)
 
     def _make_home_page(self):
         container = QWidget()
@@ -230,6 +262,14 @@ class PagesMixin:
         self.status_label.setStyleSheet("color: #d83b01; font-weight: bold; font-size: 14px;")
         row2.addWidget(self.status_label)
 
+        self.conn_mode_btn = PushButton(
+            f"连接模式: {format_connection_mode_label(settings.get('connection_mode'))}",
+            conn_card,
+        )
+        self.conn_mode_btn.setToolTip("切换兼容模式 (ADB) 与混合加速 (Daemon)")
+        self.conn_mode_btn.clicked.connect(self._open_connection_mode_dialog)
+        row2.addWidget(self.conn_mode_btn)
+
         row2.addStretch(1)
         conn_layout.addLayout(row2)
 
@@ -267,6 +307,14 @@ class PagesMixin:
         self.log_file_toggle.setChecked(False)
         self.log_file_toggle.stateChanged.connect(self._toggle_log_file)
         log_btn_row.addWidget(self.log_file_toggle)
+        self.verbose_log_toggle = CheckBox("详细日志", log_card)
+        self.verbose_log_toggle.setChecked(bool(load_settings().get("verbose_log", False)))
+        self.verbose_log_toggle.setToolTip(
+            "显示页面回读与预设逐项跳过明细（开启「记录到本地文件」时文件内始终保留完整明细）"
+        )
+        self.verbose_log_toggle.stateChanged.connect(self._toggle_verbose_log)
+        log_btn_row.addSpacing(12)
+        log_btn_row.addWidget(self.verbose_log_toggle)
         log_btn_row.addStretch(1)
         export_log_btn = PushButton(FIF.SHARE, "导出日志", log_card)
         export_log_btn.clicked.connect(self._export_log)

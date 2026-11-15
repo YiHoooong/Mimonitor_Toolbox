@@ -163,5 +163,60 @@ class SoundOutputHelpersTests(unittest.TestCase):
         self.assertEqual(core.format_sound_output_label(None), "未知")
 
 
+class ConnectionModeTests(unittest.TestCase):
+    """覆盖连接模式默认配置、规范化、展示文案和持久化。"""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.config_path = Path(self.temp_dir.name) / "config.json"
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_connection_mode_defaults_and_normalization(self):
+        from mimonitor_toolbox import core
+
+        with mock.patch.object(core, "get_settings_path", return_value=str(self.config_path)):
+            settings = core.load_settings()
+
+        self.assertEqual(settings["connection_mode"], core.CONNECTION_MODE_ADB)
+        self.assertEqual(core.normalize_connection_mode("daemon"), core.CONNECTION_MODE_DAEMON)
+        self.assertEqual(core.normalize_connection_mode(" DAEMON "), core.CONNECTION_MODE_DAEMON)
+        self.assertEqual(core.normalize_connection_mode("adb"), core.CONNECTION_MODE_ADB)
+        self.assertEqual(core.normalize_connection_mode(None), core.CONNECTION_MODE_ADB)
+        self.assertEqual(core.normalize_connection_mode("invalid"), core.CONNECTION_MODE_ADB)
+        self.assertEqual(core.format_connection_mode_label("adb"), "兼容模式 (ADB)")
+        self.assertEqual(core.format_connection_mode_label("daemon"), "混合加速 (Daemon)")
+
+    def test_update_settings_persists_connection_mode(self):
+        from mimonitor_toolbox import core
+
+        with mock.patch.object(core, "get_settings_path", return_value=str(self.config_path)):
+            self.assertTrue(core.update_settings({"connection_mode": "daemon"}))
+            settings = core.load_settings()
+            self.assertEqual(settings["connection_mode"], core.CONNECTION_MODE_DAEMON)
+            self.assertTrue(core.update_settings({"connection_mode": "adb"}))
+            self.assertEqual(core.load_settings()["connection_mode"], core.CONNECTION_MODE_ADB)
+
+    def test_verbose_log_defaults_false_and_page_display_names(self):
+        from mimonitor_toolbox import core
+
+        with mock.patch.object(core, "get_settings_path", return_value=str(self.config_path)):
+            self.assertFalse(core.load_settings()["verbose_log"])
+            core.update_settings({"verbose_log": True})
+            self.assertTrue(core.load_settings()["verbose_log"])
+
+        self.assertEqual(core.format_page_display_name("picturePage"), "画面设置")
+        self.assertEqual(core.format_page_display_name("gamePage"), "游戏模式")
+        self.assertEqual(core.format_page_display_name("sourcePage"), "信号源与音频")
+        self.assertEqual(core.format_page_display_name("lightPage"), "屏幕灯")
+        self.assertEqual(core.format_page_display_name("unknownPage"), "unknownPage")
+
+        detail_calls = []
+        host_with_detail = type("Host", (), {"log_detail": detail_calls.append})()
+        core.emit_detail_log(host_with_detail, "明细条目")
+        self.assertEqual(detail_calls, ["明细条目"])
+
+
 if __name__ == "__main__":
     unittest.main()

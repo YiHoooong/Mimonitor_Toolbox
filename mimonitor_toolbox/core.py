@@ -54,6 +54,52 @@ def _as_list_of_dicts(raw):
 BASELINE_PRESET_ID = "__baseline__"
 TRAY_PRESET_LIMIT = 4
 
+CONNECTION_MODE_ADB = "adb"
+CONNECTION_MODE_DAEMON = "daemon"
+CONNECTION_MODE_OPTIONS = (
+    (CONNECTION_MODE_ADB, "兼容模式 (ADB)"),
+    (CONNECTION_MODE_DAEMON, "混合加速 (Daemon)"),
+)
+CONNECTION_MODE_LABELS = dict(CONNECTION_MODE_OPTIONS)
+MTK_DAEMON_PORT = 27891
+
+
+def normalize_connection_mode(mode):
+    """规范化连接模式：仅识别 daemon，其余一律归为标准 adb。"""
+    if str(mode or "").strip().lower() == CONNECTION_MODE_DAEMON:
+        return CONNECTION_MODE_DAEMON
+    return CONNECTION_MODE_ADB
+
+
+def format_connection_mode_label(mode):
+    """返回连接模式对应的界面显示文本。"""
+    return CONNECTION_MODE_LABELS[normalize_connection_mode(mode)]
+
+
+PAGE_DISPLAY_NAMES = {
+    "picturePage": "画面设置",
+    "gamePage": "游戏模式",
+    "sourcePage": "信号源与音频",
+    "lightPage": "屏幕灯",
+}
+
+
+def format_page_display_name(page_name):
+    """将内部页面标识转换为界面展示用的中文页面名称。"""
+    return PAGE_DISPLAY_NAMES.get(page_name, page_name)
+
+
+def emit_detail_log(host, message):
+    """写入详细日志：支持 log_detail 时按开关仅显示于详细模式（文件始终保留）。"""
+    detail_fn = getattr(host, "log_detail", None)
+    if callable(detail_fn):
+        detail_fn(message)
+        return
+    if bool(load_settings().get("verbose_log", False)):
+        log_fn = getattr(host, "log", None)
+        if callable(log_fn):
+            log_fn(message)
+
 
 def normalize_tray_preset_ids(raw_ids, presets=None):
     """规范化托盘预设 id 列表：过滤无效 id、去重并限制最多 4 个。"""
@@ -81,7 +127,9 @@ def _load_settings_unlocked():
         "close_behavior": "tray",
         "never_ask_close": False,
         "never_show_preset_edit_merged_notice": False,
+        "verbose_log": False,
         "saved_ip": "",
+        "connection_mode": CONNECTION_MODE_ADB,
         # 扫描网卡的高级覆盖：Hyper-V 外部虚拟交换机把物理网卡的 IP 搬到了
         # vEthernet 上（物理网卡会"非物理网卡"式地被过滤掉），这两项可以点名
         # 某块网卡 / 某个网段永远参与扫描。
@@ -142,6 +190,8 @@ def _load_settings_unlocked():
     preset_ids = {preset.get("id") for preset in merged["presets"]
                   if isinstance(preset.get("id"), str)}
     merged["active_preset_id"] = active if isinstance(active, str) and active in preset_ids else None
+    merged["connection_mode"] = normalize_connection_mode(merged.get("connection_mode"))
+    merged["verbose_log"] = bool(merged.get("verbose_log", False))
     return merged
 
 def load_settings():

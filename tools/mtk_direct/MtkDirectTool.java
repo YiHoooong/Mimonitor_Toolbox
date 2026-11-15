@@ -1,17 +1,85 @@
+import android.content.ContentResolver;
+import android.content.Context;
+import android.content.Intent;
+import android.os.Build;
+import android.os.Process;
+import android.provider.Settings;
 import android.util.Log;
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FileWriter;
+import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
+import java.net.BindException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 public class MtkDirectTool {
     private static final String TAG = "MtkDirectTool";
+    private static final String VERSION = "v2.1";
+    private static final int DEFAULT_DAEMON_PORT = 27891;
     private static final String RESULT_FILE = "/data/data/mitv.service/cache/.jni_result";
     private static final String BATCH_RESULT_FILE =
             "/sdcard/Download/Mimonitor_Toolbox/.mtk_batch_result.txt";
     private static final String TV_CLASSPATH =
             "/system/framework/mitvmiddlewareimpl.jar:/system_ext/priv-app/TvServices/TvServices.apk";
     private static final String NATIVE_LIB_PATH = "/vendor/lib64:/system/lib64:/system_ext/lib64";
+    private static final String BSP_IFACE = "vendor.mi.hardware.bspmserver@2.0::IBspMServer";
+    private static final String CONFIG_IFACE = "vendor.mi.hardware.bspmserver@2.0::IVendorConfig";
+    private static final String PIC_MODE_CHANGED_ACTION = "com.xiaomi.mitv.action.PIC_MODE_CHANGED";
+
+    // Cached reflection handles (shared by CLI and resident daemon)
+    private static ClassLoader sTvClassLoader;
+    private static Method sGetConfigValueNative;
+    private static Method sSetConfigValueNative;
+    private static Method sGetMinMaxNative;
+
+    private static Class<?> sDisplayClass;
+    private static Object sDisplayInstance;
+    private static Object sUserColorTempEnum;
+    private static Constructor<?> sColorTempDataCtor;
+    private static Method sSetWbGainOffsetExMethod;
+
+    private static Class<?> sMiTvProviderClass;
+    private static Object sMiTvProvider;
+    private static Method sSetHdrAttrMethod;
+
+    private static Class<?> sIAudioServiceClass;
+    private static Object sAudioService;
+    private static Method sAudioGetParamsMethod;
+    private static Method sAudioSetParamsMethod;
+    private static Method sAudioGetOutputDeviceNameMethod;
+
+    private static Class<?> sHwBinderClass;
+    private static Class<?> sHwParcelClass;
+    private static Class<?> sIHwBinderClass;
+    private static Object sLedConfigBinder;
+    private static Method sHwParcelWriteIfaceMethod;
+    private static Method sHwParcelWriteInt32Method;
+    private static Method sHwParcelVerifySuccessMethod;
+    private static Method sHwParcelReleaseTempMethod;
+    private static Method sHwParcelReadInt32Method;
+    private static Method sHwParcelReadStrongBinderMethod;
+    private static Method sHwParcelReleaseMethod;
+    private static Method sIHwBinderTransactMethod;
+
+    private static Context sContext;
+    private static ContentResolver sResolver;
+    private static boolean sContextInitTried = false;
+    private static boolean sResolverGetBroken = false;
+    private static boolean sResolverPutBroken = false;
+    private static boolean sSendBroadcastBroken = false;
+    private static String sCachedModel;
 
     private static void log(String msg) {
         System.out.println(msg);
@@ -41,54 +109,194 @@ public class MtkDirectTool {
         writeFile(BATCH_RESULT_FILE, value);
     }
 
-    private static ClassLoader tvClassLoader() throws Exception {
-        return (ClassLoader) Class.forName("dalvik.system.PathClassLoader")
-                .getConstructor(String.class, String.class, ClassLoader.class)
-                .newInstance(TV_CLASSPATH, NATIVE_LIB_PATH, ClassLoader.getSystemClassLoader());
+    private static String sanitizeSingleLine(String text) {
+        if (text == null) {
+            return "";
+        }
+        return text.replace("\r", "").replace("\n", " ");
     }
 
-    private static void setColorGains(ClassLoader classLoader, int red, int green, int blue) throws Exception {
-        Class<?> displayClass = classLoader.loadClass("com.mediatek.twoworlds.factory.MtkTvFApiDisplay");
-        Object display = displayClass.getMethod("getInstance").invoke(null);
+    private static int clamp(int v, int lo, int hi) {
+        return Math.max(lo, Math.min(hi, v));
+    }
+
+    private static int parseIntOr(String s, int def) {
+        try {
+            return Integer.parseInt(s);
+        } catch (Exception e) {
+            return def;
+        }
+    }
+
+    private static synchronized ClassLoader ensureTvClassLoader() throws Exception {
+        if (sTvClassLoader == null) {
+            sTvClassLoader = (ClassLoader) Class.forName("dalvik.system.PathClassLoader")
+                    .getConstructor(String.class, String.class, ClassLoader.class)
+                    .newInstance(TV_CLASSPATH, NATIVE_LIB_PATH, ClassLoader.getSystemClassLoader());
+        }
+        return sTvClassLoader;
+    }
+
+    private static synchronized void ensureTvNative() throws Exception {
+        if (sGetConfigValueNative != null && sSetConfigValueNative != null && sGetMinMaxNative != null) {
+            return;
+        }
+        ClassLoader classLoader = ensureTvClassLoader();
+        Class<?> tvNativeClass = classLoader.loadClass("com.mediatek.twoworlds.tv.TVNative");
+        sGetConfigValueNative = tvNativeClass.getDeclaredMethod(
+                "getConfigValue_native", int.class, String.class);
+        sGetConfigValueNative.setAccessible(true);
+        sSetConfigValueNative = tvNativeClass.getDeclaredMethod(
+                "setConfigValue_native", int.class, String.class, int.class, int.class);
+        sSetConfigValueNative.setAccessible(true);
+        sGetMinMaxNative = tvNativeClass.getDeclaredMethod(
+                "getMinMaxConfigValue_native", int.class, String.class);
+        sGetMinMaxNative.setAccessible(true);
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static synchronized void ensureDisplayHandles() throws Exception {
+        if (sDisplayInstance != null && sSetWbGainOffsetExMethod != null) {
+            return;
+        }
+        ClassLoader classLoader = ensureTvClassLoader();
+        sDisplayClass = classLoader.loadClass("com.mediatek.twoworlds.factory.MtkTvFApiDisplay");
+        sDisplayInstance = sDisplayClass.getMethod("getInstance").invoke(null);
 
         Class<?> enumClass = classLoader.loadClass(
                 "com.mediatek.twoworlds.factory.common.MtkTvFApiDisplayTypes$EnumColorTemperature");
-        Object userColorTemp = Enum.valueOf((Class<Enum>) enumClass.asSubclass(Enum.class),
+        sUserColorTempEnum = Enum.valueOf(
+                (Class<Enum>) enumClass.asSubclass(Enum.class),
                 "E_MTK_FAPI_COLOR_TEMP_USER");
 
         Class<?> dataClass = classLoader.loadClass(
                 "com.mediatek.twoworlds.factory.common.MtkTvFApiDisplayTypes$ColorTempData");
-        Constructor<?> ctor = dataClass.getConstructor(
+        sColorTempDataCtor = dataClass.getConstructor(
                 int.class, int.class, int.class, int.class, int.class, int.class);
-        Object data = ctor.newInstance(red, green, blue, 1024, 1024, 1024);
 
-        Method method = displayClass.getMethod("setWbGainOffsetEx", enumClass, dataClass, int.class);
-        int ret = (Integer) method.invoke(display, userColorTemp, data, 0);
-        log("RESULT: SET_COLOR_GAINS r=" + red + " g=" + green + " b=" + blue + ", return: " + ret);
-        writeResult(String.valueOf(ret));
+        sSetWbGainOffsetExMethod = sDisplayClass.getMethod(
+                "setWbGainOffsetEx", enumClass, dataClass, int.class);
     }
 
-    private static void setHdrToneMapping(ClassLoader classLoader, Method setConfigValueNative, int value,
-            int isUpdate) throws Exception {
-        int configRet = (Integer) setConfigValueNative.invoke(
-                null, -1, "g_video__vid_hdr_tone_mapping_mode", value, isUpdate);
-        Integer hdrAttrRet = null;
-        try {
-            Class<?> providerClass = classLoader.loadClass("xiaomi.hardware.mitv.provider.V1_0.IMiTVProvider");
-            Object provider = providerClass.getMethod("getService", boolean.class).invoke(null, false);
-            if (provider != null) {
-                hdrAttrRet = (Integer) providerClass.getMethod("setHdrAttr", int.class, int.class)
-                        .invoke(provider, 4, value);
-            }
-        } catch (Exception e) {
-            log("WARN: setHdrAttr failed: " + e.getMessage());
+    private static synchronized void ensureContext() {
+        if (sContextInitTried) {
+            return;
         }
-        log("RESULT: SET_HDR_TONE_MAPPING value=" + value + ", configReturn: " + configRet
-                + ", hdrAttrReturn: " + (hdrAttrRet == null ? "N/A" : hdrAttrRet));
-        writeResult(String.valueOf(configRet));
+        sContextInitTried = true;
+        try {
+            Class<?> looperClass = Class.forName("android.os.Looper");
+            Object mainLooper = looperClass.getMethod("getMainLooper").invoke(null);
+            if (mainLooper == null) {
+                looperClass.getMethod("prepareMainLooper").invoke(null);
+            }
+            Class<?> atClass = Class.forName("android.app.ActivityThread");
+            Object at = atClass.getMethod("currentActivityThread").invoke(null);
+            if (at == null) {
+                at = atClass.getMethod("systemMain").invoke(null);
+            }
+            if (at != null) {
+                Object ctx = atClass.getMethod("getSystemContext").invoke(at);
+                if (ctx instanceof Context) {
+                    sContext = (Context) ctx;
+                    sResolver = sContext.getContentResolver();
+                    try {
+                        Settings.Global.getString(sResolver, "picture_mode");
+                    } catch (Throwable probeErr) {
+                        sResolverGetBroken = true;
+                        sResolverPutBroken = true;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "ensureContext failed: " + t.getMessage());
+            sContext = null;
+            sResolver = null;
+        }
     }
 
-    private static void batchGet(Method getConfigValueNative, String[] keys, int startIndex) {
+    private static int getJniValue(String key) throws Exception {
+        ensureTvNative();
+        return (Integer) sGetConfigValueNative.invoke(null, -1, key);
+    }
+
+    private static int setJniValue(String key, int value, int isUpdate) throws Exception {
+        ensureTvNative();
+        return (Integer) sSetConfigValueNative.invoke(null, -1, key, value, isUpdate);
+    }
+
+    private static int rampJni(String key, int from, int target, int isUpdate, int stepMs,
+            String doneFile, int stepSize) throws Exception {
+        ensureTvNative();
+        int clampedStepSize = Math.max(1, stepSize);
+        if (doneFile != null && doneFile.length() > 0) {
+            try {
+                new File(doneFile).delete();
+            } catch (Exception ignored) {
+            }
+        }
+        int applied = from;
+        int v = from;
+        int step = target >= from ? clampedStepSize : -clampedStepSize;
+        while (true) {
+            sSetConfigValueNative.invoke(null, -1, key, v, isUpdate);
+            applied = v;
+            if (v == target) {
+                break;
+            }
+            int next = v + step;
+            if ((step > 0 && next > target) || (step < 0 && next < target)) {
+                next = target;
+            }
+            v = next;
+            if (stepMs > 0) {
+                Thread.sleep(stepMs);
+            }
+        }
+        if (doneFile != null && doneFile.length() > 0) {
+            writeFile(doneFile, "1");
+        }
+        return applied;
+    }
+
+    private static int setColorGains(int red, int green, int blue) throws Exception {
+        ensureDisplayHandles();
+        Object data = sColorTempDataCtor.newInstance(red, green, blue, 1024, 1024, 1024);
+        return (Integer) sSetWbGainOffsetExMethod.invoke(sDisplayInstance, sUserColorTempEnum, data, 0);
+    }
+
+    private static Integer trySetHdrAttr(int value) {
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                if (sMiTvProvider == null || sSetHdrAttrMethod == null || sMiTvProviderClass == null) {
+                    ClassLoader classLoader = ensureTvClassLoader();
+                    sMiTvProviderClass = classLoader.loadClass(
+                            "xiaomi.hardware.mitv.provider.V1_0.IMiTVProvider");
+                    sMiTvProvider = sMiTvProviderClass.getMethod("getService", boolean.class)
+                            .invoke(null, false);
+                    sSetHdrAttrMethod = sMiTvProviderClass.getMethod("setHdrAttr", int.class, int.class);
+                }
+                if (sMiTvProvider == null) {
+                    return null;
+                }
+                return (Integer) sSetHdrAttrMethod.invoke(sMiTvProvider, 4, value);
+            } catch (Exception e) {
+                sMiTvProvider = null;
+                if (attempt == 1) {
+                    log("WARN: setHdrAttr failed: " + e.getMessage());
+                }
+            }
+        }
+        return null;
+    }
+
+    private static int[] setHdrToneMapping(int value, int isUpdate) throws Exception {
+        int configRet = setJniValue("g_video__vid_hdr_tone_mapping_mode", value, isUpdate);
+        Integer hdrAttrRet = trySetHdrAttr(value);
+        return new int[]{configRet, hdrAttrRet == null ? Integer.MIN_VALUE : hdrAttrRet};
+    }
+
+    private static void batchGet(String[] keys, int startIndex) throws Exception {
+        ensureTvNative();
         StringBuilder sb = new StringBuilder();
         long startMs = System.currentTimeMillis();
         int count = 0;
@@ -99,7 +307,7 @@ public class MtkDirectTool {
             }
             count++;
             try {
-                int val = (Integer) getConfigValueNative.invoke(null, -1, k);
+                int val = (Integer) sGetConfigValueNative.invoke(null, -1, k);
                 sb.append(k).append("=").append(val).append("\n");
             } catch (Throwable e) {
                 sb.append(k).append("=ERROR:").append(e.getClass().getSimpleName()).append("\n");
@@ -230,19 +438,30 @@ public class MtkDirectTool {
         }
     }
 
-    private static Object getAudioService() throws Exception {
-        Class<?> smClass = Class.forName("android.os.ServiceManager");
-        Object audioBinder = smClass.getMethod("getService", String.class).invoke(null, "audio");
-        if (audioBinder == null) {
-            throw new IllegalStateException("ServiceManager.getService(\"audio\") returned null");
+    private static synchronized void ensureAudioHandles(boolean forceRefresh) throws Exception {
+        if (forceRefresh) {
+            sAudioService = null;
         }
-        Class<?> iBinderClass = Class.forName("android.os.IBinder");
-        Class<?> stubClass = Class.forName("android.media.IAudioService$Stub");
-        Object audioService = stubClass.getMethod("asInterface", iBinderClass).invoke(null, audioBinder);
-        if (audioService == null) {
-            throw new IllegalStateException("IAudioService$Stub.asInterface returned null");
+        if (sAudioGetParamsMethod == null) {
+            Class<?> audioSystemClass = Class.forName("android.media.AudioSystem");
+            sAudioGetParamsMethod = audioSystemClass.getMethod("getParameters", String.class);
+            sAudioSetParamsMethod = audioSystemClass.getMethod("setParameters", String.class);
+            sAudioGetOutputDeviceNameMethod = audioSystemClass.getMethod("getOutputDeviceName", int.class);
+            sIAudioServiceClass = Class.forName("android.media.IAudioService");
         }
-        return audioService;
+        if (sAudioService == null) {
+            Class<?> smClass = Class.forName("android.os.ServiceManager");
+            Object audioBinder = smClass.getMethod("getService", String.class).invoke(null, "audio");
+            if (audioBinder == null) {
+                throw new IllegalStateException("ServiceManager.getService(\"audio\") returned null");
+            }
+            Class<?> iBinderClass = Class.forName("android.os.IBinder");
+            Class<?> stubClass = Class.forName("android.media.IAudioService$Stub");
+            sAudioService = stubClass.getMethod("asInterface", iBinderClass).invoke(null, audioBinder);
+            if (sAudioService == null) {
+                throw new IllegalStateException("IAudioService$Stub.asInterface returned null");
+            }
+        }
     }
 
     private static void setSoundOutput(int deviceId) throws Exception {
@@ -267,43 +486,46 @@ public class MtkDirectTool {
                 hdmiArc = false;
                 break;
             default:
-                log("ERROR: Unsupported sound output deviceId: " + deviceId);
-                writeResult("ERROR: Unsupported deviceId " + deviceId);
-                return;
+                throw new IllegalArgumentException("Unsupported deviceId " + deviceId);
         }
 
-        Class<?> audioSystemClass = Class.forName("android.media.AudioSystem");
-        Method getParameters = audioSystemClass.getMethod("getParameters", String.class);
-        Method setParameters = audioSystemClass.getMethod("setParameters", String.class);
-        Method getOutputDeviceName = audioSystemClass.getMethod("getOutputDeviceName", int.class);
+        try {
+            ensureAudioHandles(false);
+        } catch (Exception e) {
+            ensureAudioHandles(true);
+        }
 
-        Class<?> iAudioServiceClass = Class.forName("android.media.IAudioService");
-        Object audioService = getAudioService();
-
-        String spdifParam = (String) getParameters.invoke(null, "xmfeaspdifdet");
+        String spdifParam = (String) sAudioGetParamsMethod.invoke(null, "xmfeaspdifdet");
         boolean spdifSupported = "xmfeaspdifdet=support".equals(spdifParam);
 
-        setParameters.invoke(null, "xiaomi_switch_device=true");
+        sAudioSetParamsMethod.invoke(null, "xiaomi_switch_device=true");
         int forceRet;
         int hdmiRet;
         boolean spdifDisconnected = false;
         int paramRet;
         String devName;
         try {
-            forceRet = (Integer) iAudioServiceClass
-                    .getMethod("xmSetForceUse", int.class, int.class)
-                    .invoke(audioService, 1, forceConfig);
-            hdmiRet = (Integer) iAudioServiceClass
-                    .getMethod("setHdmiSystemAudioSupported", boolean.class)
-                    .invoke(audioService, hdmiArc);
-            if (!spdifSupported) {
-                spdifDisconnected = disconnectSpdif(iAudioServiceClass, audioService);
+            try {
+                forceRet = (Integer) sIAudioServiceClass
+                        .getMethod("xmSetForceUse", int.class, int.class)
+                        .invoke(sAudioService, 1, forceConfig);
+            } catch (Exception firstErr) {
+                ensureAudioHandles(true);
+                forceRet = (Integer) sIAudioServiceClass
+                        .getMethod("xmSetForceUse", int.class, int.class)
+                        .invoke(sAudioService, 1, forceConfig);
             }
-            devName = (String) getOutputDeviceName.invoke(null, androidDev);
-            paramRet = (Integer) setParameters.invoke(null, "switch_output_device=" + devName);
+            hdmiRet = (Integer) sIAudioServiceClass
+                    .getMethod("setHdmiSystemAudioSupported", boolean.class)
+                    .invoke(sAudioService, hdmiArc);
+            if (!spdifSupported) {
+                spdifDisconnected = disconnectSpdif(sIAudioServiceClass, sAudioService);
+            }
+            devName = (String) sAudioGetOutputDeviceNameMethod.invoke(null, androidDev);
+            paramRet = (Integer) sAudioSetParamsMethod.invoke(null, "switch_output_device=" + devName);
         } finally {
             try {
-                setParameters.invoke(null, "xiaomi_switch_device=false");
+                sAudioSetParamsMethod.invoke(null, "xiaomi_switch_device=false");
             } catch (Throwable ignored) {
             }
         }
@@ -323,54 +545,776 @@ public class MtkDirectTool {
         writeResult("OK:" + deviceId);
     }
 
-    private static void getSoundOutput() throws Exception {
-        Class<?> audioSystemClass = Class.forName("android.media.AudioSystem");
-        Method getParameters = audioSystemClass.getMethod("getParameters", String.class);
-        Class<?> iAudioServiceClass = Class.forName("android.media.IAudioService");
-        Object audioService = getAudioService();
-
-        int forceUse = (Integer) iAudioServiceClass
-                .getMethod("xmGetForceUse", int.class)
-                .invoke(audioService, 1);
-        boolean hdmiAudio = (Boolean) iAudioServiceClass
+    private static String querySoundOutputSummary() throws Exception {
+        try {
+            ensureAudioHandles(false);
+        } catch (Exception e) {
+            ensureAudioHandles(true);
+        }
+        int forceUse;
+        try {
+            forceUse = (Integer) sIAudioServiceClass
+                    .getMethod("xmGetForceUse", int.class)
+                    .invoke(sAudioService, 1);
+        } catch (Exception e) {
+            ensureAudioHandles(true);
+            forceUse = (Integer) sIAudioServiceClass
+                    .getMethod("xmGetForceUse", int.class)
+                    .invoke(sAudioService, 1);
+        }
+        boolean hdmiAudio = (Boolean) sIAudioServiceClass
                 .getMethod("isHdmiSystemAudioSupported")
-                .invoke(audioService);
-        String spdifParam = (String) getParameters.invoke(null, "xmfeaspdifdet");
+                .invoke(sAudioService);
+        String spdifParam = (String) sAudioGetParamsMethod.invoke(null, "xmfeaspdifdet");
         int tvDevice = queryTvServiceInt(34);
 
         log("RESULT: GET_SOUND_OUTPUT forceUseMedia=" + forceUse
                 + " hdmiSystemAudio=" + hdmiAudio
                 + " tvDevice=" + tvDevice
                 + " spdif=" + spdifParam);
-        writeResult(forceUse + "," + hdmiAudio + "," + tvDevice);
+        return forceUse + "," + hdmiAudio + "," + tvDevice;
+    }
+
+    private static int getMediaVolume() throws Exception {
+        try {
+            ensureAudioHandles(false);
+        } catch (Exception e) {
+            ensureAudioHandles(true);
+        }
+        try {
+            Method m = sIAudioServiceClass.getMethod("getStreamVolumeForMute", int.class);
+            return (Integer) m.invoke(sAudioService, 3);
+        } catch (NoSuchMethodException e) {
+            Method m = sIAudioServiceClass.getMethod("getStreamVolume", int.class);
+            return (Integer) m.invoke(sAudioService, 3);
+        }
+    }
+
+    private static boolean getMediaMuted() throws Exception {
+        try {
+            ensureAudioHandles(false);
+        } catch (Exception e) {
+            ensureAudioHandles(true);
+        }
+        Method m = sIAudioServiceClass.getMethod("isStreamMute", int.class);
+        return (Boolean) m.invoke(sAudioService, 3);
+    }
+
+    private static String audioCallerPackage() {
+        ensureContext();
+        if (sContext != null) {
+            try {
+                String op = sContext.getOpPackageName();
+                if (op != null && op.length() > 0) {
+                    return op;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return "mitv.service";
+    }
+
+    private static boolean setMediaVolume(int target, boolean unmuteFirst, boolean showUi) {
+        int clamped = clamp(target, 0, 100);
+        int flags = showUi ? 1 : 0;
+        try {
+            ensureAudioHandles(false);
+            if (unmuteFirst) {
+                setMediaMuted(false, false);
+            }
+            Method setVol = sIAudioServiceClass.getMethod(
+                    "setStreamVolume", int.class, int.class, int.class, String.class);
+            String pkg = audioCallerPackage();
+            try {
+                setVol.invoke(sAudioService, 3, clamped, flags, pkg);
+            } catch (Exception e) {
+                setVol.invoke(sAudioService, 3, clamped, flags, "com.android.shell");
+            }
+            return getMediaVolume() == clamped;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static boolean setMediaMuted(boolean muted, boolean showUi) {
+        int flags = showUi ? 1 : 0;
+        int direction = muted ? -100 : 100;
+        try {
+            ensureAudioHandles(false);
+            Method adjVol = sIAudioServiceClass.getMethod(
+                    "adjustStreamVolume", int.class, int.class, int.class, String.class);
+            String pkg = audioCallerPackage();
+            try {
+                adjVol.invoke(sAudioService, 3, direction, flags, pkg);
+            } catch (Exception e) {
+                adjVol.invoke(sAudioService, 3, direction, flags, "com.android.shell");
+            }
+            return getMediaMuted() == muted;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static synchronized void ensureLedReflection() throws Exception {
+        if (sHwBinderClass != null && sIHwBinderTransactMethod != null) {
+            return;
+        }
+        sHwBinderClass = Class.forName("android.os.HwBinder");
+        sHwParcelClass = Class.forName("android.os.HwParcel");
+        sIHwBinderClass = Class.forName("android.os.IHwBinder");
+        sHwParcelWriteIfaceMethod = sHwParcelClass.getMethod("writeInterfaceToken", String.class);
+        sHwParcelWriteInt32Method = sHwParcelClass.getMethod("writeInt32", int.class);
+        sHwParcelVerifySuccessMethod = sHwParcelClass.getMethod("verifySuccess");
+        sHwParcelReleaseTempMethod = sHwParcelClass.getMethod("releaseTemporaryStorage");
+        sHwParcelReadInt32Method = sHwParcelClass.getMethod("readInt32");
+        sHwParcelReadStrongBinderMethod = sHwParcelClass.getMethod("readStrongBinder");
+        sHwParcelReleaseMethod = sHwParcelClass.getMethod("release");
+        sIHwBinderTransactMethod = sIHwBinderClass.getMethod(
+                "transact", int.class, sHwParcelClass, sHwParcelClass, int.class);
+    }
+
+    private static Object getLedConfigBinder(boolean forceRefresh) throws Exception {
+        ensureLedReflection();
+        if (!forceRefresh && sLedConfigBinder != null) {
+            return sLedConfigBinder;
+        }
+        sLedConfigBinder = null;
+        Object bsp = sHwBinderClass.getMethod("getService", String.class, String.class)
+                .invoke(null, BSP_IFACE, "default");
+        if (bsp == null) {
+            throw new IllegalStateException("HwBinder.getService(" + BSP_IFACE + ") returned null");
+        }
+        Object req = sHwParcelClass.getConstructor().newInstance();
+        Object reply = sHwParcelClass.getConstructor().newInstance();
+        sHwParcelWriteIfaceMethod.invoke(req, BSP_IFACE);
+        try {
+            sIHwBinderTransactMethod.invoke(bsp, 6, req, reply, 0);
+            sHwParcelVerifySuccessMethod.invoke(reply);
+            sHwParcelReleaseTempMethod.invoke(req);
+            int status = (Integer) sHwParcelReadInt32Method.invoke(reply);
+            Object config = sHwParcelReadStrongBinderMethod.invoke(reply);
+            if (status != 0 || config == null) {
+                throw new RuntimeException("CreateConfigInterface failed status=" + status + " binder=" + config);
+            }
+            sLedConfigBinder = config;
+            return config;
+        } finally {
+            try {
+                sHwParcelReleaseMethod.invoke(reply);
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private static int setColorfulLedRaw(int mode, int color) throws Exception {
+        Exception lastErr = null;
+        for (int attempt = 0; attempt < 2; attempt++) {
+            Object config = getLedConfigBinder(attempt > 0);
+            Object req = sHwParcelClass.getConstructor().newInstance();
+            Object reply = sHwParcelClass.getConstructor().newInstance();
+            sHwParcelWriteIfaceMethod.invoke(req, CONFIG_IFACE);
+            sHwParcelWriteInt32Method.invoke(req, mode);
+            sHwParcelWriteInt32Method.invoke(req, color);
+            try {
+                sIHwBinderTransactMethod.invoke(config, 2, req, reply, 0);
+                sHwParcelVerifySuccessMethod.invoke(reply);
+                sHwParcelReleaseTempMethod.invoke(req);
+                return (Integer) sHwParcelReadInt32Method.invoke(reply);
+            } catch (Exception e) {
+                sLedConfigBinder = null;
+                lastErr = e;
+            } finally {
+                try {
+                    sHwParcelReleaseMethod.invoke(reply);
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        throw lastErr;
+    }
+
+    private static int lightingColor(int illumination, int colorTemp) {
+        illumination = clamp(illumination, 0, 14);
+        colorTemp = clamp(colorTemp, 0, 2);
+        if (colorTemp == 1) {
+            return 13 + illumination;
+        }
+        if (colorTemp == 0) {
+            return 28 + illumination;
+        }
+        return 43 + illumination;
+    }
+
+    private static int solidColor(int illumination, int colorValue) {
+        illumination = clamp(illumination, 0, 14);
+        colorValue = clamp(colorValue, 0, 4);
+        int[] base = {58, 73, 103, 88, 118};
+        return base[colorValue] + illumination;
+    }
+
+    private static int runColorfulLed(String[] args, int offset) throws Exception {
+        if (offset >= args.length) {
+            throw new IllegalArgumentException("led requires action");
+        }
+        String cmd = args[offset];
+        String arg1 = offset + 1 < args.length ? args[offset + 1] : null;
+        String arg2 = offset + 2 < args.length ? args[offset + 2] : null;
+        int mode;
+        int color;
+        if ("off".equals(cmd)) {
+            mode = 0;
+            color = 1;
+        } else if ("ambient".equals(cmd)) {
+            mode = 12;
+            color = 1;
+        } else if ("cycle".equals(cmd)) {
+            mode = 3;
+            color = 1;
+        } else if ("lighting".equals(cmd)) {
+            mode = 11;
+            color = lightingColor(parseIntOr(arg1, 9), parseIntOr(arg2, 1));
+        } else if ("solid".equals(cmd)) {
+            mode = 1;
+            color = solidColor(parseIntOr(arg1, 9), parseIntOr(arg2, 0));
+        } else if ("raw".equals(cmd)) {
+            mode = parseIntOr(arg1, 0);
+            color = parseIntOr(arg2, 0);
+        } else {
+            throw new IllegalArgumentException("Unknown led command: " + cmd);
+        }
+        return setColorfulLedRaw(mode, color);
+    }
+
+    private static List<String> execCommandAndReadLines(String... cmd) throws Exception {
+        java.lang.Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
+        List<String> lines = new ArrayList<>();
+        try (BufferedReader br = new BufferedReader(
+                new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                lines.add(line);
+            }
+        }
+        int exit = p.waitFor();
+        if (exit != 0) {
+            throw new IllegalStateException("Command failed (" + exit + "): " + String.join(" ", lines));
+        }
+        return lines;
+    }
+
+    private static String execCommandAndReadFirstLine(String... cmd) throws Exception {
+        List<String> lines = execCommandAndReadLines(cmd);
+        StringBuilder out = new StringBuilder();
+        for (String line : lines) {
+            String trimmed = line.trim();
+            if (trimmed.length() == 0) {
+                continue;
+            }
+            if (out.length() > 0) {
+                out.append(" ");
+            }
+            out.append(trimmed);
+        }
+        return out.toString();
+    }
+
+    private static String getGlobalSettingViaCli(String key) throws Exception {
+        try {
+            return sanitizeSingleLine(execCommandAndReadFirstLine("cmd", "settings", "get", "global", key));
+        } catch (Throwable t) {
+            return sanitizeSingleLine(execCommandAndReadFirstLine("settings", "get", "global", key));
+        }
+    }
+
+    private static Map<String, String> getGlobalSettingsBulk(List<String> keys) throws Exception {
+        Map<String, String> result = new HashMap<>();
+        if (keys == null || keys.isEmpty()) {
+            return result;
+        }
+        ensureContext();
+        if (sResolver != null && !sResolverGetBroken) {
+            try {
+                for (String k : keys) {
+                    String v = Settings.Global.getString(sResolver, k);
+                    result.put(k, v == null ? "null" : sanitizeSingleLine(v));
+                }
+                return result;
+            } catch (Throwable t) {
+                sResolverGetBroken = true;
+                result.clear();
+            }
+        }
+        if (keys.size() == 1) {
+            String k = keys.get(0);
+            result.put(k, getGlobalSettingViaCli(k));
+            return result;
+        }
+        List<String> lines;
+        try {
+            lines = execCommandAndReadLines("cmd", "settings", "list", "global");
+        } catch (Throwable t) {
+            lines = execCommandAndReadLines("settings", "list", "global");
+        }
+        Map<String, String> all = new HashMap<>();
+        for (String raw : lines) {
+            int eq = raw.indexOf('=');
+            if (eq <= 0) {
+                continue;
+            }
+            String k = raw.substring(0, eq).trim();
+            String v = sanitizeSingleLine(raw.substring(eq + 1));
+            all.put(k, v);
+        }
+        for (String k : keys) {
+            String v = all.get(k);
+            result.put(k, v == null ? "null" : v);
+        }
+        return result;
+    }
+
+    private static String getGlobalSetting(String key) throws Exception {
+        ensureContext();
+        if (sResolver != null && !sResolverGetBroken) {
+            try {
+                String v = Settings.Global.getString(sResolver, key);
+                return v == null ? "null" : sanitizeSingleLine(v);
+            } catch (Throwable t) {
+                sResolverGetBroken = true;
+            }
+        }
+        return getGlobalSettingViaCli(key);
+    }
+
+    private static void putGlobalSetting(String key, String value) throws SecurityException {
+        ensureContext();
+        if (sResolver == null || sResolverPutBroken) {
+            throw new SecurityException("PUT_DENIED:" + key + ":no_resolver");
+        }
+        try {
+            boolean ok = Settings.Global.putString(sResolver, key, value);
+            if (!ok) {
+                sResolverPutBroken = true;
+                throw new SecurityException("PUT_DENIED:" + key + ":returned_false");
+            }
+        } catch (SecurityException se) {
+            sResolverPutBroken = true;
+            String msg = se.getMessage() == null ? "security_exception" : sanitizeSingleLine(se.getMessage());
+            if (!msg.startsWith("PUT_DENIED:")) {
+                msg = "PUT_DENIED:" + key + ":" + msg;
+            }
+            throw new SecurityException(msg, se);
+        } catch (Throwable t) {
+            sResolverPutBroken = true;
+            throw new SecurityException(
+                    "PUT_DENIED:" + key + ":" + t.getClass().getSimpleName() + ":" + sanitizeSingleLine(t.getMessage()),
+                    t);
+        }
+    }
+
+    private static String getDeviceModel() {
+        if (sCachedModel != null && sCachedModel.length() > 0) {
+            return sCachedModel;
+        }
+        try {
+            Class<?> spClass = Class.forName("android.os.SystemProperties");
+            String val = (String) spClass.getMethod("get", String.class, String.class)
+                    .invoke(null, "ro.product.model", Build.MODEL);
+            sCachedModel = sanitizeSingleLine(val);
+        } catch (Throwable t) {
+            sCachedModel = sanitizeSingleLine(Build.MODEL);
+        }
+        return sCachedModel;
+    }
+
+    private static void refreshPq() throws Exception {
+        ensureContext();
+        if (sContext != null && !sSendBroadcastBroken) {
+            Intent intent = new Intent(PIC_MODE_CHANGED_ACTION);
+            intent.putExtra("picmode", 7);
+            try {
+                Class<?> uhClass = Class.forName("android.os.UserHandle");
+                Object userAll = uhClass.getField("ALL").get(null);
+                Method sendAsUser = sContext.getClass().getMethod("sendBroadcastAsUser", Intent.class, uhClass);
+                sendAsUser.invoke(sContext, intent, userAll);
+                return;
+            } catch (Throwable asUserErr) {
+                try {
+                    sContext.sendBroadcast(intent);
+                    return;
+                } catch (Throwable sendErr) {
+                    sSendBroadcastBroken = true;
+                }
+            }
+        }
+        execCommandAndReadFirstLine(
+                "am", "broadcast", "-a", PIC_MODE_CHANGED_ACTION, "--ei", "picmode", "7");
+    }
+
+    private static String[] splitWhitespace(String line) {
+        String trimmed = line == null ? "" : line.trim();
+        if (trimmed.length() == 0) {
+            return new String[0];
+        }
+        return trimmed.split("\\s+");
+    }
+
+    private static void handleQuery(BufferedReader in, BufferedWriter out) throws Exception {
+        List<String> settingKeys = new ArrayList<>();
+        List<String> jniKeys = new ArrayList<>();
+        List<String> flags = new ArrayList<>();
+
+        String line;
+        while ((line = in.readLine()) != null) {
+            String trimmed = line.trim();
+            if ("END".equals(trimmed)) {
+                break;
+            }
+            String[] parts = splitWhitespace(trimmed);
+            if (parts.length == 0) {
+                continue;
+            }
+            String sec = parts[0];
+            if ("SETTINGS".equals(sec)) {
+                for (int i = 1; i < parts.length; i++) {
+                    settingKeys.add(parts[i]);
+                }
+            } else if ("JNI".equals(sec)) {
+                for (int i = 1; i < parts.length; i++) {
+                    jniKeys.add(parts[i]);
+                }
+            } else if ("FLAGS".equals(sec)) {
+                for (int i = 1; i < parts.length; i++) {
+                    flags.add(parts[i]);
+                }
+            }
+        }
+
+        long startMs = System.currentTimeMillis();
+        out.write("OK\n");
+
+        if (!settingKeys.isEmpty()) {
+            try {
+                Map<String, String> bulkSettings = getGlobalSettingsBulk(settingKeys);
+                for (String k : settingKeys) {
+                    String v = bulkSettings.get(k);
+                    out.write("S " + k + "=" + (v == null ? "null" : v) + "\n");
+                }
+            } catch (Throwable bulkErr) {
+                for (String k : settingKeys) {
+                    try {
+                        String v = getGlobalSetting(k);
+                        out.write("S " + k + "=" + v + "\n");
+                    } catch (Throwable t) {
+                        out.write("S " + k + "=__ERR__:" + sanitizeSingleLine(t.getMessage()) + "\n");
+                    }
+                }
+            }
+        }
+
+        for (String k : jniKeys) {
+            try {
+                int v = getJniValue(k);
+                out.write("J " + k + "=" + v + "\n");
+            } catch (Throwable t) {
+                out.write("J " + k + "=__ERR__:" + t.getClass().getSimpleName() + "\n");
+            }
+        }
+
+        for (String flag : flags) {
+            try {
+                if ("model".equals(flag)) {
+                    out.write("F model=" + getDeviceModel() + "\n");
+                } else if ("volume".equals(flag)) {
+                    out.write("F volume=" + getMediaVolume() + "\n");
+                } else if ("muted".equals(flag)) {
+                    out.write("F muted=" + (getMediaMuted() ? "1" : "0") + "\n");
+                } else if ("sound_out".equals(flag)) {
+                    out.write("F sound_out=" + querySoundOutputSummary() + "\n");
+                } else {
+                    out.write("F " + flag + "=__ERR__:unknown_flag\n");
+                }
+            } catch (Throwable t) {
+                out.write("F " + flag + "=__ERR__:" + sanitizeSingleLine(t.getMessage()) + "\n");
+            }
+        }
+
+        out.write("ELAPSED " + (System.currentTimeMillis() - startMs) + "\n");
+        out.write("END\n");
+        out.flush();
+    }
+
+    private static void handleBatch(BufferedReader in, BufferedWriter out) throws Exception {
+        List<String> ops = new ArrayList<>();
+        String line;
+        while ((line = in.readLine()) != null) {
+            String trimmed = line.trim();
+            if ("END".equals(trimmed)) {
+                break;
+            }
+            if (trimmed.length() > 0) {
+                ops.add(trimmed);
+            }
+        }
+
+        long startMs = System.currentTimeMillis();
+        List<String> stepLines = new ArrayList<>();
+
+        for (int idx = 0; idx < ops.size(); idx++) {
+            String raw = ops.get(idx);
+            String[] headParts = raw.split("\\s+", 3);
+            String op = headParts[0];
+
+            try {
+                if ("PUT".equals(op)) {
+                    if (headParts.length < 2) {
+                        stepLines.add("STEP " + idx + " ERR PUT:missing_key");
+                        continue;
+                    }
+                    String key = headParts[1];
+                    String val = headParts.length >= 3 ? headParts[2] : "";
+                    try {
+                        putGlobalSetting(key, val);
+                        stepLines.add("STEP " + idx + " OK PUT " + key);
+                    } catch (SecurityException se) {
+                        out.write("ERR_AT " + idx + " " + sanitizeSingleLine(se.getMessage()) + "\n");
+                        for (String sl : stepLines) {
+                            out.write(sl + "\n");
+                        }
+                        out.write("END\n");
+                        out.flush();
+                        return;
+                    }
+                } else {
+                    String[] parts = splitWhitespace(raw);
+                    if ("JNI_SET".equals(op) && parts.length >= 3) {
+                        int val = Integer.parseInt(parts[2]);
+                        int upd = parts.length >= 4 ? Integer.parseInt(parts[3]) : 3;
+                        int ret = setJniValue(parts[1], val, upd);
+                        stepLines.add("STEP " + idx + " OK JNI_SET " + parts[1] + "=" + ret);
+                    } else if ("JNI_RAMP".equals(op) && parts.length >= 4) {
+                        int from = Integer.parseInt(parts[2]);
+                        int to = Integer.parseInt(parts[3]);
+                        int upd = parts.length >= 5 ? Integer.parseInt(parts[4]) : 3;
+                        int stepMs = parts.length >= 6 ? Integer.parseInt(parts[5]) : 0;
+                        int stepSize = parts.length >= 7 ? Integer.parseInt(parts[6]) : 1;
+                        int applied = rampJni(parts[1], from, to, upd, stepMs, null, stepSize);
+                        stepLines.add("STEP " + idx + " OK JNI_RAMP " + parts[1] + "=" + applied);
+                    } else if ("COLOR_GAINS".equals(op) && parts.length >= 4) {
+                        int ret = setColorGains(
+                                Integer.parseInt(parts[1]),
+                                Integer.parseInt(parts[2]),
+                                Integer.parseInt(parts[3]));
+                        stepLines.add("STEP " + idx + " OK COLOR_GAINS " + ret);
+                    } else if ("HDR_TM".equals(op) && parts.length >= 2) {
+                        int val = Integer.parseInt(parts[1]);
+                        int upd = parts.length >= 3 ? Integer.parseInt(parts[2]) : 3;
+                        int[] rets = setHdrToneMapping(val, upd);
+                        stepLines.add("STEP " + idx + " OK HDR_TM " + rets[0]);
+                    } else if ("SOUND_OUT".equals(op) && parts.length >= 2) {
+                        int devId = Integer.parseInt(parts[1]);
+                        setSoundOutput(devId);
+                        stepLines.add("STEP " + idx + " OK SOUND_OUT " + devId);
+                    } else if ("LED".equals(op) && parts.length >= 2) {
+                        int ret = runColorfulLed(parts, 1);
+                        stepLines.add("STEP " + idx + " OK LED " + ret);
+                    } else if ("VOL_SET".equals(op) && parts.length >= 2) {
+                        int val = Integer.parseInt(parts[1]);
+                        boolean unmuteFirst = parts.length >= 3 && Integer.parseInt(parts[2]) != 0;
+                        boolean showUi = parts.length >= 4 && Integer.parseInt(parts[3]) != 0;
+                        boolean ok = setMediaVolume(val, unmuteFirst, showUi);
+                        stepLines.add("STEP " + idx + (ok ? " OK VOL_SET " + val : " ERR VOL_VERIFY_FAILED"));
+                    } else if ("VOL_MUTE".equals(op) && parts.length >= 2) {
+                        boolean muted = Integer.parseInt(parts[1]) != 0;
+                        boolean showUi = parts.length >= 3 && Integer.parseInt(parts[2]) != 0;
+                        boolean ok = setMediaMuted(muted, showUi);
+                        stepLines.add("STEP " + idx + (ok ? " OK VOL_MUTE " + muted : " ERR VOL_VERIFY_FAILED"));
+                    } else if ("KEY".equals(op) && parts.length >= 2) {
+                        execCommandAndReadFirstLine("input", "keyevent", parts[1]);
+                        stepLines.add("STEP " + idx + " OK KEY " + parts[1]);
+                    } else if ("SLEEP".equals(op) && parts.length >= 2) {
+                        long ms = Math.max(0L, Math.min(5000L, Long.parseLong(parts[1])));
+                        if (ms > 0) {
+                            Thread.sleep(ms);
+                        }
+                        stepLines.add("STEP " + idx + " OK SLEEP " + ms);
+                    } else if ("REFRESH_PQ".equals(op)) {
+                        refreshPq();
+                        stepLines.add("STEP " + idx + " OK REFRESH_PQ");
+                    } else {
+                        stepLines.add("STEP " + idx + " ERR UNKNOWN_OP:" + op);
+                    }
+                }
+            } catch (Throwable t) {
+                stepLines.add("STEP " + idx + " ERR " + t.getClass().getSimpleName()
+                        + ":" + sanitizeSingleLine(t.getMessage()));
+            }
+        }
+
+        out.write("OK\n");
+        for (String sl : stepLines) {
+            out.write(sl + "\n");
+        }
+        out.write("ELAPSED " + (System.currentTimeMillis() - startMs) + "\n");
+        out.write("END\n");
+        out.flush();
+    }
+
+    private static void sendQuitToExistingDaemon(int port) {
+        Socket client = null;
+        try {
+            client = new Socket();
+            client.connect(new InetSocketAddress("127.0.0.1", port), 500);
+            client.setSoTimeout(1000);
+            BufferedWriter out = new BufferedWriter(
+                    new OutputStreamWriter(client.getOutputStream(), StandardCharsets.UTF_8));
+            BufferedReader in = new BufferedReader(
+                    new InputStreamReader(client.getInputStream(), StandardCharsets.UTF_8));
+            out.write("QUIT\n");
+            out.flush();
+            in.readLine();
+        } catch (Throwable ignored) {
+        } finally {
+            try {
+                if (client != null) {
+                    client.close();
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private static void runDaemon(int port) throws Exception {
+        ensureTvNative();
+        ensureContext();
+
+        ServerSocket server = null;
+        for (int attempt = 0; attempt < 5; attempt++) {
+            try {
+                ServerSocket candidate = new ServerSocket();
+                candidate.setReuseAddress(true);
+                candidate.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), port));
+                server = candidate;
+                break;
+            } catch (BindException be) {
+                sendQuitToExistingDaemon(port);
+                Thread.sleep(150);
+            }
+        }
+        if (server == null) {
+            throw new IllegalStateException("Failed to bind daemon socket on 127.0.0.1:" + port);
+        }
+
+        int pid = Process.myPid();
+        int uid = Process.myUid();
+        log("DAEMON_READY port=" + port + " pid=" + pid + " uid=" + uid);
+
+        boolean running = true;
+        while (running) {
+            Socket client = null;
+            try {
+                client = server.accept();
+                client.setTcpNoDelay(true);
+                client.setSoTimeout(10000);
+                BufferedReader in = new BufferedReader(
+                        new InputStreamReader(client.getInputStream(), StandardCharsets.UTF_8));
+                BufferedWriter out = new BufferedWriter(
+                        new OutputStreamWriter(client.getOutputStream(), StandardCharsets.UTF_8));
+
+                String firstLine = in.readLine();
+                if (firstLine == null) {
+                    continue;
+                }
+                String cmd = firstLine.trim();
+                if ("PING".equals(cmd)) {
+                    ensureContext();
+                    String putCap = (sResolver != null && !sResolverPutBroken) ? "1" : "0";
+                    out.write("OK MtkDirectTool " + VERSION + " pid=" + pid + " uid=" + uid + " put=" + putCap + "\n");
+                    out.write("END\n");
+                    out.flush();
+                } else if ("QUIT".equals(cmd)) {
+                    out.write("OK BYE\n");
+                    out.write("END\n");
+                    out.flush();
+                    running = false;
+                } else if ("QUERY".equals(cmd)) {
+                    handleQuery(in, out);
+                } else if ("BATCH".equals(cmd)) {
+                    handleBatch(in, out);
+                } else {
+                    out.write("ERR UNKNOWN_CMD " + sanitizeSingleLine(cmd) + "\n");
+                    out.write("END\n");
+                    out.flush();
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "Daemon client error: " + t.getMessage());
+            } finally {
+                try {
+                    if (client != null) {
+                        client.close();
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        try {
+            server.close();
+        } catch (Throwable ignored) {
+        }
     }
 
     public static void main(String[] args) throws Exception {
         if (args.length == 0) {
-            log("Usage: MtkDirectTool <get/set/ramp/batchGet/getMinMax/setColorGains/setHdrToneMapping/setSoundOutput/getSoundOutput/dump> [args]");
+            log("Usage: MtkDirectTool <get/set/ramp/batchGet/getMinMax/setColorGains/setHdrToneMapping/setSoundOutput/getSoundOutput/led/daemon/dump> [args]");
+            System.exit(1);
             return;
         }
 
         String cmd = args[0];
         String key = args.length >= 2 ? args[1] : null;
-
         try {
+            if ("daemon".equals(cmd)) {
+                int port = args.length >= 2 ? parseIntOr(args[1], DEFAULT_DAEMON_PORT) : DEFAULT_DAEMON_PORT;
+                runDaemon(port);
+                System.exit(0);
+                return;
+            }
+
+            if ("led".equals(cmd)) {
+                if (args.length < 2) {
+                    log("ERROR: led requires <off|ambient|cycle|lighting|solid|raw> ...");
+                    writeResult("ERROR");
+                    return;
+                }
+                int ret = runColorfulLed(args, 1);
+                log("RESULT: LED " + args[1] + " ret=" + ret);
+                writeResult(String.valueOf(ret));
+                System.exit(0);
+                return;
+            }
+
             if ("setSoundOutput".equals(cmd)) {
                 if (args.length < 2) {
                     log("ERROR: setSoundOutput requires deviceId");
                     writeResult("ERROR");
                     return;
                 }
-                setSoundOutput(Integer.parseInt(args[1]));
+                int deviceId = Integer.parseInt(args[1]);
+                try {
+                    setSoundOutput(deviceId);
+                } catch (IllegalArgumentException iae) {
+                    log("ERROR: Unsupported sound output deviceId: " + deviceId);
+                    writeResult("ERROR: Unsupported deviceId " + deviceId);
+                }
+                System.exit(0);
                 return;
             }
 
             if ("getSoundOutput".equals(cmd)) {
-                getSoundOutput();
+                String summary = querySoundOutputSummary();
+                writeResult(summary);
+                System.exit(0);
                 return;
             }
-
-            ClassLoader classLoader = tvClassLoader();
 
             if ("setColorGains".equals(cmd)) {
                 if (args.length < 4) {
@@ -378,21 +1322,17 @@ public class MtkDirectTool {
                     writeResult("ERROR");
                     return;
                 }
-                setColorGains(classLoader, Integer.parseInt(args[1]), Integer.parseInt(args[2]),
-                        Integer.parseInt(args[3]));
+                int red = Integer.parseInt(args[1]);
+                int green = Integer.parseInt(args[2]);
+                int blue = Integer.parseInt(args[3]);
+                int ret = setColorGains(red, green, blue);
+                log("RESULT: SET_COLOR_GAINS r=" + red + " g=" + green + " b=" + blue + ", return: " + ret);
+                writeResult(String.valueOf(ret));
+                System.exit(0);
                 return;
             }
 
-            Class<?> tvNativeClass = classLoader.loadClass("com.mediatek.twoworlds.tv.TVNative");
-            Method getConfigValueNative = tvNativeClass.getDeclaredMethod(
-                    "getConfigValue_native", int.class, String.class);
-            getConfigValueNative.setAccessible(true);
-            Method setConfigValueNative = tvNativeClass.getDeclaredMethod(
-                    "setConfigValue_native", int.class, String.class, int.class, int.class);
-            setConfigValueNative.setAccessible(true);
-            Method getMinMaxNative = tvNativeClass.getDeclaredMethod(
-                    "getMinMaxConfigValue_native", int.class, String.class);
-            getMinMaxNative.setAccessible(true);
+            ensureTvNative();
 
             if ("get".equals(cmd)) {
                 if (key == null) {
@@ -400,7 +1340,7 @@ public class MtkDirectTool {
                     writeResult("ERROR");
                     return;
                 }
-                int val = (Integer) getConfigValueNative.invoke(null, -1, key);
+                int val = getJniValue(key);
                 log("RESULT: GET " + key + " = " + val);
                 writeResult(String.valueOf(val));
 
@@ -410,7 +1350,7 @@ public class MtkDirectTool {
                     writeBatchResult("ERROR\n");
                     return;
                 }
-                batchGet(getConfigValueNative, args, 1);
+                batchGet(args, 1);
 
             } else if ("setHdrToneMapping".equals(cmd)) {
                 if (args.length < 2) {
@@ -420,7 +1360,10 @@ public class MtkDirectTool {
                 }
                 int hdrValue = Integer.parseInt(args[1]);
                 int hdrIsUpdate = args.length >= 3 ? Integer.parseInt(args[2]) : 3;
-                setHdrToneMapping(classLoader, setConfigValueNative, hdrValue, hdrIsUpdate);
+                int[] rets = setHdrToneMapping(hdrValue, hdrIsUpdate);
+                log("RESULT: SET_HDR_TONE_MAPPING value=" + hdrValue + ", configReturn: " + rets[0]
+                        + ", hdrAttrReturn: " + (rets[1] == Integer.MIN_VALUE ? "N/A" : rets[1]));
+                writeResult(String.valueOf(rets[0]));
 
             } else if ("set".equals(cmd)) {
                 if (key == null) {
@@ -430,7 +1373,7 @@ public class MtkDirectTool {
                 }
                 int value = args.length >= 3 ? Integer.parseInt(args[2]) : 0;
                 int isUpdate = args.length >= 4 ? Integer.parseInt(args[3]) : 1;
-                int ret = (Integer) setConfigValueNative.invoke(null, -1, key, value, isUpdate);
+                int ret = setJniValue(key, value, isUpdate);
                 log("RESULT: SET " + key + " to " + value + " (isUpdate=" + isUpdate + "), return: " + ret);
                 writeResult(String.valueOf(ret));
 
@@ -450,40 +1393,11 @@ public class MtkDirectTool {
                 int stepMs = args.length >= 6 ? Integer.parseInt(args[5]) : 0;
                 String doneFile = args.length >= 7 ? args[6] : null;
                 int stepSize = args.length >= 8 ? Math.max(1, Integer.parseInt(args[7])) : 1;
-                if (doneFile != null && doneFile.length() > 0) {
-                    try {
-                        new File(doneFile).delete();
-                    } catch (Exception e) {
-                        // ignore
-                    }
-                }
                 long rampStartMs = System.currentTimeMillis();
-                int applied = from;
-                int v = from;
-                int step = target >= from ? stepSize : -stepSize;
-                while (true) {
-                    setConfigValueNative.invoke(null, -1, key, v, isUpdate);
-                    applied = v;
-                    if (v == target) {
-                        break;
-                    }
-                    int next = v + step;
-                    if ((step > 0 && next > target) || (step < 0 && next < target)) {
-                        next = target;
-                    }
-                    v = next;
-                    if (stepMs > 0) {
-                        Thread.sleep(stepMs);
-                    }
-                }
+                int applied = rampJni(key, from, target, isUpdate, stepMs, doneFile, stepSize);
                 log("RESULT: RAMP " + key + " " + from + " -> " + target + " isUpdate=" + isUpdate
                         + " stepMs=" + stepMs + " elapsed=" + (System.currentTimeMillis() - rampStartMs) + "ms");
                 writeResult(String.valueOf(applied));
-                // 渐变完成信号：App 侧等这个文件出现后才会写 settings，
-                // 避免 settings 观察者提前把画面拉到目标值、把渐变打断。
-                if (doneFile != null && doneFile.length() > 0) {
-                    writeFile(doneFile, "1");
-                }
 
             } else if ("getMinMax".equals(cmd)) {
                 if (key == null) {
@@ -491,8 +1405,8 @@ public class MtkDirectTool {
                     writeResult("ERROR");
                     return;
                 }
-                int minVal = (Integer) getMinMaxNative.invoke(null, 0, key);
-                int maxVal = (Integer) getMinMaxNative.invoke(null, 1, key);
+                int minVal = (Integer) sGetMinMaxNative.invoke(null, 0, key);
+                int maxVal = (Integer) sGetMinMaxNative.invoke(null, 1, key);
                 String result = minVal + "," + maxVal;
                 log("RESULT: RANGE " + key + " = [" + minVal + ", " + maxVal + "]");
                 writeResult(result);
@@ -516,7 +1430,7 @@ public class MtkDirectTool {
                 };
                 for (String k : keys) {
                     try {
-                        int val = (Integer) getConfigValueNative.invoke(null, -1, k);
+                        int val = getJniValue(k);
                         log(k + ": " + val);
                         sb.append(k).append("=").append(val).append("\n");
                     } catch (Exception e) {

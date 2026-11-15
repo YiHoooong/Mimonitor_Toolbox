@@ -77,9 +77,24 @@ from .windows import (
 )
 
 
+def _write_log_line(app_obj, text, ui_visible=True):
+    """输出一行日志到控件（可选）与本地日志文件（开启时始终写入）。"""
+    if ui_visible:
+        app_obj.log_widget.append(text)
+        scroll_bar = app_obj.log_widget.verticalScrollBar()
+        scroll_bar.setValue(scroll_bar.maximum())
+    if adb_runtime._log_file and adb_runtime._log_to_file_enabled:
+        try:
+            adb_runtime._log_file.write(text + "\n")
+            adb_runtime._log_file.flush()
+        except Exception:
+            pass
+
+
 class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
     # Signals for thread-safe UI updates
     log_signal = pyqtSignal(str)
+    detail_log_signal = pyqtSignal(str)
     status_signal = pyqtSignal(str)
     values_signal = pyqtSignal(dict)
     jni_values_signal = pyqtSignal(dict)
@@ -130,6 +145,7 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
 
         # Connect signals
         self.log_signal.connect(self._on_log)
+        self.detail_log_signal.connect(self._on_detail_log)
         self.status_signal.connect(self._on_status)
         self.values_signal.connect(self._apply_polled_values)
         self.jni_values_signal.connect(self._apply_polled_jni_values)
@@ -693,15 +709,22 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
                 dialog.deleteLater()
                 event.ignore()
 
+    def is_verbose_log_enabled(self):
+        toggle = getattr(self, "verbose_log_toggle", None)
+        if toggle is not None:
+            return bool(toggle.isChecked())
+        return bool(load_settings().get("verbose_log", False))
+
     def _on_log(self, text):
-        self.log_widget.append(text)
-        scroll_bar = self.log_widget.verticalScrollBar()
-        scroll_bar.setValue(scroll_bar.maximum())
-        if adb_runtime._log_file and adb_runtime._log_to_file_enabled:
-            try:
-                adb_runtime._log_file.write(text + "\n")
-                adb_runtime._log_file.flush()
-            except Exception: pass
+        _write_log_line(self, text, ui_visible=True)
+
+    def _on_detail_log(self, text):
+        _write_log_line(self, text, ui_visible=self.is_verbose_log_enabled())
+
+    def _toggle_verbose_log(self, state):
+        enabled = state == Qt.CheckState.Checked.value or state == 2
+        update_settings({"verbose_log": enabled})
+        self.log(f"详细操作日志: {'开启' if enabled else '关闭（仅保留关键摘要）'}")
 
     def _report_background_error(self, error):
         self.log_signal.emit(
@@ -860,6 +883,14 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
 
     def _on_status(self, text):
         text = normalize_status_text(text)
+        adb_obj = getattr(self, "adb", None)
+        if (
+            adb_obj is not None
+            and hasattr(adb_obj, "ip")
+            and is_connected_status_text(text)
+            and not str(getattr(adb_obj, "ip", "") or "").strip()
+        ):
+            return
         self.status_label.setText(text)
         was_connected = getattr(self, "adb_connected", False)
         is_scan_status = text.startswith("扫描")
@@ -950,6 +981,9 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
 
     def log(self, m):
         self.log_signal.emit(f"[{time.strftime('%H:%M:%S')}] {m}")
+
+    def log_detail(self, m):
+        self.detail_log_signal.emit(f"[{time.strftime('%H:%M:%S')}] {m}")
 
 
     # ===== Pages Creators =====

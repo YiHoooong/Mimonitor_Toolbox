@@ -1881,5 +1881,367 @@ class HdmiGameModeReadbackTests(unittest.TestCase):
         self.assertEqual(core.parse_hdmi_edid_flags(None, 3), (0, 1))
 
 
+class DaemonSnapshotTests(unittest.TestCase):
+    """混合加速 (Daemon) 下 _read_picture_values / _refresh_page_data / _poll_source_state 单次快照与回退。"""
+
+    def _host(self, adb_obj):
+        class Host(device_features.DeviceFeaturesMixin):
+            def __init__(self):
+                self.initialize_device_features()
+                self.adb = adb_obj
+                self.adb_connected = True
+                self.logs = []
+                self.values_signal = FakeSignal()
+                self.jni_values_signal = FakeSignal()
+                self.page_refresh_finished = FakeSignal()
+                self._source_poll_armed = True
+                self._source_poll_checking = False
+                self._picture_mode_switch_seq = 0
+                self._cleanup_done = False
+                self._windows_session_ending = False
+
+            def log(self, message):
+                self.logs.append(message)
+
+            def _mark_adb_busy(self, _seconds=0.0):
+                pass
+
+            def _adb_channel_busy(self):
+                return False
+
+            def _show_loading_overlay(self, _page):
+                pass
+
+            def _source_page_is_active(self):
+                return True
+
+        return Host()
+
+    def test_read_picture_values_uses_daemon_snapshot_single_roundtrip(self):
+        class DaemonAdb:
+            connection_mode = "daemon"
+
+            def __init__(self):
+                self.queries = 0
+                self.shell_calls = []
+
+            def is_daemon_mode(self):
+                return True
+
+            def transaction(self):
+                return nullcontext()
+
+            def daemon_query(self, settings_keys=(), jni_keys=(), flags=(), check=False):
+                self.queries += 1
+                return {
+                    "settings": {
+                        "picture_mode": "14",
+                        "picture_brightness": "70",
+                        "picture_contrast": "50",
+                        "atmosphere_light_switcher_pm2": "1",
+                        "mitv.tvplayer.hdmi.last.source": "23",
+                        device_features.SOUND_OUTPUT_SETTINGS_KEY: "8",
+                    },
+                    "jni": {
+                        "g_disp__disp_back_light": 60,
+                        "g_video__clr_temp": 1,
+                        "g_video__vid_local_dimming": 2,
+                        "g_video__vid_hdr_tone_mapping_mode": 0,
+                        "g_video__light_sensor_switch": 0,
+                        "g_video__freesync_switch": 3,
+                        "g_fusion_picture__hdmi_edid_version": 5,
+                    },
+                    "flags": {"volume": "38", "muted": "0"},
+                    "elapsed_ms": 11,
+                }
+
+            def shell(self, cmd, check=False):
+                self.shell_calls.append(cmd)
+                raise AssertionError("Daemon 快照命中时不应走 adb shell")
+
+            def jni_batch_get_or_single(self, *_args, **_kwargs):
+                raise AssertionError("Daemon 快照命中时不应额外查 JNI")
+
+            def get(self, *_args, **_kwargs):
+                raise AssertionError("Daemon 快照命中时不应额外 get")
+
+            def media_volume(self, **_kwargs):
+                raise AssertionError("Daemon 快照命中时不应额外查音量")
+
+            def media_muted(self, **_kwargs):
+                raise AssertionError("Daemon 快照命中时不应额外查静音")
+
+        adb_obj = DaemonAdb()
+        host = self._host(adb_obj)
+        with mock.patch.object(device_features, "load_settings", return_value={"connection_mode": "daemon"}):
+            vals = host._read_picture_values()
+
+        self.assertEqual(adb_obj.queries, 1)
+        self.assertEqual(vals["picture_mode"], 14)
+        self.assertEqual(vals["picture_brightness"], 70)
+        self.assertEqual(vals["picture_local_dimming"], 2)
+        self.assertEqual(vals["mode_320"], 1)
+        self.assertEqual(vals["freesync"], 1)
+        self.assertEqual(vals[device_features.SOUND_OUTPUT_SETTINGS_KEY], 8)
+        self.assertEqual(vals["volume_music_speaker"], 38)
+        self.assertEqual(vals["media_muted"], 0)
+        self.assertEqual(vals["atmosphere_light_switcher_pm2"], 1)
+
+    def test_read_picture_values_falls_back_to_adb_when_daemon_returns_none(self):
+        class FallbackAdb:
+            connection_mode = "daemon"
+
+            def __init__(self):
+                self.shell_called = 0
+
+            def is_daemon_mode(self):
+                return True
+
+            def transaction(self):
+                return nullcontext()
+
+            def daemon_query(self, **_kwargs):
+                return None
+
+            def shell(self, _cmd, check=False):
+                self.shell_called += 1
+                return "picture_mode=14\npicture_brightness=55\n"
+
+            def get(self, key, check=False):
+                if key == "mitv.tvplayer.hdmi.last.source":
+                    return "29"
+                if key == device_features.SOUND_OUTPUT_SETTINGS_KEY:
+                    return "0"
+                return ""
+
+            def jni_batch_get_or_single(self, keys, check=False):
+                out = {k: 0 for k in keys}
+                if "g_disp__disp_back_light" in out:
+                    out["g_disp__disp_back_light"] = 45
+                if "g_video__vid_local_dimming" in out:
+                    out["g_video__vid_local_dimming"] = 3
+                if "g_video__dp_adaptive_sync" in out:
+                    out["g_video__dp_adaptive_sync"] = 1
+                if "g_fusion_picture__dp_edid_version" in out:
+                    out["g_fusion_picture__dp_edid_version"] = 3
+                return out
+
+            def media_volume(self, **_kwargs):
+                return 25
+
+            def media_muted(self, **_kwargs):
+                return True
+
+        adb_obj = FallbackAdb()
+        host = self._host(adb_obj)
+        with mock.patch.object(device_features, "load_settings", return_value={"connection_mode": "daemon"}):
+            vals = host._read_picture_values()
+
+        self.assertEqual(adb_obj.shell_called, 1)
+        self.assertEqual(vals["picture_local_dimming"], 3)
+        self.assertEqual(vals["mode_320"], 1)
+        self.assertEqual(vals["freesync"], 1)
+        self.assertEqual(vals["volume_music_speaker"], 25)
+        self.assertEqual(vals["media_muted"], 1)
+
+    def test_refresh_page_data_and_poll_source_state_use_daemon_query(self):
+        class DaemonAdb:
+            connection_mode = "daemon"
+
+            def __init__(self):
+                self.calls = []
+
+            def is_daemon_mode(self):
+                return True
+
+            def transaction(self):
+                return nullcontext()
+
+            def daemon_query(self, settings_keys=(), jni_keys=(), flags=(), check=False):
+                self.calls.append((tuple(settings_keys), tuple(jni_keys), tuple(flags)))
+                return {
+                    "settings": {
+                        "mitv.tvplayer.hdmi.last.source": "23",
+                        device_features.SOUND_OUTPUT_SETTINGS_KEY: "8",
+                        "picture_mode": "14",
+                    },
+                    "jni": {
+                        "g_disp__disp_back_light": 52,
+                        "g_video__freesync_switch": 3,
+                        "g_fusion_picture__hdmi_edid_version": 5,
+                    },
+                    "flags": {"volume": "40", "muted": "1"},
+                    "elapsed_ms": 8,
+                }
+
+            def shell(self, *_args, **_kwargs):
+                raise AssertionError("Daemon 刷新命中时不该回退 adb shell")
+
+            def get(self, *_args, **_kwargs):
+                raise AssertionError("Daemon 轮询命中时不该回退 adb get")
+
+            def media_volume(self, **_kwargs):
+                raise AssertionError("Daemon 命中时不该调 media_volume")
+
+            def media_muted(self, **_kwargs):
+                raise AssertionError("Daemon 命中时不该调 media_muted")
+
+        adb_obj = DaemonAdb()
+        host = self._host(adb_obj)
+        with mock.patch.object(device_features, "load_settings", return_value={"connection_mode": "daemon"}), \
+                mock.patch.object(device_features, "async_run", side_effect=lambda fn: fn()):
+            host._refresh_page_data("picturePage")
+            host._refresh_page_data("sourcePage")
+            host._poll_source_state()
+
+        self.assertEqual(len(adb_obj.calls), 3)
+        self.assertGreaterEqual(len(host.values_signal.events), 3)
+        self.assertEqual(host.jni_values_signal.events[0][0]["g_disp__disp_back_light"], 52)
+        self.assertEqual(host.values_signal.events[1][0]["volume_music_speaker"], 40)
+        self.assertEqual(host.values_signal.events[1][0]["media_muted"], 1)
+        self.assertEqual(host.values_signal.events[2][0]["mitv.tvplayer.hdmi.last.source"], 23)
+
+    def test_refresh_page_data_uses_chinese_detail_logs_and_releases_busy_lock(self):
+        from contextlib import nullcontext
+        from mimonitor_toolbox import device_features
+
+        class DaemonAdb:
+            def is_daemon_mode(self):
+                return True
+
+            def transaction(self):
+                return nullcontext()
+
+            def daemon_query(self, settings_keys=(), jni_keys=(), flags=(), check=False):
+                return {
+                    "settings": {"picture_mode": "14"},
+                    "jni": {k: 0 for k in jni_keys},
+                    "flags": {},
+                    "elapsed_ms": 5,
+                }
+
+            def shell(self, *_args, **_kwargs):
+                return ""
+
+        with mock.patch.object(device_features, "load_settings", return_value={"connection_mode": "daemon"}), \
+                mock.patch.object(device_features, "async_run", side_effect=lambda fn: fn()):
+            host = self._host(DaemonAdb())
+            detail_logs = []
+            host.log_detail = detail_logs.append
+            host._hide_loading_overlay = lambda _name: None
+            host._mark_adb_busy = lambda secs=2.0: setattr(
+                host,
+                "_adb_busy_until",
+                max(host._adb_busy_until, time.monotonic() + secs),
+            )
+            host._refresh_page_data("picturePage")
+
+        self.assertGreater(host._adb_busy_until, 0.0)
+        host._finish_page_refresh("picturePage", True)
+        self.assertEqual(host._adb_busy_until, 0.0)
+        self.assertEqual(host.logs, [])
+        self.assertEqual(
+            detail_logs,
+            ["正在刷新「画面设置」数据...", "「画面设置」数据刷新完成"],
+        )
+
+    def test_disconnect_adb_resets_daemon_state_and_skips_stale_emit_after_reconnect(self):
+        from contextlib import nullcontext
+        from mimonitor_toolbox import adb as adb_runtime, device_features
+
+        adb_obj = adb_runtime.Adb("192.168.1.9", connection_mode="daemon")
+        adb_obj._daemon_ip = "192.168.1.9"
+        adb_obj._daemon_forward_port = 50001
+        adb_obj._daemon_ready = True
+        adb_obj._daemon_jar_healed_ip = "192.168.1.9"
+
+        host = self._host(adb_obj)
+        host.status_signal = FakeSignal()
+        host._connection_intent_generation = 0
+        host._scan_running = False
+        host._cancel_resume_reconnect = lambda: None
+        host._stop_source_polling = lambda: None
+        host._invalidate_connection_intent = lambda: setattr(
+            host, "_connection_intent_generation", host._connection_intent_generation + 1
+        ) or host._connection_intent_generation
+
+        queued = []
+        with mock.patch.object(device_features, "async_run", side_effect=queued.append), \
+                mock.patch.object(device_features, "adb_run", return_value="") as adb_run_mock:
+            host.disconnect_adb()
+            self.assertEqual(adb_obj.ip, "")
+            self.assertIsNone(adb_obj._daemon_forward_port)
+            self.assertFalse(adb_obj._daemon_ready)
+            # 主线程点击断开即刻切回未连接状态，不等待后台 adb_run
+            self.assertEqual(host.status_signal.events, [("未连接",)])
+            # 断开期间立即发起了新连接意图，延迟执行的旧断开回调不应触发 adb disconnect 或重复覆盖状态
+            host._invalidate_connection_intent()
+            queued[0]()
+            adb_run_mock.assert_not_called()
+            self.assertEqual(host.status_signal.events, [("未连接",)])
+
+    def test_disconnect_adb_recovers_when_ip_empty_or_connect_in_progress(self):
+        from mimonitor_toolbox import adb as adb_runtime, device_features
+
+        adb_obj = adb_runtime.Adb("", connection_mode="daemon")
+        host = self._host(adb_obj)
+        host.status_signal = FakeSignal()
+        host.adb_connected = True
+        host._connection_in_progress = True
+        host._connection_intent_generation = 0
+        host._scan_running = False
+        host._cancel_resume_reconnect = lambda: None
+        host._stop_source_polling = lambda: None
+        host._invalidate_connection_intent = lambda: setattr(
+            host, "_connection_intent_generation", host._connection_intent_generation + 1
+        ) or host._connection_intent_generation
+
+        with mock.patch.object(device_features, "async_run") as async_mock:
+            host.disconnect_adb()
+
+        async_mock.assert_not_called()
+        self.assertFalse(host._connection_in_progress)
+        self.assertEqual(host.status_signal.events, [("未连接",)])
+
+    def test_connect_skips_connected_emit_when_disconnected_during_daemon_warm(self):
+        from mimonitor_toolbox import adb as adb_runtime, device_features
+
+        adb_obj = adb_runtime.Adb("192.168.1.9", connection_mode="daemon")
+        host = self._host(adb_obj)
+        host.ip_entry = mock.Mock()
+        host.ip_entry.text.return_value = "192.168.1.9"
+        host.status_signal = FakeSignal()
+        host.message_signal = FakeSignal()
+        host.adb_connected = False
+        host._connection_in_progress = False
+        host._connection_intent_generation = 0
+        host._scan_running = False
+        host._cancel_resume_reconnect = lambda: None
+        host._cancel_scan = lambda reason=None: False
+        host._stop_source_polling = lambda: None
+        host._invalidate_connection_intent = lambda: setattr(
+            host, "_connection_intent_generation", host._connection_intent_generation + 1
+        ) or host._connection_intent_generation
+
+        def cancel_during_warm(*args, **kwargs):
+            host.disconnect_adb()
+            return False
+
+        with mock.patch.object(device_features, "async_run", side_effect=lambda fn: fn()), \
+                mock.patch.object(device_features, "adb_run", return_value=""), \
+                mock.patch.object(device_features, "ensure_adb_server", return_value=True), \
+                mock.patch.object(device_features, "update_settings"), \
+                mock.patch.object(device_features, "unignore_scan_ip"), \
+                mock.patch.object(adb_obj, "connect", return_value=True), \
+                mock.patch.object(adb_obj, "check_and_heal_jar", return_value=True), \
+                mock.patch.object(adb_obj, "get_model", return_value="MiMonitor"), \
+                mock.patch.object(device_features, "_warm_daemon_for_adb", side_effect=cancel_during_warm):
+            host.connect()
+
+        self.assertEqual(host.status_signal.events[-1], ("未连接",))
+        self.assertNotIn(("已连接: MiMonitor",), host.status_signal.events)
+        self.assertFalse(host._connection_in_progress)
+
+
 if __name__ == "__main__":
     unittest.main()

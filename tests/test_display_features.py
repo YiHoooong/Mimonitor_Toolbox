@@ -2458,6 +2458,89 @@ class FullPresetIntegrationTests(unittest.TestCase):
         Host()._reconcile_crosshair_mode_state()
         self.assertEqual(writes, [])
 
+    def test_preset_apply_releases_busy_lock_coalesces_verify_timer_and_routes_skipped_to_detail_log(self):
+        from contextlib import nullcontext
+        from mimonitor_toolbox import display_features
+        from mimonitor_toolbox.presets import ApplyResult
+
+        logs = []
+        detail_logs = []
+
+        class FakeTimer:
+            def __init__(self):
+                self.starts = []
+
+            def start(self, ms):
+                self.starts.append(ms)
+
+        class FakeAdb:
+            def transaction(self):
+                return nullcontext()
+
+        fake_result = ApplyResult(
+            applied=[("亮度", "picture_brightness", "70")],
+            skipped=[("色增益", "色温不是「自定义」，色增益不生效")],
+            failed=[("对比度", "写入超时")],
+        )
+
+        class Host(display_features.DisplayFeaturesMixin):
+            adb_connected = True
+            adb = FakeAdb()
+            current_vals = {}
+            _page_loaded = {"picturePage", "gamePage", "sourcePage", "lightPage"}
+            _adb_busy_until = 0.0
+            _display_change_refresh_suppress_until = 0.0
+            _local_dimming_memory_suppress_until = 0.0
+            _cleanup_done = False
+
+            def __init__(self):
+                self._preset_verify_timer = FakeTimer()
+
+            def check_connection(self):
+                return True
+
+            def _read_picture_values(self):
+                return {"picture_mode": 14}
+
+            def _show_preset_switching_overlay(self):
+                pass
+
+            def _hide_preset_switching_overlay(self):
+                pass
+
+            def _refresh_preset_views(self):
+                pass
+
+            def log(self, message):
+                logs.append(message)
+
+            def log_detail(self, message):
+                detail_logs.append(message)
+
+            def _run_adb_action(self, label, operation, on_success=None, on_failure=None):
+                operation()
+                if on_success:
+                    on_success()
+
+        host = Host()
+        with mock.patch.object(display_features, "apply_preset", return_value=fake_result):
+            host._apply_picture_values({"picture_brightness": 70}, "应用预设「A」")
+            host._apply_picture_values({"picture_brightness": 75}, "应用预设「B」")
+
+        self.assertEqual(host._adb_busy_until, 0.0)
+        self.assertFalse(host._adb_channel_busy())
+        self.assertEqual(host._preset_verify_timer.starts, [1800, 1800])
+        self.assertTrue(any("应用预设「A」：成功 1 项，跳过 1 项，失败 1 项" in m for m in logs))
+        self.assertTrue(any("失败 对比度：写入超时" in m for m in logs))
+        self.assertFalse(any("跳过 色增益" in m for m in logs))
+        self.assertEqual(
+            detail_logs,
+            [
+                "  · 跳过 色增益（色温不是「自定义」，色增益不生效）",
+                "  · 跳过 色增益（色温不是「自定义」，色增益不生效）",
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

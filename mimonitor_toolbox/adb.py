@@ -1,7 +1,9 @@
 """ADB 子进程、设备协议和扫描识别。"""
 
+import contextlib
 import logging
 import os
+import shlex
 import socket
 import subprocess
 import sys
@@ -9,13 +11,17 @@ import threading
 import time
 
 from .core import (
+    CONNECTION_MODE_ADB,
+    CONNECTION_MODE_DAEMON,
     MTK_BATCH_RESULT_FILE,
+    MTK_DAEMON_PORT,
     bundled_resource_path,
     get_app_data_dir,
     get_colorful_led_tool_path,
     get_mtk_direct_tool_path,
     is_frozen_build,
     load_settings,
+    normalize_connection_mode,
 )
 from .network_scan import (
     WindowsAdapterError,
@@ -270,7 +276,13 @@ def _adb_log(msg):
 
 def adb_run(args, timeout=10, check=False):
     proc = None
-    with _adb_command_lock:
+    # disconnect 需要高优先级抢占，不能卡在后台挂起的 shell/query 命令锁后面
+    lock_ctx = (
+        contextlib.nullcontext()
+        if args and args[0] == "disconnect"
+        else _adb_command_lock
+    )
+    with lock_ctx:
         try:
             cmd = adb_command(args)
             with _adb_process_lock:
@@ -388,17 +400,562 @@ def parse_service_call_int(output):
 
 
 class Adb:
-    def __init__(self, ip=""):
+    def __init__(self, ip="", connection_mode=CONNECTION_MODE_ADB):
         self.ip = ip
+        self.connection_mode = normalize_connection_mode(connection_mode)
         self._media_volume_binder_verified = None
+        self._daemon_ready = False
+        self._daemon_ip = ""
+        self._daemon_forward_port = None
+        self._daemon_put_supported = None
+        self._daemon_vol_supported = None
+        self._daemon_jar_healed_ip = ""
+        self._daemon_retry_after = 0.0
+        self._daemon_needs_restart = False
+        self._batch_depth = 0
+        self._batch_ops = []
+        self._batch_read_cache = {}
+        self._batch_jni_cache = {}
+
     @property
     def serial(self):
         return format_adb_serial(self.ip)
+
     def transaction(self):
         return _adb_command_lock
+
+    def is_daemon_mode(self):
+        return self.connection_mode == CONNECTION_MODE_DAEMON
+
+    def _reset_daemon_state(self):
+        self._daemon_ready = False
+        self._daemon_ip = ""
+        self._daemon_forward_port = None
+        self._daemon_put_supported = None
+        self._daemon_vol_supported = None
+        self._daemon_jar_healed_ip = ""
+        self._daemon_retry_after = 0.0
+        self._daemon_needs_restart = False
+
+    def set_connection_mode(self, mode):
+        normalized = normalize_connection_mode(mode)
+        self._daemon_retry_after = 0.0
+        if normalized != self.connection_mode:
+            self.connection_mode = normalized
+            if normalized != CONNECTION_MODE_DAEMON:
+                self._batch_depth = 0
+                self._batch_ops.clear()
+                self._batch_read_cache.clear()
+                self._batch_jni_cache.clear()
+        return normalized
+
+    def stop_daemon(self):
+        port = self._daemon_forward_port
+        self._reset_daemon_state()
+        if not port or not self.ip:
+            return
+        with _adb_process_lock:
+            if _adb_spawn_blocked:
+                return
+        self._raw_socket_exchange(port, "QUIT\n", timeout=0.8)
+
     def shell(self, cmd, check=False):
         out = adb_run(["-s", self.serial, "shell", cmd], check=check)
         return out
+
+    @staticmethod
+    def _pick_free_local_port():
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+
+    @staticmethod
+    def _raw_socket_exchange(port, payload, timeout=4.0):
+        if not port:
+            return None
+        sock = None
+        try:
+            sock = socket.create_connection(("127.0.0.1", int(port)), timeout=min(timeout, 0.4))
+            sock.settimeout(timeout)
+            text_payload = payload if payload.endswith("\n") else payload + "\n"
+            sock.sendall(text_payload.encode("utf-8"))
+            lines = []
+            with sock.makefile("r", encoding="utf-8", errors="replace") as reader:
+                for raw_line in reader:
+                    line = raw_line.rstrip("\r\n")
+                    if line == "END":
+                        break
+                    lines.append(line)
+            return lines if lines else None
+        except OSError:
+            return None
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+    def _setup_adb_forward(self):
+        old_port = self._daemon_forward_port
+        old_ip = self._daemon_ip
+        self._daemon_forward_port = None
+        if old_port and old_ip == self.ip:
+            adb_run(
+                ["-s", self.serial, "forward", "--remove", f"tcp:{old_port}"],
+                timeout=2,
+                check=False,
+            )
+        for _ in range(2):
+            local_port = self._pick_free_local_port()
+            out = adb_run(
+                ["-s", self.serial, "forward", f"tcp:{local_port}", f"tcp:{MTK_DAEMON_PORT}"],
+                timeout=4,
+                check=False,
+            )
+            lower = str(out or "").lower()
+            if (
+                adb_text_has_disconnected_marker(out)
+                or "error:" in lower
+                or "cannot bind" in lower
+                or "failed" in lower
+            ):
+                continue
+            self._daemon_forward_port = local_port
+            self._daemon_ip = self.ip
+            return local_port
+        return None
+
+    def _daemon_socket_request(self, payload, timeout=4.0):
+        if not self.ip or self._daemon_ip != self.ip or not self._daemon_forward_port:
+            return None
+        with _adb_process_lock:
+            if _adb_spawn_blocked:
+                return None
+        lines = self._raw_socket_exchange(self._daemon_forward_port, payload, timeout=timeout)
+        if lines is None:
+            self._daemon_ready = False
+        return lines
+
+    def _parse_daemon_pong(self, pong_line):
+        for token in str(pong_line or "").split():
+            if token == "put=0":
+                self._daemon_put_supported = False
+
+    def ensure_daemon(self, check=False):
+        if not self.is_daemon_mode() or not self.ip:
+            return False
+        with _adb_process_lock:
+            if _adb_spawn_blocked:
+                if check:
+                    raise RuntimeError("应用正在退出，Daemon 启动已取消")
+                return False
+
+        with self.transaction():
+            if self._daemon_ip and self._daemon_ip != self.ip:
+                self._reset_daemon_state()
+
+            if (
+                self._daemon_ready
+                and self._daemon_forward_port
+                and self._daemon_jar_healed_ip == self.ip
+                and not self._daemon_needs_restart
+            ):
+                pong = self._daemon_socket_request("PING\n", timeout=1.2)
+                if pong and pong[0].startswith("OK MtkDirectTool v2"):
+                    self._parse_daemon_pong(pong[0])
+                    self._daemon_retry_after = 0.0
+                    return True
+                self._daemon_ready = False
+
+            if time.monotonic() < getattr(self, "_daemon_retry_after", 0.0):
+                return False
+
+            if self._daemon_jar_healed_ip != self.ip:
+                self.check_and_heal_jar()
+
+            fresh_forward = False
+            if not self._daemon_forward_port or self._daemon_ip != self.ip:
+                if not self._setup_adb_forward():
+                    self._daemon_retry_after = time.monotonic() + 5.0
+                    _adb_log("daemon: adb forward 失败，回退 ADB 模式")
+                    return False
+                fresh_forward = True
+
+            pong = self._daemon_socket_request("PING\n", timeout=1.2)
+            # 若旧的 forward 映射已被 disconnect / 重连 / ADB 重启销毁，重建 forward 后再 PING
+            if not pong and not fresh_forward:
+                if not self._setup_adb_forward():
+                    self._daemon_retry_after = time.monotonic() + 5.0
+                    _adb_log("daemon: 重建 adb forward 失败，回退 ADB 模式")
+                    return False
+                pong = self._daemon_socket_request("PING\n", timeout=1.2)
+
+            if pong:
+                if not self._daemon_needs_restart and pong[0].startswith("OK MtkDirectTool v2"):
+                    self._parse_daemon_pong(pong[0])
+                    self._daemon_ready = True
+                    self._daemon_retry_after = 0.0
+                    _adb_log(f"daemon: 已复用常驻服务 ({pong[0]})")
+                    return True
+                self._daemon_socket_request("QUIT\n", timeout=0.8)
+                self._daemon_needs_restart = False
+            else:
+                self._daemon_needs_restart = False
+
+            jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
+            launch_cmd = build_tvservice_app_process_command(
+                jar, ["MtkDirectTool", "daemon", MTK_DAEMON_PORT]
+            )
+            launch_out = self.shell(launch_cmd, check=check)
+            if not self.ip or adb_text_has_disconnected_marker(launch_out):
+                self._daemon_retry_after = time.monotonic() + 5.0
+                _adb_log("daemon: 设备已断连，取消启动")
+                return False
+
+            for delay in (0.15, 0.2, 0.25, 0.35, 0.5, 0.5, 0.5):
+                if not self.ip or not self.is_daemon_mode():
+                    return False
+                time.sleep(delay)
+                if not self.ip or not self.is_daemon_mode():
+                    return False
+                with _adb_process_lock:
+                    if _adb_spawn_blocked:
+                        return False
+                pong = self._daemon_socket_request("PING\n", timeout=1.2)
+                if pong and pong[0].startswith("OK MtkDirectTool v2"):
+                    self._parse_daemon_pong(pong[0])
+                    self._daemon_ready = True
+                    self._daemon_retry_after = 0.0
+                    _adb_log(f"daemon: 启动就绪 ({pong[0]})")
+                    return True
+
+            self._daemon_retry_after = time.monotonic() + 5.0
+            _adb_log("daemon: 启动握手超时，回退标准 ADB")
+            return False
+
+    def daemon_query(self, settings_keys=(), jni_keys=(), flags=(), check=False):
+        if not self.is_daemon_mode() or not self.ip:
+            return None
+        safe_settings = [str(k).strip() for k in settings_keys if str(k).strip()]
+        safe_jni = [
+            str(k).strip()
+            for k in jni_keys
+            if str(k).strip() and all(ch.isalnum() or ch == "_" for ch in str(k).strip())
+        ]
+        safe_flags = [str(f).strip() for f in flags if str(f).strip()]
+        if not safe_settings and not safe_jni and not safe_flags:
+            return {"settings": {}, "jni": {}, "flags": {}, "elapsed_ms": 0}
+
+        lines_req = ["QUERY"]
+        if safe_settings:
+            lines_req.append("SETTINGS " + " ".join(safe_settings))
+        if safe_jni:
+            lines_req.append("JNI " + " ".join(safe_jni))
+        if safe_flags:
+            lines_req.append("FLAGS " + " ".join(safe_flags))
+        lines_req.append("END")
+        payload = "\n".join(lines_req) + "\n"
+
+        with self.transaction():
+            if not self.ensure_daemon(check=check):
+                return None
+            resp = self._daemon_socket_request(payload, timeout=5.0)
+            if not resp:
+                if not self.ensure_daemon(check=check):
+                    return None
+                resp = self._daemon_socket_request(payload, timeout=5.0)
+        if not resp or resp[0] != "OK":
+            return None
+
+        result = {"settings": {}, "jni": {}, "flags": {}, "elapsed_ms": None}
+        for line in resp[1:]:
+            if line.startswith("S "):
+                body = line[2:]
+                if "=" in body:
+                    k, v = body.split("=", 1)
+                    if not v.startswith("__ERR__:"):
+                        result["settings"][k] = v
+            elif line.startswith("J "):
+                body = line[2:]
+                if "=" in body:
+                    k, v = body.split("=", 1)
+                    if not v.startswith("__ERR__:"):
+                        try:
+                            result["jni"][k] = int(v)
+                        except ValueError:
+                            pass
+            elif line.startswith("F "):
+                body = line[2:]
+                if "=" in body:
+                    k, v = body.split("=", 1)
+                    if not v.startswith("__ERR__:"):
+                        result["flags"][k] = v
+            elif line.startswith("ELAPSED "):
+                try:
+                    result["elapsed_ms"] = int(line.split(" ", 1)[1].strip())
+                except ValueError:
+                    pass
+        _adb_log(
+            f"daemon_query s={len(result['settings'])}/{len(safe_settings)} "
+            f"j={len(result['jni'])}/{len(safe_jni)} elapsed={result['elapsed_ms']}ms"
+        )
+        return result
+
+    @staticmethod
+    def _format_batch_line(op):
+        kind = op[0]
+        if kind == "PUT":
+            return f"PUT {op[1]} {op[2]}"
+        if kind == "JNI_SET":
+            return f"JNI_SET {op[1]} {int(op[2])} {int(op[3])}"
+        if kind == "JNI_RAMP":
+            return (
+                f"JNI_RAMP {op[1]} {int(op[2])} {int(op[3])} "
+                f"{int(op[4])} {int(op[5])} {int(op[6])}"
+            )
+        if kind == "COLOR_GAINS":
+            return f"COLOR_GAINS {int(op[1])} {int(op[2])} {int(op[3])}"
+        if kind == "HDR_TM":
+            return f"HDR_TM {int(op[1])} {int(op[2])}"
+        if kind == "SOUND_OUT":
+            return f"SOUND_OUT {int(op[1])}"
+        if kind == "LED":
+            args_str = " ".join(str(x) for x in op[2:])
+            return f"LED {op[1]} {args_str}".strip()
+        if kind == "VOL_SET":
+            return f"VOL_SET {int(op[1])} {int(op[2])} {int(op[3])}"
+        if kind == "VOL_MUTE":
+            return f"VOL_MUTE {int(op[1])} {int(op[2])}"
+        if kind == "KEY":
+            return f"KEY {op[1]}"
+        if kind == "SLEEP":
+            return f"SLEEP {int(op[1])}"
+        if kind == "REFRESH_PQ":
+            return "REFRESH_PQ"
+        raise ValueError(f"Unsupported batch op: {op!r}")
+
+    def daemon_batch(self, ops, check=False):
+        if not ops:
+            return True, None, []
+        if not self.is_daemon_mode() or not self.ip:
+            return False, None, []
+        lines = ["BATCH"] + [self._format_batch_line(op) for op in ops] + ["END"]
+        payload = "\n".join(lines) + "\n"
+
+        with self.transaction():
+            if not self.ensure_daemon(check=check):
+                return False, None, []
+            resp = self._daemon_socket_request(payload, timeout=8.0)
+            if not resp:
+                if not self.ensure_daemon(check=check):
+                    return False, None, []
+                resp = self._daemon_socket_request(payload, timeout=8.0)
+        if not resp:
+            return False, None, []
+
+        head = resp[0]
+        steps = []
+        for line in resp[1:]:
+            if line.startswith("STEP "):
+                parts = line.split(" ", 3)
+                if len(parts) >= 4:
+                    try:
+                        steps.append((int(parts[1]), parts[2], parts[3]))
+                    except ValueError:
+                        pass
+        if head == "OK":
+            _adb_log(f"daemon_batch ops={len(ops)} => OK")
+            return True, None, steps
+        if head.startswith("ERR_AT "):
+            rest = head[7:].split(" ", 1)
+            try:
+                err_idx = int(rest[0])
+            except (TypeError, ValueError):
+                err_idx = 0
+            err_msg = rest[1] if len(rest) > 1 else ""
+            _adb_log(f"daemon_batch ops={len(ops)} => ERR_AT {err_idx}: {err_msg}")
+            return False, err_idx, steps
+        return False, None, steps
+
+    @contextlib.contextmanager
+    def batch_writes(self, prefetch_settings=(), prefetch_jni=()):
+        if not self.is_daemon_mode():
+            yield
+            return
+        outermost = self._batch_depth == 0
+        self._batch_depth += 1
+        try:
+            if outermost and (prefetch_settings or prefetch_jni):
+                snapshot = self.daemon_query(
+                    settings_keys=prefetch_settings,
+                    jni_keys=prefetch_jni,
+                    check=False,
+                )
+                if snapshot:
+                    self._batch_read_cache.update(snapshot.get("settings") or {})
+                    self._batch_jni_cache.update(snapshot.get("jni") or {})
+            yield
+        except Exception:
+            if outermost:
+                self._batch_ops.clear()
+                self._batch_read_cache.clear()
+                self._batch_jni_cache.clear()
+            raise
+        else:
+            if outermost:
+                self.flush_batch(check=False)
+                self._batch_read_cache.clear()
+                self._batch_jni_cache.clear()
+        finally:
+            self._batch_depth = max(0, self._batch_depth - 1)
+
+    def batch_sleep(self, ms):
+        delay_ms = max(0, int(ms))
+        if delay_ms <= 0:
+            return
+        if self.is_daemon_mode() and self._batch_depth > 0:
+            self._batch_ops.append(("SLEEP", delay_ms))
+        else:
+            time.sleep(delay_ms / 1000.0)
+
+    @staticmethod
+    def _coalesce_batch_ops(ops):
+        last_refresh_idx = -1
+        for i, op in enumerate(ops):
+            if op[0] == "REFRESH_PQ":
+                last_refresh_idx = i
+        if last_refresh_idx < 0:
+            return list(ops)
+        return [
+            op for i, op in enumerate(ops)
+            if op[0] != "REFRESH_PQ" or i == last_refresh_idx
+        ]
+
+    def _exec_op_via_adb(self, op, check=False):
+        kind = op[0]
+        if kind == "PUT":
+            return self._adb_put(op[1], op[2], check=check)
+        if kind == "JNI_SET":
+            return self._adb_jni_set(op[1], op[2], upd=op[3], check=check)
+        if kind == "COLOR_GAINS":
+            return self._adb_jni_set_color_gains(op[1], op[2], op[3], check=check)
+        if kind == "HDR_TM":
+            return self._adb_hdr_tone_mapping(op[1], upd=op[2], check=check)
+        if kind == "SOUND_OUT":
+            return self._adb_set_sound_output(op[1], check=check)
+        if kind == "LED":
+            return self._adb_colorful_led(op[1], *op[2:], check=check)
+        if kind == "VOL_SET":
+            return self._adb_set_media_volume(
+                op[1], unmute_first=bool(op[2]), show_ui=bool(op[3]), check=check
+            )
+        if kind == "VOL_MUTE":
+            return self._adb_set_media_muted(bool(op[1]), show_ui=bool(op[2]), check=check)
+        if kind == "KEY":
+            return self._adb_key(op[1], check=check)
+        if kind == "SLEEP":
+            time.sleep(max(0, int(op[1])) / 1000.0)
+            return ""
+        if kind == "REFRESH_PQ":
+            return self._adb_refresh_pq(check=check)
+        return ""
+
+    def _exec_put_run_via_adb(self, put_ops, check=False):
+        if len(put_ops) == 1:
+            _, k, v = put_ops[0]
+            self._adb_put(k, v, check=check)
+            return
+        _adb_log(f"settings put batch ({len(put_ops)} keys)")
+        cmd = " && ".join(
+            f"settings put global {shlex.quote(str(op[1]))} {shlex.quote(str(op[2]))}"
+            for op in put_ops
+        )
+        self.shell(cmd, check=check)
+
+    def _apply_daemon_step_fallbacks(self, chunk_ops, steps, check=False):
+        for idx, status, msg in steps:
+            if status == "ERR" and "VOL_VERIFY_FAILED" in msg and 0 <= idx < len(chunk_ops):
+                op = chunk_ops[idx]
+                if op[0] in ("VOL_SET", "VOL_MUTE"):
+                    self._daemon_vol_supported = False
+                    self._exec_op_via_adb(op, check=check)
+
+    def _execute_mixed_chunks(self, ops, check=False):
+        i = 0
+        n = len(ops)
+        while i < n:
+            op = ops[i]
+            if op[0] == "SLEEP":
+                self._exec_op_via_adb(op, check=check)
+                i += 1
+                continue
+            if self._daemon_vol_supported is False and op[0] in ("VOL_SET", "VOL_MUTE"):
+                self._exec_op_via_adb(op, check=check)
+                i += 1
+                continue
+
+            j = i
+            while j < n:
+                nxt = ops[j]
+                if nxt[0] == "SLEEP":
+                    break
+                if self._daemon_vol_supported is False and nxt[0] in ("VOL_SET", "VOL_MUTE"):
+                    break
+                j += 1
+
+            segment = ops[i:j]
+            put_ops = [sub_op for sub_op in segment if sub_op[0] == "PUT"]
+            daemon_ops = [sub_op for sub_op in segment if sub_op[0] != "PUT"]
+            if put_ops:
+                self._exec_put_run_via_adb(put_ops, check=check)
+            if daemon_ops:
+                ok, _err_idx, steps = self.daemon_batch(daemon_ops, check=check)
+                if ok:
+                    self._apply_daemon_step_fallbacks(daemon_ops, steps, check=check)
+                else:
+                    for sub_op in daemon_ops:
+                        self._exec_op_via_adb(sub_op, check=check)
+            i = j
+
+    def flush_batch(self, check=False):
+        if not self._batch_ops:
+            return True
+        ops = self._coalesce_batch_ops(self._batch_ops)
+        self._batch_ops = []
+
+        if not self.is_daemon_mode() or not self.ip:
+            for op in ops:
+                self._exec_op_via_adb(op, check=check)
+            return True
+
+        with self.transaction():
+            has_puts = any(op[0] == "PUT" for op in ops)
+            if (not has_puts or self._daemon_put_supported is not False) and self.ensure_daemon(check=check):
+                if self._daemon_vol_supported is False and any(
+                    op[0] in ("VOL_SET", "VOL_MUTE") for op in ops
+                ):
+                    self._execute_mixed_chunks(ops, check=check)
+                    return True
+                ok, err_idx, steps = self.daemon_batch(ops, check=check)
+                if ok:
+                    if has_puts and self._daemon_put_supported is None:
+                        self._daemon_put_supported = True
+                    self._apply_daemon_step_fallbacks(ops, steps, check=check)
+                    return True
+                if err_idx is not None:
+                    self._daemon_put_supported = False
+                    self._execute_mixed_chunks(ops[err_idx:], check=check)
+                    return True
+
+            if self._daemon_put_supported is False and self.ensure_daemon(check=check):
+                self._execute_mixed_chunks(ops, check=check)
+                return True
+
+            for op in ops:
+                self._exec_op_via_adb(op, check=check)
+            return False
+
     def _check_and_heal_remote_jar(self, filename, local_jar, check=False):
         with self.transaction():
             sdcard_jar = f"/sdcard/{filename}"
@@ -418,26 +975,43 @@ class Adb:
                     local_size = os.path.getsize(local_jar)
                 except OSError:
                     local_size = 0
+            jar_updated = False
             if sd_size < 1000 or (local_size > 0 and sd_size != local_size):
                 if local_jar:
                     adb_run(
                         ["-s", self.serial, "push", local_jar, sdcard_jar],
                         check=check,
                     )
+                    jar_updated = True
                 else:
                     _adb_log(f"WARNING: {filename} 本地未找到，无法推送到设备")
                     return False
+            if filename == "MtkDirectTool.jar" and jar_updated:
+                self._daemon_needs_restart = True
+                self.stop_daemon()
             self.shell(
                 build_tvservice_shell_command(["cp", sdcard_jar, cache_jar]),
                 check=check,
             )
+            if filename == "MtkDirectTool.jar" and jar_updated:
+                time.sleep(0.2)
             return True
 
     def check_and_heal_jar(self):
-        self._check_and_heal_remote_jar(
+        if (
+            self.is_daemon_mode()
+            and self._batch_depth > 0
+            and self._daemon_ready
+            and self._daemon_jar_healed_ip == self.ip
+        ):
+            return True
+        ok = self._check_and_heal_remote_jar(
             "MtkDirectTool.jar",
             get_mtk_direct_tool_path(),
         )
+        if ok:
+            self._daemon_jar_healed_ip = self.ip
+        return ok
 
     def check_and_heal_colorful_led_tool(self, check=False):
         return self._check_and_heal_remote_jar(
@@ -457,6 +1031,8 @@ class Adb:
         state = adb_device_state(self.serial, timeout=2)
         if state == "device":
             return True, state
+        # 传输已断开时原有 adb forward 映射随之失效，清除旧状态以便重建
+        self._reset_daemon_state()
         adb_run(["connect", self.serial], timeout=5)
         state = adb_device_state(self.serial, timeout=3)
         return state == "device", state
@@ -468,23 +1044,77 @@ class Adb:
         """
         if not self.ip:
             return False, "unknown"
+        self._reset_daemon_state()
         adb_run(["disconnect", self.serial], timeout=3)
         return self.ensure_connected()
     def device_state(self, timeout=3):
         if not self.ip:
             return "unknown"
         return adb_device_state(self.serial, timeout=timeout)
-    def get(self, k, check=False):
+    def _adb_get(self, k, check=False):
         v = self.shell(f"settings get global {k}", check=check)
         _adb_log(f"settings get {k} => {v}")
         return v
-    def put(self, k, v, check=False):
+
+    def get(self, k, check=False):
+        key = str(k)
+        if self.is_daemon_mode():
+            if self._batch_depth > 0 and key in self._batch_read_cache:
+                v = self._batch_read_cache[key]
+                _adb_log(f"settings get (batch cache) {key} => {v}")
+                return v
+            res = self.daemon_query(settings_keys=(key,), check=False)
+            if res and key in res["settings"]:
+                v = res["settings"][key]
+                if self._batch_depth > 0:
+                    self._batch_read_cache[key] = v
+                _adb_log(f"settings get (daemon) {key} => {v}")
+                return v
+        v = self._adb_get(key, check=check)
+        if self._batch_depth > 0:
+            self._batch_read_cache[key] = v
+        return v
+
+    def _adb_put(self, k, v, check=False):
         _adb_log(f"settings put {k} = {v}")
         return self.shell(f"settings put global {k} {v}", check=check)
-    def key(self, k, check=False):
+
+    def put(self, k, v, check=False):
+        key = str(k)
+        val = str(v)
+        if self.is_daemon_mode():
+            if self._batch_depth > 0:
+                _adb_log(f"settings put (batch) {key} = {val}")
+                self._batch_read_cache[key] = val
+                self._batch_ops.append(("PUT", key, val))
+                return ""
+            if self._daemon_put_supported is not False:
+                ok, err_idx, _ = self.daemon_batch([("PUT", key, val)], check=False)
+                if ok:
+                    self._daemon_put_supported = True
+                    _adb_log(f"settings put (daemon) {key} = {val}")
+                    return ""
+                if err_idx is not None:
+                    self._daemon_put_supported = False
+        return self._adb_put(key, val, check=check)
+
+    def _adb_key(self, k, check=False):
         _adb_log(f"keyevent {k}")
         return self.shell(f"input keyevent {k}", check=check)
-    def colorful_led(self, action, *args, check=False):
+
+    def key(self, k, check=False):
+        if self.is_daemon_mode():
+            if self._batch_depth > 0:
+                _adb_log(f"keyevent (batch) {k}")
+                self._batch_ops.append(("KEY", str(k)))
+                return ""
+            ok, _, _ = self.daemon_batch([("KEY", str(k))], check=False)
+            if ok:
+                _adb_log(f"keyevent (daemon) {k}")
+                return ""
+        return self._adb_key(k, check=check)
+
+    def _adb_colorful_led(self, action, *args, check=False):
         with self.transaction():
             _adb_log(f"colorful_led {action} {' '.join(map(str, args))}")
             if not self.check_and_heal_colorful_led_tool(check=check):
@@ -495,21 +1125,65 @@ class Adb:
                 build_tvservice_app_process_command(jar, parts),
                 check=check,
             )
-    def jni_set(self, key, val, upd=3, check=False):
+
+    def colorful_led(self, action, *args, check=False):
+        op = ("LED", str(action), *[str(a) for a in args])
+        if self.is_daemon_mode():
+            if self._batch_depth > 0:
+                _adb_log(f"colorful_led (batch) {action} {' '.join(map(str, args))}")
+                self._batch_ops.append(op)
+                return ""
+            ok, _, _ = self.daemon_batch([op], check=False)
+            if ok:
+                _adb_log(f"colorful_led (daemon) {action} {' '.join(map(str, args))}")
+                return ""
+        return self._adb_colorful_led(action, *args, check=check)
+
+    def _adb_jni_set(self, key, val, upd=3, check=False):
         _adb_log(f"jni_set {key} = {val}")
         jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
         command = build_tvservice_app_process_command(
             jar, ["MtkDirectTool", "set", key, val, upd]
         )
         return self.shell(command, check=check)
-    def hdr_tone_mapping(self, val, upd=3, check=False):
+
+    def jni_set(self, key, val, upd=3, check=False):
+        op = ("JNI_SET", str(key), int(val), int(upd))
+        if self.is_daemon_mode():
+            if self._batch_depth > 0:
+                _adb_log(f"jni_set (batch) {key} = {val}")
+                self._batch_jni_cache[str(key)] = int(val)
+                self._batch_ops.append(op)
+                return ""
+            ok, _, _ = self.daemon_batch([op], check=False)
+            if ok:
+                _adb_log(f"jni_set (daemon) {key} = {val}")
+                return ""
+        return self._adb_jni_set(key, val, upd=upd, check=check)
+
+    def _adb_hdr_tone_mapping(self, val, upd=3, check=False):
         _adb_log(f"hdr_tone_mapping = {val}")
         jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
         command = build_tvservice_app_process_command(
             jar, ["MtkDirectTool", "setHdrToneMapping", val, upd]
         )
         return self.shell(command, check=check)
-    def set_sound_output(self, device_id, check=False):
+
+    def hdr_tone_mapping(self, val, upd=3, check=False):
+        op = ("HDR_TM", int(val), int(upd))
+        if self.is_daemon_mode():
+            if self._batch_depth > 0:
+                _adb_log(f"hdr_tone_mapping (batch) = {val}")
+                self._batch_jni_cache["g_video__vid_hdr_tone_mapping_mode"] = int(val)
+                self._batch_ops.append(op)
+                return ""
+            ok, _, _ = self.daemon_batch([op], check=False)
+            if ok:
+                _adb_log(f"hdr_tone_mapping (daemon) = {val}")
+                return ""
+        return self._adb_hdr_tone_mapping(val, upd=upd, check=check)
+
+    def _adb_set_sound_output(self, device_id, check=False):
         """通过 TvService 3 调用 MtkDirectTool 切换音频输出设备（不在此处写 Settings.Global）。"""
         _adb_log(f"set_sound_output = {device_id}")
         jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
@@ -518,7 +1192,21 @@ class Adb:
         )
         return self.shell(command, check=check)
 
-    def media_volume(self, check=False):
+    def set_sound_output(self, device_id, check=False):
+        """通过 TvService 3 调用 MtkDirectTool 切换音频输出设备（不在此处写 Settings.Global）。"""
+        op = ("SOUND_OUT", int(device_id))
+        if self.is_daemon_mode():
+            if self._batch_depth > 0:
+                _adb_log(f"set_sound_output (batch) = {device_id}")
+                self._batch_ops.append(op)
+                return ""
+            ok, _, _ = self.daemon_batch([op], check=False)
+            if ok:
+                _adb_log(f"set_sound_output (daemon) = {device_id}")
+                return ""
+        return self._adb_set_sound_output(device_id, check=check)
+
+    def _adb_media_volume(self, check=False):
         """读取显示器媒体音量（0~100）。优先走 AudioService getStreamVolumeForMute。"""
         out = self.shell(
             f"service call audio {_AUDIO_SERVICE_TXN_GET_STREAM_VOLUME_FOR_MUTE} i32 {_AUDIO_STREAM_MUSIC}",
@@ -538,7 +1226,21 @@ class Adb:
             return parsed
         return None
 
-    def media_muted(self, check=False):
+    def media_volume(self, check=False):
+        """读取显示器媒体音量（0~100）。优先走 AudioService getStreamVolumeForMute。"""
+        if self.is_daemon_mode():
+            res = self.daemon_query(flags=("volume",), check=False)
+            if res and "volume" in res["flags"]:
+                try:
+                    val = int(res["flags"]["volume"])
+                    if 0 <= val <= 100:
+                        _adb_log(f"media_volume (daemon) => {val}")
+                        return val
+                except (TypeError, ValueError):
+                    pass
+        return self._adb_media_volume(check=check)
+
+    def _adb_media_muted(self, check=False):
         """读取显示器媒体流静音状态。"""
         out = self.shell(
             f"service call audio {_AUDIO_SERVICE_TXN_IS_STREAM_MUTE} i32 {_AUDIO_STREAM_MUSIC}",
@@ -551,6 +1253,18 @@ class Adb:
         _adb_log(f"media_muted => {muted}")
         return muted
 
+    def media_muted(self, check=False):
+        """读取显示器媒体流静音状态。"""
+        if self.is_daemon_mode():
+            res = self.daemon_query(flags=("muted",), check=False)
+            if res and "muted" in res["flags"]:
+                raw = res["flags"]["muted"]
+                if raw in ("0", "1"):
+                    muted = raw == "1"
+                    _adb_log(f"media_muted (daemon) => {muted}")
+                    return muted
+        return self._adb_media_muted(check=check)
+
     def _apply_media_volume_by_keyevent(self, target, check=False):
         current = self.media_volume(check=check)
         if current is None:
@@ -562,13 +1276,12 @@ class Adb:
         batch = " ".join([key] * min(abs(delta), 100))
         self.shell(f"input keyevent {batch}", check=check)
 
-    def set_media_volume(self, value, unmute_first=False, show_ui=False, check=False):
-        """绝对设置显示器媒体音量（0~100）。返回是否使用了 binder 快速通道。"""
+    def _adb_set_media_volume(self, value, unmute_first=False, show_ui=False, check=False):
         target = max(0, min(100, int(value)))
         flags = 1 if show_ui else 0
         _adb_log(f"set_media_volume = {target} (unmute_first={bool(unmute_first)}, show_ui={bool(show_ui)})")
         if unmute_first:
-            self.set_media_muted(False, show_ui=False, check=check)
+            self._adb_set_media_muted(False, show_ui=False, check=check)
         if self._media_volume_binder_verified is not False:
             out = self.shell(
                 f"service call audio {_AUDIO_SERVICE_TXN_SET_STREAM_VOLUME} "
@@ -588,8 +1301,25 @@ class Adb:
         self._apply_media_volume_by_keyevent(target, check=check)
         return False
 
-    def set_media_muted(self, muted, show_ui=False, check=False):
-        """设置/解除显示器媒体流静音。返回是否使用了 binder 快速通道。"""
+    def set_media_volume(self, value, unmute_first=False, show_ui=False, check=False):
+        """绝对设置显示器媒体音量（0~100）。返回是否使用了 binder 快速通道。"""
+        target = max(0, min(100, int(value)))
+        if self.is_daemon_mode() and self._daemon_vol_supported is not False:
+            op = ("VOL_SET", target, int(bool(unmute_first)), int(bool(show_ui)))
+            if self._batch_depth > 0:
+                _adb_log(f"set_media_volume (batch) = {target}")
+                self._batch_ops.append(op)
+                return True
+            ok, _, steps = self.daemon_batch([op], check=False)
+            if ok and not any(st == "ERR" and "VOL_VERIFY_FAILED" in msg for _, st, msg in steps):
+                self._daemon_vol_supported = True
+                _adb_log(f"set_media_volume (daemon) = {target}")
+                return True
+            if steps and any("VOL_VERIFY_FAILED" in msg for _, _, msg in steps):
+                self._daemon_vol_supported = False
+        return self._adb_set_media_volume(value, unmute_first=unmute_first, show_ui=show_ui, check=check)
+
+    def _adb_set_media_muted(self, muted, show_ui=False, check=False):
         muted_bool = bool(muted)
         flags = 1 if show_ui else 0
         _adb_log(f"set_media_muted = {muted_bool} (show_ui={bool(show_ui)})")
@@ -612,14 +1342,47 @@ class Adb:
                 self._media_volume_binder_verified = False
         self.shell("input keyevent KEYCODE_VOLUME_MUTE", check=check)
         return False
-    def jni_set_color_gains(self, red, green, blue, check=False):
+
+    def set_media_muted(self, muted, show_ui=False, check=False):
+        """设置/解除显示器媒体流静音。返回是否使用了 binder 快速通道。"""
+        muted_bool = bool(muted)
+        if self.is_daemon_mode() and self._daemon_vol_supported is not False:
+            op = ("VOL_MUTE", int(muted_bool), int(bool(show_ui)))
+            if self._batch_depth > 0:
+                _adb_log(f"set_media_muted (batch) = {muted_bool}")
+                self._batch_ops.append(op)
+                return True
+            ok, _, steps = self.daemon_batch([op], check=False)
+            if ok and not any(st == "ERR" and "VOL_VERIFY_FAILED" in msg for _, st, msg in steps):
+                self._daemon_vol_supported = True
+                _adb_log(f"set_media_muted (daemon) = {muted_bool}")
+                return True
+            if steps and any("VOL_VERIFY_FAILED" in msg for _, _, msg in steps):
+                self._daemon_vol_supported = False
+        return self._adb_set_media_muted(muted, show_ui=show_ui, check=check)
+
+    def _adb_jni_set_color_gains(self, red, green, blue, check=False):
         _adb_log(f"jni_set_color_gains r={red} g={green} b={blue}")
         jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
         command = build_tvservice_app_process_command(
             jar, ["MtkDirectTool", "setColorGains", red, green, blue]
         )
         return self.shell(command, check=check)
-    def jni_get(self, key, check=False):
+
+    def jni_set_color_gains(self, red, green, blue, check=False):
+        op = ("COLOR_GAINS", int(red), int(green), int(blue))
+        if self.is_daemon_mode():
+            if self._batch_depth > 0:
+                _adb_log(f"jni_set_color_gains (batch) r={red} g={green} b={blue}")
+                self._batch_ops.append(op)
+                return ""
+            ok, _, _ = self.daemon_batch([op], check=False)
+            if ok:
+                _adb_log(f"jni_set_color_gains (daemon) r={red} g={green} b={blue}")
+                return ""
+        return self._adb_jni_set_color_gains(red, green, blue, check=check)
+
+    def _adb_jni_get(self, key, check=False):
         with self.transaction():
             jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
             self.shell("logcat -c", check=check)
@@ -636,7 +1399,23 @@ class Adb:
         _adb_log(f"jni_get {key} => {v}")
         return v
 
-    def jni_batch_get(self, keys, check=False):
+    def jni_get(self, key, check=False):
+        k = str(key)
+        if self.is_daemon_mode():
+            if self._batch_depth > 0 and k in self._batch_jni_cache:
+                v = str(self._batch_jni_cache[k])
+                _adb_log(f"jni_get (batch cache) {k} => {v}")
+                return v
+            res = self.daemon_query(jni_keys=(k,), check=False)
+            if res and k in res["jni"]:
+                v = str(res["jni"][k])
+                if self._batch_depth > 0:
+                    self._batch_jni_cache[k] = res["jni"][k]
+                _adb_log(f"jni_get (daemon) {k} => {v}")
+                return v
+        return self._adb_jni_get(k, check=check)
+
+    def _adb_jni_batch_get(self, keys, check=False):
         safe_keys = []
         for key in keys:
             key = str(key)
@@ -665,6 +1444,26 @@ class Adb:
         _adb_log(f"jni_batch_get {','.join(safe_keys)} => {vals}")
         return vals
 
+    def jni_batch_get(self, keys, check=False):
+        if self.is_daemon_mode():
+            safe_keys = [
+                str(k) for k in keys
+                if str(k) and all(ch.isalnum() or ch == "_" for ch in str(k))
+            ]
+            if not safe_keys:
+                return {}
+            if self._batch_depth > 0 and all(k in self._batch_jni_cache for k in safe_keys):
+                cached = {k: self._batch_jni_cache[k] for k in safe_keys}
+                _adb_log(f"jni_batch_get (batch cache) => {cached}")
+                return cached
+            res = self.daemon_query(jni_keys=safe_keys, check=False)
+            if res and res["jni"]:
+                if self._batch_depth > 0:
+                    self._batch_jni_cache.update(res["jni"])
+                _adb_log(f"jni_batch_get (daemon) => {res['jni']}")
+                return dict(res["jni"])
+        return self._adb_jni_batch_get(keys, check=check)
+
     def jni_batch_get_or_single(self, keys, check=False):
         vals = self.jni_batch_get(keys)
         for key in keys:
@@ -678,9 +1477,21 @@ class Adb:
                 pass
         return vals
 
-    def refresh_pq(self, check=False):
+    def _adb_refresh_pq(self, check=False):
         _adb_log("refresh_pq")
         return self.shell("am broadcast -a com.xiaomi.mitv.action.PIC_MODE_CHANGED --ei picmode 7", check=check)
+
+    def refresh_pq(self, check=False):
+        if self.is_daemon_mode():
+            if self._batch_depth > 0:
+                _adb_log("refresh_pq (batch)")
+                self._batch_ops.append(("REFRESH_PQ",))
+                return ""
+            ok, _, _ = self.daemon_batch([("REFRESH_PQ",)], check=False)
+            if ok:
+                _adb_log("refresh_pq (daemon)")
+                return ""
+        return self._adb_refresh_pq(check=check)
     def get_model(self):
         m = self.shell("getprop ro.product.model")
         _adb_log(f"get_model => {m}")

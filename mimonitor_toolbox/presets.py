@@ -10,6 +10,7 @@ hdr_tone_mapping / check_and_heal_jar 即可），所以可以用假的 adb 直�
 否则会被模式的默认值冲掉。
 """
 
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 
 from .core import (
@@ -619,36 +620,52 @@ def apply_preset(adb, values, on_item=None, options=None):
     """
     result = ApplyResult()
     opts = normalize_preset_options(options) if options is not None else None
-    for item in PICTURE_ITEMS:
-        if opts is not None:
-            group_id = item_option_group(item.id)
-            if not opts.get(group_id, True):
-                reason = f"该预设未启用「{_PRESET_GROUP_LABELS.get(group_id, group_id)}」"
-                result.skipped.append((item.label, reason))
-                if on_item:
-                    on_item(item, "skipped", reason)
-                continue
-        if item.condition is not None:
+    is_daemon = (
+        callable(getattr(adb, "is_daemon_mode", None))
+        and adb.is_daemon_mode() is True
+    )
+    batch_ctx = (
+        adb.batch_writes(
+            prefetch_settings=("mitv.tvplayer.hdmi.last.source",),
+            prefetch_jni=(
+                "g_fusion_picture__hdmi_edid_version",
+                "g_video__freesync_switch",
+            ),
+        )
+        if is_daemon and callable(getattr(adb, "batch_writes", None))
+        else nullcontext()
+    )
+    with batch_ctx:
+        for item in PICTURE_ITEMS:
+            if opts is not None:
+                group_id = item_option_group(item.id)
+                if not opts.get(group_id, True):
+                    reason = f"该预设未启用「{_PRESET_GROUP_LABELS.get(group_id, group_id)}」"
+                    result.skipped.append((item.label, reason))
+                    if on_item:
+                        on_item(item, "skipped", reason)
+                    continue
+            if item.condition is not None:
+                try:
+                    should_apply, reason = item.condition(values)
+                except Exception as exc:
+                    result.skipped.append((item.label, f"条件判断失败：{exc}"))
+                    continue
+                if not should_apply:
+                    result.skipped.append((item.label, reason))
+                    if on_item:
+                        on_item(item, "skipped", reason)
+                    continue
             try:
-                should_apply, reason = item.condition(values)
+                item.apply(adb, values)
             except Exception as exc:
-                result.skipped.append((item.label, f"条件判断失败：{exc}"))
-                continue
-            if not should_apply:
-                result.skipped.append((item.label, reason))
+                result.failed.append((item.label, str(exc)))
                 if on_item:
-                    on_item(item, "skipped", reason)
+                    on_item(item, "failed", str(exc))
                 continue
-        try:
-            item.apply(adb, values)
-        except Exception as exc:
-            result.failed.append((item.label, str(exc)))
+            result.applied.append(item.label)
             if on_item:
-                on_item(item, "failed", str(exc))
-            continue
-        result.applied.append(item.label)
-        if on_item:
-            on_item(item, "applied", "")
+                on_item(item, "applied", "")
     return result
 
 

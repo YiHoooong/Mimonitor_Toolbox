@@ -1751,5 +1751,106 @@ class MemcPageIntegrationTests(TrayTestBase):
             self._close(window)
 
 
+class ConnectionModeUiTests(TrayTestBase):
+    """主页连接状态旁边的连接模式按钮、弹窗选择与配置持久化。"""
+
+    def test_home_page_has_connection_mode_button_next_to_status_label(self):
+        settings = {"connection_mode": "adb"}
+        p1, p2 = self._settings_patches(settings)
+        with p1, p2:
+            window = self._app()
+        try:
+            self.assertTrue(hasattr(window, "conn_mode_btn"))
+            self.assertTrue(hasattr(window, "status_label"))
+            self.assertEqual(window.conn_mode_btn.text(), "连接模式: 兼容模式 (ADB)")
+            self.assertEqual(window.adb.connection_mode, "adb")
+            row_layout = window.status_label.parentWidget().layout()
+            self.assertIsNotNone(row_layout)
+        finally:
+            self._close(window)
+
+    def test_connection_mode_dialog_selection_and_toggle(self):
+        from PyQt6.QtWidgets import QWidget
+        from mimonitor_toolbox.widgets import ConnectionModeDialog
+
+        parent = QWidget()
+        dialog = ConnectionModeDialog("adb", parent)
+        try:
+            self.assertEqual(dialog.selected_mode(), "adb")
+            dialog.select_mode("daemon")
+            self.assertEqual(dialog.selected_mode(), "daemon")
+            dialog.select_mode("adb")
+            self.assertEqual(dialog.selected_mode(), "adb")
+        finally:
+            dialog.deleteLater()
+            parent.deleteLater()
+
+    def test_open_connection_mode_dialog_switches_and_persists_mode(self):
+        from mimonitor_toolbox import device_features, pages
+
+        settings = {"connection_mode": "adb"}
+        p1, p2 = self._settings_patches(settings)
+        with p1, p2, \
+                mock.patch.object(device_features, "update_settings", side_effect=settings.update), \
+                mock.patch.object(pages, "update_settings", side_effect=settings.update):
+            window = self._app()
+            try:
+                fake_dialog = mock.Mock()
+                fake_dialog.exec.return_value = True
+                fake_dialog.selected_mode.return_value = "daemon"
+                with mock.patch.object(pages, "ConnectionModeDialog", return_value=fake_dialog):
+                    window._open_connection_mode_dialog()
+
+                self.assertEqual(settings["connection_mode"], "daemon")
+                self.assertEqual(window.adb.connection_mode, "daemon")
+                self.assertEqual(window.conn_mode_btn.text(), "连接模式: 混合加速 (Daemon)")
+
+                fake_dialog2 = mock.Mock()
+                fake_dialog2.exec.return_value = True
+                fake_dialog2.selected_mode.return_value = "adb"
+                with mock.patch.object(pages, "ConnectionModeDialog", return_value=fake_dialog2):
+                    window._open_connection_mode_dialog()
+
+                self.assertEqual(settings["connection_mode"], "adb")
+                self.assertEqual(window.adb.connection_mode, "adb")
+                self.assertEqual(window.conn_mode_btn.text(), "连接模式: 兼容模式 (ADB)")
+            finally:
+                self._close(window)
+
+    def test_verbose_log_toggle_filters_ui_but_keeps_file_logging(self):
+        import io
+        from PyQt6.QtCore import Qt
+        from mimonitor_toolbox import adb as adb_runtime, main_window as main_window_mod
+
+        settings = {"verbose_log": False}
+        p1, p2 = self._settings_patches(settings)
+        with p1, p2, \
+                mock.patch.object(main_window_mod, "update_settings", side_effect=settings.update), \
+                mock.patch.object(main_window_mod, "load_settings", side_effect=lambda: dict(settings)):
+            window = self._app()
+            old_file = adb_runtime._log_file
+            old_enabled = adb_runtime._log_to_file_enabled
+            fake_file = io.StringIO()
+            try:
+                self.assertFalse(window.verbose_log_toggle.isChecked())
+                adb_runtime._log_file = fake_file
+                adb_runtime._log_to_file_enabled = True
+
+                # 默认精简模式下，detail 日志只写文件、不进 UI
+                window._on_detail_log("[00:00:01] 正在刷新「画面设置」数据...")
+                self.assertNotIn("正在刷新「画面设置」数据...", window.log_widget.toPlainText())
+                self.assertIn("正在刷新「画面设置」数据...", fake_file.getvalue())
+
+                # 开启详细日志后，状态同步落盘且后续 detail 日志在 UI 显示
+                window.verbose_log_toggle.setChecked(True)
+                self.assertTrue(settings["verbose_log"])
+                window._on_detail_log("[00:00:02] 「画面设置」数据刷新完成")
+                self.assertIn("「画面设置」数据刷新完成", window.log_widget.toPlainText())
+            finally:
+                adb_runtime._log_file = old_file
+                adb_runtime._log_to_file_enabled = old_enabled
+                self._close(window)
+
+
 if __name__ == "__main__":
     unittest.main()

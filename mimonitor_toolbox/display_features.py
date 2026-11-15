@@ -1,5 +1,6 @@
 """显示器控制、快捷键和 HDR/模式记忆功能。"""
 
+import contextlib
 import time
 
 from PyQt6.QtCore import QTimer, Qt
@@ -22,6 +23,7 @@ from .core import (
     SOUND_OUTPUT_SETTINGS_KEY,
     SOUND_OUTPUT_VALID_VALUES,
     XIAOMI_TO_MTK_COLOR_TEMP,
+    emit_detail_log,
     evaluate_memc_conditions,
     format_memc_condition_dialog,
     format_memc_label,
@@ -70,6 +72,26 @@ _GAME_FEATURE_DEPENDENCIES = {
 }
 
 
+def _is_daemon_adb(adb):
+    """严格判断 adb 是否处于 Hybrid Daemon 模式（兼容 mock.Mock 与简化替身）。"""
+    checker = getattr(adb, "is_daemon_mode", None)
+    return callable(checker) and checker() is True
+
+
+@contextlib.contextmanager
+def _batch_tx(adb, prefetch_settings=(), prefetch_jni=()):
+    """包装设备事务；仅在 Hybrid Daemon 模式下将多步写入合并为批量下发。"""
+    with adb.transaction():
+        if _is_daemon_adb(adb) and callable(getattr(adb, "batch_writes", None)):
+            with adb.batch_writes(
+                prefetch_settings=prefetch_settings,
+                prefetch_jni=prefetch_jni,
+            ):
+                yield
+        else:
+            yield
+
+
 class DisplayFeaturesMixin:
     def initialize_display_features(self):
         """初始化显示器控制缓存以及 HDR 记忆定时器。"""
@@ -108,6 +130,9 @@ class DisplayFeaturesMixin:
         self._display_change_refresh_timer.timeout.connect(
             lambda: self._refresh_pages_after_display_change()
         )
+        self._preset_verify_timer = QTimer(self)
+        self._preset_verify_timer.setSingleShot(True)
+        self._preset_verify_timer.timeout.connect(self._verify_after_preset_apply)
 
     def hotkey_countdown_enabled(self):
         return bool(load_settings().get("hotkey_countdown_enabled", True))
@@ -437,7 +462,7 @@ class DisplayFeaturesMixin:
         previous = self.current_vals.get("picture_local_dimming")
 
         def operation():
-            with self.adb.transaction():
+            with _batch_tx(self.adb):
                 self.adb.jni_set("g_video__vid_local_dimming", value, check=True)
                 self.adb.put("picture_local_dimming", str(value), check=True)
                 self.adb.put("tv_picture_video_local_dimming", str(value), check=True)
@@ -601,9 +626,11 @@ class DisplayFeaturesMixin:
         elif not self.check_connection():
             return
         seconds = self._preset_suppress_seconds()
+        preset_busy_deadline = time.monotonic() + seconds
+        self._preset_apply_busy_deadline = preset_busy_deadline
         self._mark_adb_busy(seconds)
         self._suppress_display_change_refresh(seconds)
-        self._local_dimming_memory_suppress_until = time.monotonic() + seconds
+        self._local_dimming_memory_suppress_until = preset_busy_deadline
         self._show_preset_switching_overlay()
         outcome = {}
 
@@ -614,13 +641,14 @@ class DisplayFeaturesMixin:
                 outcome["result"] = apply_preset(self.adb, values, options=options)
 
         def success():
+            self._release_preset_apply_guards(preset_busy_deadline)
             self._hide_preset_switching_overlay()
             result = outcome.get("result")
             if result is None:
                 return
             self.log(f"{label}：{result.summary()}")
             for name, reason in result.skipped:
-                self.log(f"  · 跳过 {name}（{reason}）")
+                emit_detail_log(self, f"  · 跳过 {name}（{reason}）")
             for name, error in result.failed:
                 self.log(f"  · 失败 {name}：{error}")
             self.current_vals.update(values)
@@ -646,12 +674,13 @@ class DisplayFeaturesMixin:
             self._page_loaded.discard("sourcePage")
             self._page_loaded.discard("lightPage")
             # 等设备把整批写入消化完再回读 —— 兼作"写入是否真的落下去"的校验，
-            # 因为模式切换会重新应用该模式的整套参数。
-            QTimer.singleShot(1800, self._verify_after_preset_apply)
+            # 使用单一防抖定时器，连续切换预设只执行最后一次回读。
+            self._schedule_preset_verify(1800)
             if on_finished:
                 on_finished(result)
 
         def failure(error):
+            self._release_preset_apply_guards(preset_busy_deadline)
             self._hide_preset_switching_overlay()
             self.log(f"{label} 失败：{error}")
             if on_finished:
@@ -659,12 +688,36 @@ class DisplayFeaturesMixin:
 
         self._run_adb_action(label, operation, success, failure)
 
+    def _release_preset_apply_guards(self, busy_deadline):
+        """预设批次结束后立即释放 20s 通道忙碌锁，并将事件压制收敛到短暂稳定期。"""
+        if getattr(self, "_preset_apply_busy_deadline", 0.0) != busy_deadline:
+            return
+        if getattr(self, "_adb_busy_until", 0.0) <= busy_deadline + 0.05:
+            self._adb_busy_until = 0.0
+        now = time.monotonic()
+        self._local_dimming_memory_suppress_until = min(
+            getattr(self, "_local_dimming_memory_suppress_until", 0.0),
+            now + 2.5,
+        )
+        self._display_change_refresh_suppress_until = min(
+            getattr(self, "_display_change_refresh_suppress_until", 0.0),
+            now + 2.5,
+        )
+
+    def _schedule_preset_verify(self, delay_ms=1800):
+        """单例防抖排程预设应用后的页面回读。"""
+        timer = getattr(self, "_preset_verify_timer", None)
+        if timer is not None:
+            timer.start(delay_ms)
+        else:
+            QTimer.singleShot(delay_ms, self._verify_after_preset_apply)
+
     def _verify_after_preset_apply(self):
         """应用后回读一次并刷新界面。"""
         if getattr(self, "_cleanup_done", False) or not getattr(self, "adb_connected", False):
             return
         if self._adb_channel_busy():
-            QTimer.singleShot(800, self._verify_after_preset_apply)
+            self._schedule_preset_verify(800)
             return
         self._refresh_pages(("picturePage", "gamePage", "sourcePage", "lightPage"), force=True)
 
@@ -712,7 +765,7 @@ class DisplayFeaturesMixin:
         name = preset.get("name") or preset_id
         missing = missing_keys(values, options=options)
         if missing:
-            self.log(f"预设「{name}」缺 {len(missing)} 项（{'、'.join(missing)}），只应用已有的项")
+            emit_detail_log(self, f"预设「{name}」缺 {len(missing)} 项（{'、'.join(missing)}），只应用已有的项")
         # 只有从「无预设」切进预设时才更新那份值 —— 预设之间互切不该覆盖它，
         # 否则「无预设」就不再是"套预设之前"的那套设置了。
         leaving_baseline = not self.active_preset_id()
@@ -1793,7 +1846,7 @@ class DisplayFeaturesMixin:
         })
 
         def operation():
-            with self.adb.transaction():
+            with _batch_tx(self.adb):
                 self.adb.jni_set("g_video__vid_local_dimming", value, check=True)
                 self.adb.put("picture_local_dimming", str(value), check=True)
                 self.adb.put("tv_picture_video_local_dimming", str(value), check=True)
@@ -2101,7 +2154,7 @@ class DisplayFeaturesMixin:
         previous = self._take_control_previous(k)
 
         def operation():
-            with self.adb.transaction():
+            with _batch_tx(self.adb):
                 if k == "mitv.tvplayer.hdmi.last.source":
                     self.adb.shell("am force-stop com.xiaomi.mitv.tvplayer", check=True)
                     self.adb.shell(f"am start -a com.xiaomi.mitv.tvplayer.EXTSRC_PLAY -n com.xiaomi.mitv.tvplayer/.ExternalSourceActivity --ei input {v} -f 0x10000000", check=True)
@@ -2147,7 +2200,7 @@ class DisplayFeaturesMixin:
         previous = self._take_control_previous(state_key)
 
         def operation():
-            with self.adb.transaction():
+            with _batch_tx(self.adb):
                 self.adb.check_and_heal_jar()
                 self.adb.set_sound_output(device_id, check=True)
                 self.adb.put(state_key, str(device_id), check=True)
@@ -2317,14 +2370,17 @@ class DisplayFeaturesMixin:
             self._picture_mode_switch_seq = getattr(self, "_picture_mode_switch_seq", 0) + 1
 
         def operation():
-            with self.adb.transaction():
+            with _batch_tx(self.adb):
                 for setting, setting_value in updates.items():
                     self.adb.put(setting, str(setting_value), check=True)
                 if switch_to_game:
                     self.adb.put("picture_mode", "10", check=True)
                 elif retrigger_game_mode and game_mode_active:
                     self.adb.put("picture_mode", "14", check=True)
-                    time.sleep(0.5)
+                    if _is_daemon_adb(self.adb) and callable(getattr(self.adb, "batch_sleep", None)):
+                        self.adb.batch_sleep(500)
+                    else:
+                        time.sleep(0.5)
                     self.adb.put("picture_mode", "10", check=True)
                 else:
                     self.adb.refresh_pq(check=True)
@@ -2356,7 +2412,7 @@ class DisplayFeaturesMixin:
         previous = self._take_control_previous(sk)
 
         def operation():
-            with self.adb.transaction():
+            with _batch_tx(self.adb):
                 self.adb.jni_set(jk, v, check=True)
                 self.adb.put(sk, str(v), check=True)
                 if osd_sk:
@@ -2395,6 +2451,24 @@ class DisplayFeaturesMixin:
     def _read_memc_condition_state(self):
         live_settings = dict(getattr(self, "current_vals", {}))
         cond_keys = ("picture_mode", "picture_preset_scenario", "mitv.tvplayer.hdmi.last.source")
+        if _is_daemon_adb(self.adb) and callable(getattr(self.adb, "daemon_query", None)):
+            try:
+                snap = self.adb.daemon_query(
+                    settings_keys=cond_keys,
+                    jni_keys=MEMC_CONDITION_JNI_KEYS,
+                    check=False,
+                )
+            except Exception:
+                snap = None
+            if snap is not None:
+                for key, raw in (snap.get("settings") or {}).items():
+                    if raw in (None, "", "null", "N/A"):
+                        continue
+                    try:
+                        live_settings[key] = int(raw)
+                    except (TypeError, ValueError):
+                        live_settings[key] = raw
+                return live_settings, dict(snap.get("jni") or {})
         if hasattr(self.adb, "shell"):
             try:
                 keys_str = " ".join(cond_keys)
@@ -2565,7 +2639,7 @@ class DisplayFeaturesMixin:
         previous = self._take_control_previous(state_key)
 
         def operation():
-            with self.adb.transaction():
+            with _batch_tx(self.adb):
                 self.adb.check_and_heal_jar()
                 self.adb.hdr_tone_mapping(mtk_value, check=True)
                 self.adb.put("picture_hdr_tone_mapping", str(mtk_value), check=True)
@@ -2592,7 +2666,7 @@ class DisplayFeaturesMixin:
         previous = self._take_control_previous("picture_color_temperature")
 
         def operation():
-            with self.adb.transaction():
+            with _batch_tx(self.adb):
                 self.adb.jni_set("g_video__clr_temp", jv, check=True)
                 self.adb.put("picture_color_temperature", str(sv), check=True)
                 self.adb.refresh_pq(check=True)
@@ -2645,7 +2719,7 @@ class DisplayFeaturesMixin:
         self.current_vals.update(values)
 
         def operation():
-            with self.adb.transaction():
+            with _batch_tx(self.adb):
                 self.adb.jni_set("g_video__clr_temp", XIAOMI_TO_MTK_COLOR_TEMP[CUSTOM_COLOR_TEMP_VALUE], check=True)
                 self.adb.put("picture_color_temperature", str(CUSTOM_COLOR_TEMP_VALUE), check=True)
                 self.adb.jni_set_color_gains(
@@ -2698,7 +2772,14 @@ class DisplayFeaturesMixin:
         previous = self._take_control_previous("mode_320")
 
         def operation():
-            with self.adb.transaction():
+            with _batch_tx(
+                self.adb,
+                prefetch_settings=("mitv.tvplayer.hdmi.last.source",),
+                prefetch_jni=(
+                    "g_fusion_picture__hdmi_edid_version",
+                    "g_video__freesync_switch",
+                ),
+            ):
                 src = str(self._get_input_source(check=True)).strip()
                 if src in ("29", "30"):
                     self.adb.jni_set("g_fusion_picture__dp_edid_version", 3 if on else 2, check=True)
@@ -2751,7 +2832,14 @@ class DisplayFeaturesMixin:
                 restore_mode = self._get_freesync_memory_mode()
 
         def operation():
-            with self.adb.transaction():
+            with _batch_tx(
+                self.adb,
+                prefetch_settings=("mitv.tvplayer.hdmi.last.source",),
+                prefetch_jni=(
+                    "g_fusion_picture__hdmi_edid_version",
+                    "g_video__freesync_switch",
+                ),
+            ):
                 src = str(self._get_input_source(check=True)).strip()
                 if src in ("29", "30"):
                     self.adb.jni_set("g_video__dp_adaptive_sync", 1 if on else 0, check=True)
@@ -2812,7 +2900,7 @@ class DisplayFeaturesMixin:
         color_value = self._screen_light_int("atmosphere_light_color_value", 0)
 
         def operation():
-            with self.adb.transaction():
+            with _batch_tx(self.adb):
                 write_screen_light_values(self.adb, mode, illumination, color_temp, color_value)
 
         def success():

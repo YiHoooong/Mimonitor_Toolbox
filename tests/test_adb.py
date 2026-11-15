@@ -292,42 +292,45 @@ class ConnectByDeviceStateTests(unittest.TestCase):
                     return "MiTV-MFFU1"
             return ""
 
-        with mock.patch.object(adb_runtime, "get_windows_scan_networks", return_value=networks), \
-                mock.patch.object(adb_runtime, "build_probe_targets", return_value=list(all_targets)), \
-                mock.patch.object(adb_runtime, "probe_tcp_targets", side_effect=fake_probe_tcp_targets), \
-                mock.patch.object(adb_runtime, "ensure_adb_server", return_value=True), \
-                mock.patch.object(adb_runtime, "adb_run", side_effect=fake_adb_run):
-            first = adb_runtime.scan_adb()
-            self.assertEqual(first, [("192.168.1.60", "Pixel 8"), ("192.168.1.70", "MiTV-MFFU1")])
-            self.assertEqual(
-                adb_runtime.get_ignored_scan_ips(),
-                {"192.168.1.50", "192.168.1.60"},
-            )
-            self.assertEqual(
-                connect_calls,
-                ["192.168.1.50:5555", "192.168.1.60:5555", "192.168.1.70:5555"],
-            )
+        try:
+            with mock.patch.object(adb_runtime, "get_windows_scan_networks", return_value=networks), \
+                    mock.patch.object(adb_runtime, "build_probe_targets", return_value=list(all_targets)), \
+                    mock.patch.object(adb_runtime, "probe_tcp_targets", side_effect=fake_probe_tcp_targets), \
+                    mock.patch.object(adb_runtime, "ensure_adb_server", return_value=True), \
+                    mock.patch.object(adb_runtime, "adb_run", side_effect=fake_adb_run):
+                first = adb_runtime.scan_adb()
+                self.assertEqual(first, [("192.168.1.60", "Pixel 8"), ("192.168.1.70", "MiTV-MFFU1")])
+                self.assertEqual(
+                    adb_runtime.get_ignored_scan_ips(),
+                    {"192.168.1.50", "192.168.1.60"},
+                )
+                self.assertEqual(
+                    connect_calls,
+                    ["192.168.1.50:5555", "192.168.1.60:5555", "192.168.1.70:5555"],
+                )
 
-            connect_calls.clear()
-            connected_serials.clear()
-            second = adb_runtime.scan_adb()
-            self.assertEqual(second, [("192.168.1.70", "MiTV-MFFU1")])
-            self.assertEqual(probe_target_batches[-1], ["192.168.1.70"])
-            self.assertEqual(connect_calls, ["192.168.1.70:5555"])
+                connect_calls.clear()
+                connected_serials.clear()
+                second = adb_runtime.scan_adb()
+                self.assertEqual(second, [("192.168.1.70", "MiTV-MFFU1")])
+                self.assertEqual(probe_target_batches[-1], ["192.168.1.70"])
+                self.assertEqual(connect_calls, ["192.168.1.70:5555"])
 
+                adb_runtime.clear_ignored_scan_ips()
+                connect_calls.clear()
+                connected_serials.clear()
+                third = adb_runtime.scan_adb()
+                self.assertEqual(len(third), 2)
+                self.assertEqual(
+                    probe_target_batches[-1],
+                    ["192.168.1.50", "192.168.1.60", "192.168.1.70"],
+                )
+                self.assertEqual(
+                    connect_calls,
+                    ["192.168.1.50:5555", "192.168.1.60:5555", "192.168.1.70:5555"],
+                )
+        finally:
             adb_runtime.clear_ignored_scan_ips()
-            connect_calls.clear()
-            connected_serials.clear()
-            third = adb_runtime.scan_adb()
-            self.assertEqual(len(third), 2)
-            self.assertEqual(
-                probe_target_batches[-1],
-                ["192.168.1.50", "192.168.1.60", "192.168.1.70"],
-            )
-            self.assertEqual(
-                connect_calls,
-                ["192.168.1.50:5555", "192.168.1.60:5555", "192.168.1.70:5555"],
-            )
 
     def test_reconnect_disconnects_then_ensures_device_state(self):
         from mimonitor_toolbox import adb as adb_runtime
@@ -514,6 +517,393 @@ class ConnectByDeviceStateTests(unittest.TestCase):
         with mock.patch.object(client_fb, "shell", side_effect=fake_fail):
             self.assertFalse(client_fb.set_media_muted(True))
         self.assertEqual(cmds[-1], "input keyevent KEYCODE_VOLUME_MUTE")
+
+
+class AdbDaemonModeTests(unittest.TestCase):
+    """覆盖混合加速 (Daemon) 协议解析、批处理合批、PUT_DENIED 混合回退及降级逻辑。"""
+
+    def test_daemon_mode_defaults_and_switching_clears_batch_state(self):
+        from mimonitor_toolbox import adb as adb_runtime
+
+        client = adb_runtime.Adb("192.168.1.9")
+        self.assertEqual(client.connection_mode, "adb")
+        self.assertFalse(client.is_daemon_mode())
+
+        self.assertEqual(client.set_connection_mode("daemon"), "daemon")
+        self.assertTrue(client.is_daemon_mode())
+        client._batch_ops.append(("PUT", "brightness", "50"))
+        client._batch_read_cache["brightness"] = "50"
+        client._batch_jni_cache["g_video__freesync_switch"] = 3
+
+        self.assertEqual(client.set_connection_mode("unknown"), "adb")
+        self.assertFalse(client.is_daemon_mode())
+        self.assertEqual(client._batch_ops, [])
+        self.assertEqual(client._batch_read_cache, {})
+        self.assertEqual(client._batch_jni_cache, {})
+
+    def test_daemon_query_parses_settings_jni_flags_and_skips_errors(self):
+        from mimonitor_toolbox import adb as adb_runtime
+
+        client = adb_runtime.Adb("192.168.1.9")
+        self.assertIsNone(client.daemon_query(settings_keys=("brightness",)))
+
+        client.set_connection_mode("daemon")
+        payloads = []
+
+        def fake_req(payload, timeout=5.0):
+            payloads.append(payload)
+            return [
+                "OK",
+                "S brightness=65",
+                "S missing=__ERR__:null",
+                "J g_video__freesync_switch=3",
+                "J bad_int=notanumber",
+                "F volume=42",
+                "F muted=1",
+                "ELAPSED 14",
+            ]
+
+        with mock.patch.object(client, "ensure_daemon", return_value=True), \
+                mock.patch.object(client, "_daemon_socket_request", side_effect=fake_req):
+            snap = client.daemon_query(
+                settings_keys=("brightness", "missing"),
+                jni_keys=("g_video__freesync_switch", "bad_int", "bad;key"),
+                flags=("volume", "muted"),
+            )
+
+        self.assertEqual(len(payloads), 1)
+        self.assertNotIn("bad;key", payloads[0])
+        self.assertEqual(snap["settings"], {"brightness": "65"})
+        self.assertEqual(snap["jni"], {"g_video__freesync_switch": 3})
+        self.assertEqual(snap["flags"], {"volume": "42", "muted": "1"})
+        self.assertEqual(snap["elapsed_ms"], 14)
+
+    def test_batch_writes_coalesces_refresh_pq_and_hits_prefetch_cache(self):
+        from mimonitor_toolbox import adb as adb_runtime
+
+        client = adb_runtime.Adb("192.168.1.9")
+        client.set_connection_mode("daemon")
+        sent_batches = []
+        shell_calls = []
+
+        def fake_query(settings_keys=(), jni_keys=(), flags=(), check=False):
+            return {
+                "settings": {"brightness": "70"},
+                "jni": {"g_video__freesync_switch": 3},
+                "flags": {},
+                "elapsed_ms": 5,
+            }
+
+        def fake_batch(ops, check=False):
+            sent_batches.append(list(ops))
+            return True, None, [(idx, "OK", "") for idx in range(len(ops))]
+
+        with mock.patch.object(client, "daemon_query", side_effect=fake_query), \
+                mock.patch.object(client, "ensure_daemon", return_value=True), \
+                mock.patch.object(client, "daemon_batch", side_effect=fake_batch), \
+                mock.patch.object(client, "shell", side_effect=shell_calls.append):
+            with client.batch_writes(
+                prefetch_settings=("brightness",),
+                prefetch_jni=("g_video__freesync_switch",),
+            ):
+                self.assertEqual(client.get("brightness"), "70")
+                self.assertEqual(client.jni_get("g_video__freesync_switch"), "3")
+                client.put("brightness", 80)
+                client.refresh_pq()
+                client.jni_set("g_video__freesync_switch", 3)
+                client.refresh_pq()
+
+        self.assertEqual(shell_calls, [])
+        self.assertEqual(len(sent_batches), 1)
+        self.assertEqual(
+            sent_batches[0],
+            [
+                ("PUT", "brightness", "80"),
+                ("JNI_SET", "g_video__freesync_switch", 3, 3),
+                ("REFRESH_PQ",),
+            ],
+        )
+
+    def test_put_denied_triggers_ordered_hybrid_fallback(self):
+        from mimonitor_toolbox import adb as adb_runtime
+
+        client = adb_runtime.Adb("192.168.1.9")
+        client.set_connection_mode("daemon")
+        client._batch_ops = [
+            ("JNI_SET", "g_video__freesync_switch", "3", "3"),
+            ("PUT", "brightness", "75"),
+            ("PUT", "contrast", "55"),
+            ("REFRESH_PQ",),
+        ]
+        trace = []
+
+        def fake_batch(ops, check=False):
+            trace.append(("batch", list(ops)))
+            if any(op[0] == "PUT" for op in ops):
+                return False, 1, [(0, "OK", "")]
+            return True, None, [(idx, "OK", "") for idx in range(len(ops))]
+
+        def fake_shell(cmd, check=False):
+            trace.append(("shell", cmd))
+            return ""
+
+        with mock.patch.object(client, "ensure_daemon", return_value=True), \
+                mock.patch.object(client, "daemon_batch", side_effect=fake_batch), \
+                mock.patch.object(client, "shell", side_effect=fake_shell):
+            self.assertTrue(client.flush_batch())
+
+        self.assertFalse(client._daemon_put_supported)
+        self.assertEqual(trace[0][0], "batch")
+        self.assertEqual(trace[1][0], "shell")
+        self.assertIn("settings put global brightness 75", trace[1][1])
+        self.assertIn("settings put global contrast 55", trace[1][1])
+        self.assertEqual(trace[2], ("batch", [("REFRESH_PQ",)]))
+
+        # 后续批次直接跳过 Daemon PUT，按顺序切块混合下发
+        trace.clear()
+        client._batch_ops = [
+            ("PUT", "gamma", "2"),
+            ("JNI_SET", "g_video__dp_adaptive_sync", "1", "3"),
+        ]
+        with mock.patch.object(client, "ensure_daemon", return_value=True), \
+                mock.patch.object(client, "daemon_batch", side_effect=fake_batch), \
+                mock.patch.object(client, "shell", side_effect=fake_shell):
+            self.assertTrue(client.flush_batch())
+        self.assertEqual(trace[0][0], "shell")
+        self.assertIn("settings put global gamma 2", trace[0][1])
+        self.assertEqual(trace[1], ("batch", [("JNI_SET", "g_video__dp_adaptive_sync", "1", "3")]))
+
+    def test_ensure_daemon_failure_falls_back_to_adb_shell(self):
+        from mimonitor_toolbox import adb as adb_runtime
+
+        client = adb_runtime.Adb("192.168.1.9")
+        client.set_connection_mode("daemon")
+        shell_cmds = []
+
+        def fake_shell(cmd, check=False):
+            shell_cmds.append(cmd)
+            if cmd == "settings get global brightness":
+                return "50"
+            return ""
+
+        with mock.patch.object(client, "ensure_daemon", return_value=False), \
+                mock.patch.object(client, "shell", side_effect=fake_shell):
+            self.assertEqual(client.get("brightness"), "50")
+            client.put("brightness", 60)
+
+        self.assertEqual(
+            shell_cmds,
+            ["settings get global brightness", "settings put global brightness 60"],
+        )
+
+    def test_ensure_daemon_uses_ifs_encoded_app_process_and_parses_put_cap(self):
+        from mimonitor_toolbox import adb as adb_runtime
+
+        client = adb_runtime.Adb("192.168.1.9")
+        client.set_connection_mode("daemon")
+        launch_cmds = []
+        socket_calls = []
+
+        def fake_forward():
+            client._daemon_forward_port = 27891
+            client._daemon_ip = client.ip
+            return True
+
+        def fake_heal():
+            client._daemon_jar_healed_ip = client.ip
+
+        def fake_shell(cmd, check=False):
+            launch_cmds.append(cmd)
+            return ""
+
+        def fake_socket(payload, timeout=2.0):
+            socket_calls.append(payload)
+            if len(socket_calls) == 1:
+                return None
+            return ["OK MtkDirectTool v2.1 pid=123 uid=1000 put=0"]
+
+        with mock.patch.object(adb_runtime.time, "sleep"), \
+                mock.patch.object(client, "_setup_adb_forward", side_effect=fake_forward), \
+                mock.patch.object(client, "check_and_heal_jar", side_effect=fake_heal), \
+                mock.patch.object(client, "shell", side_effect=fake_shell), \
+                mock.patch.object(client, "_daemon_socket_request", side_effect=fake_socket):
+            ready = client.ensure_daemon()
+
+        self.assertTrue(ready)
+        self.assertTrue(client._daemon_ready)
+        self.assertIs(client._daemon_put_supported, False)
+        self.assertEqual(len(launch_cmds), 1)
+        launch_cmd = launch_cmds[0]
+        self.assertIn('s16 "sh -c eval\\${IFS}', launch_cmd)
+        self.assertIn(
+            "CLASSPATH=/data/data/mitv.service/cache/MtkDirectTool.jar"
+            "\\${IFS}/system/bin/app_process"
+            "\\${IFS}/data/data/mitv.service/cache"
+            "\\${IFS}MtkDirectTool\\${IFS}daemon\\${IFS}27891",
+            launch_cmd,
+        )
+        # eval 后的命令行体内不能包含未转义空格，否则 TvService Runtime.exec 会截断
+        eval_body = launch_cmd.split("eval", 1)[1]
+        self.assertNotIn(" ", eval_body)
+
+    def test_coalesced_mixed_chunks_packs_interleaved_puts_and_daemon_ops(self):
+        from mimonitor_toolbox import adb as adb_runtime
+
+        client = adb_runtime.Adb("192.168.1.9")
+        client.set_connection_mode("daemon")
+        client._daemon_put_supported = False
+        client._batch_ops = [
+            ("JNI_SET", "k1", "1", "3"),
+            ("PUT", "brightness", "70"),
+            ("JNI_SET", "k2", "2", "3"),
+            ("PUT", "contrast", "50"),
+            ("REFRESH_PQ",),
+            ("SLEEP", "200"),
+            ("PUT", "gamma", "1"),
+            ("VOL_SET", "20"),
+        ]
+        trace = []
+
+        def fake_shell(cmd, check=False):
+            trace.append(("shell", cmd))
+            return ""
+
+        def fake_batch(ops, check=False):
+            trace.append(("batch", list(ops)))
+            return True, None, [(idx, "OK", "") for idx in range(len(ops))]
+
+        with mock.patch.object(adb_runtime.time, "sleep") as sleep_mock, \
+                mock.patch.object(client, "ensure_daemon", return_value=True), \
+                mock.patch.object(client, "shell", side_effect=fake_shell), \
+                mock.patch.object(client, "daemon_batch", side_effect=fake_batch):
+            self.assertTrue(client.flush_batch())
+
+        self.assertEqual(trace[0][0], "shell")
+        self.assertIn("settings put global brightness 70 && settings put global contrast 50", trace[0][1])
+        self.assertEqual(
+            trace[1],
+            ("batch", [("JNI_SET", "k1", "1", "3"), ("JNI_SET", "k2", "2", "3"), ("REFRESH_PQ",)]),
+        )
+        sleep_mock.assert_called_once_with(0.2)
+        self.assertEqual(trace[2][0], "shell")
+        self.assertIn("settings put global gamma 1", trace[2][1])
+        self.assertEqual(trace[3], ("batch", [("VOL_SET", "20")]))
+
+    def test_ensure_daemon_rebuilds_dropped_forward_after_reconnect_same_ip(self):
+        from mimonitor_toolbox import adb as adb_runtime
+
+        client = adb_runtime.Adb("192.168.1.9")
+        client.set_connection_mode("daemon")
+        # 模拟断开重连同 IP 后：旧 forward 端口与 _daemon_jar_healed_ip 仍缓存，但远端隧道已断
+        client._daemon_ip = "192.168.1.9"
+        client._daemon_forward_port = 50001
+        client._daemon_jar_healed_ip = "192.168.1.9"
+        client._daemon_ready = True
+
+        forward_calls = []
+        launch_calls = []
+
+        def fake_forward():
+            forward_calls.append(True)
+            client._daemon_forward_port = 50002
+            client._daemon_ip = client.ip
+            return 50002
+
+        def fake_socket(payload, timeout=2.0):
+            # 旧端口 50001 不可达，重建到 50002 后远端常驻 Daemon 立即可响应
+            if client._daemon_forward_port == 50001:
+                return None
+            return ["OK MtkDirectTool v2.1 pid=777 uid=1000 put=0"]
+
+        with mock.patch.object(client, "_setup_adb_forward", side_effect=fake_forward), \
+                mock.patch.object(client, "_daemon_socket_request", side_effect=fake_socket), \
+                mock.patch.object(client, "shell", side_effect=lambda cmd, **_: launch_calls.append(cmd)):
+            ready = client.ensure_daemon()
+
+        self.assertTrue(ready)
+        self.assertEqual(len(forward_calls), 1)
+        self.assertEqual(client._daemon_forward_port, 50002)
+        self.assertEqual(launch_calls, [])
+
+    def test_ensure_daemon_cooldown_avoids_repeated_timeout_waits_until_reset(self):
+        from mimonitor_toolbox import adb as adb_runtime
+
+        client = adb_runtime.Adb("192.168.1.9")
+        client.set_connection_mode("daemon")
+        launch_calls = []
+
+        def fake_forward():
+            client._daemon_forward_port = 27891
+            client._daemon_ip = client.ip
+            return 27891
+
+        with mock.patch.object(adb_runtime.time, "sleep"), \
+                mock.patch.object(client, "_setup_adb_forward", side_effect=fake_forward), \
+                mock.patch.object(client, "check_and_heal_jar", side_effect=lambda: setattr(client, "_daemon_jar_healed_ip", client.ip) or True), \
+                mock.patch.object(client, "_daemon_socket_request", return_value=None), \
+                mock.patch.object(client, "shell", side_effect=lambda cmd, **_: launch_calls.append(cmd) or ""):
+            self.assertFalse(client.ensure_daemon())
+            self.assertEqual(len(launch_calls), 1)
+            # 冷却期内直接短路，不再重复执行 2.35s 握手
+            self.assertFalse(client.ensure_daemon())
+            self.assertEqual(len(launch_calls), 1)
+            # 重置模式或重连后清除冷却，允许再次尝试
+            client.set_connection_mode("daemon")
+            self.assertFalse(client.ensure_daemon())
+            self.assertEqual(len(launch_calls), 2)
+
+    def test_ensure_daemon_aborts_immediately_on_device_not_found(self):
+        from mimonitor_toolbox import adb as adb_runtime
+
+        client = adb_runtime.Adb("192.168.1.9")
+        client.set_connection_mode("daemon")
+
+        def fake_forward():
+            client._daemon_forward_port = 27892
+            client._daemon_ip = client.ip
+            return 27892
+
+        with mock.patch.object(adb_runtime.time, "sleep") as sleep_mock, \
+                mock.patch.object(client, "_setup_adb_forward", side_effect=fake_forward), \
+                mock.patch.object(client, "check_and_heal_jar", side_effect=lambda: setattr(client, "_daemon_jar_healed_ip", client.ip) or True), \
+                mock.patch.object(client, "_daemon_socket_request", return_value=None) as sock_mock, \
+                mock.patch.object(client, "shell", return_value="error: device '192.168.1.9:5555' not found"):
+            self.assertFalse(client.ensure_daemon())
+
+        sleep_mock.assert_not_called()
+        # 仅包含启动前的一次复用探测，启动返回断连后不得继续轮询 PING
+        self.assertEqual(sock_mock.call_count, 1)
+
+    def test_adb_run_disconnect_preempts_command_lock(self):
+        import threading
+        from mimonitor_toolbox import adb as adb_runtime
+
+        entered = threading.Event()
+        release = threading.Event()
+        done = threading.Event()
+        proc_mock = mock.Mock()
+        proc_mock.communicate.return_value = ("disconnected 192.168.1.9:5555", "")
+        proc_mock.returncode = 0
+
+        def hold_lock():
+            with adb_runtime._adb_command_lock:
+                entered.set()
+                release.wait(timeout=2.0)
+
+        holder = threading.Thread(target=hold_lock, daemon=True)
+        holder.start()
+        self.assertTrue(entered.wait(timeout=1.0))
+        try:
+            with mock.patch.object(adb_runtime.subprocess, "Popen", return_value=proc_mock):
+                worker = threading.Thread(
+                    target=lambda: (adb_runtime.adb_run(["disconnect", "192.168.1.9:5555"]), done.set()),
+                    daemon=True,
+                )
+                worker.start()
+                self.assertTrue(done.wait(timeout=1.0))
+        finally:
+            release.set()
+            holder.join(timeout=1.0)
 
 
 if __name__ == "__main__":

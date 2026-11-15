@@ -953,6 +953,49 @@ class PresetOptionsGroupTests(unittest.TestCase):
         self.assertFalse(any(c[0] == "put" and c[1] == "picture_mode" for c in adb.calls))
         self.assertFalse(any(c[0] == "set_media_volume" for c in adb.calls))
 
+    def test_apply_preset_wraps_in_batch_writes_when_daemon_mode_enabled(self):
+        from contextlib import contextmanager
+        from mimonitor_toolbox import presets
+
+        class DaemonFakeAdb(FakeAdb):
+            def __init__(self):
+                super().__init__(source="29")
+                self.batch_events = []
+
+            def is_daemon_mode(self):
+                return True
+
+            @contextmanager
+            def batch_writes(self, prefetch_settings=(), prefetch_jni=()):
+                self.batch_events.append(("enter", tuple(prefetch_settings), tuple(prefetch_jni)))
+                try:
+                    yield
+                finally:
+                    self.batch_events.append(("exit", len(self.calls)))
+
+        adb = DaemonFakeAdb()
+        result = presets.apply_preset(adb, full_values(freesync=1, mode_320=1))
+        self.assertEqual(result.failed, [])
+        self.assertEqual(len(adb.batch_events), 2)
+        self.assertEqual(adb.batch_events[0][0], "enter")
+        self.assertEqual(adb.batch_events[1][0], "exit")
+        self.assertGreater(adb.batch_events[1][1], 0)
+
+    def test_apply_preset_skips_batch_writes_in_adb_mode(self):
+        from mimonitor_toolbox import presets
+
+        class AdbOnlyFakeAdb(FakeAdb):
+            def is_daemon_mode(self):
+                return False
+
+            def batch_writes(self, *args, **kwargs):
+                raise AssertionError("兼容模式下不应调用 batch_writes")
+
+        adb = AdbOnlyFakeAdb(source="29")
+        result = presets.apply_preset(adb, full_values(freesync=0, mode_320=0))
+        self.assertEqual(result.failed, [])
+        self.assertGreater(len(adb.calls), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

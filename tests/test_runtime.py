@@ -427,6 +427,7 @@ class AdbRuntimeTests(unittest.TestCase):
         with mock.patch.object(adb_runtime, "get_windows_scan_networks", return_value=[object()]), \
                 mock.patch.object(adb_runtime, "build_probe_targets", return_value=[object()]), \
                 mock.patch.object(adb_runtime, "probe_tcp_targets", return_value=probe_results), \
+                mock.patch.object(adb_runtime, "get_ignored_scan_ips", return_value=set()), \
                 mock.patch.object(adb_runtime, "ensure_adb_server", return_value=True), \
                 mock.patch.object(adb_runtime, "adb_run", side_effect=fake_adb_run), \
                 mock.patch.object(adb_runtime, "adb_device_state", side_effect=lambda serial, timeout=3: states[serial]):
