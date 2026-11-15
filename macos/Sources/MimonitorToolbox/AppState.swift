@@ -387,7 +387,7 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func warmDaemonInBackground(request: UInt64, targetIp: String, reason: String) {
+    private func warmDaemonInBackground(request: Int, targetIp: String, reason: String) {
         let ready = (try? adb.ensureDaemon(check: false)) ?? false
         DispatchQueue.main.async { [weak self] in
             guard let self,
@@ -1725,7 +1725,7 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func refreshAfterEdidChange(request: UInt64? = nil) {
+    private func refreshAfterEdidChange(request: Int? = nil) {
         DispatchQueue.main.async {
             if let request, (!self.isConnected || !self.connectionIntent.isCurrent(request)) {
                 return
