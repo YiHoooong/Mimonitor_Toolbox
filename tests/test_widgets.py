@@ -777,6 +777,48 @@ class CurrentPresetBannerTests(unittest.TestCase):
         self.assertIsNotNone(layout.itemAt(layout.count() - 1).spacerItem(),
                              "右侧要有弹性项才会居中")
 
+    def test_show_banner_stacks_under_visible_preset_overlay(self):
+        from PyQt6.QtWidgets import QWidget
+        from mimonitor_toolbox.widgets import CurrentPresetBanner
+
+        host = QWidget()
+        host.resize(900, 600)
+        host.show()
+        self.addCleanup(host.deleteLater)
+        banner = CurrentPresetBanner(host)
+        self.addCleanup(banner.deleteLater)
+        overlay = QWidget(host)
+        overlay.setGeometry(host.rect())
+        overlay.show()
+        host._preset_overlay = overlay
+        banner.raise_()
+        banner.show_banner()
+
+        children = [w for w in host.children() if isinstance(w, QWidget)]
+        self.assertLess(children.index(banner), children.index(overlay))
+
+    def test_light_theme_dialogs_and_osd_shutdown(self):
+        from mimonitor_toolbox import widgets
+        from mimonitor_toolbox.widgets import (
+            CloseConfirmDialog,
+            InstallProgressDialog,
+            OsdHud,
+        )
+
+        with mock.patch.object(widgets, "isDarkTheme", return_value=False):
+            close_dlg = CloseConfirmDialog()
+            self.addCleanup(close_dlg.deleteLater)
+            install_dlg = InstallProgressDialog("app.apk")
+            self.addCleanup(install_dlg.deleteLater)
+            self.assertIn("#f9f9f9", close_dlg.findChild(widgets.QFrame, "BgFrame").styleSheet())
+            self.assertIn("#f9f9f9", install_dlg.findChild(widgets.QFrame, "InstallProgressFrame").styleSheet())
+
+        osd = OsdHud()
+        osd.show_hud("亮度", "50", countdown=5.0)
+        osd.shutdown()
+        self.assertFalse(osd.timer.isActive())
+        self.assertEqual(osd.anim.state(), widgets.QPropertyAnimation.State.Stopped)
+
 
 if __name__ == "__main__":
     unittest.main()

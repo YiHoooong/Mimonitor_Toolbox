@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 
 struct HomeView: View {
     @EnvironmentObject var state: AppState
+    @State private var showModeHelp = false
 
     var body: some View {
         ScrollView {
@@ -40,6 +41,44 @@ struct HomeView: View {
                         .frame(width: 220)
                         Text("连接状态:")
                         Text(state.statusText).fontWeight(.bold).foregroundColor(state.statusColor)
+                        Spacer()
+                    }
+                    HStack(spacing: 10) {
+                        Text("连接模式:")
+                        Picker("", selection: Binding(
+                            get: { state.connectionMode },
+                            set: { state.setConnectionMode($0) }
+                        )) {
+                            ForEach(ConnectionMode.allCases) { mode in
+                                Text(mode.label).tag(mode)
+                            }
+                        }
+                        .frame(width: 220)
+                        Button {
+                            showModeHelp.toggle()
+                        } label: {
+                            Image(systemName: "questionmark.circle")
+                        }
+                        .buttonStyle(.plain)
+                        .help("查看标准 ADB 与混合加速模式区别")
+                        .popover(isPresented: $showModeHelp) {
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text("连接模式说明").font(.headline)
+                                ForEach(ConnectionMode.allCases) { mode in
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(mode.label).font(.subheadline.bold())
+                                        Text(mode.descriptionText)
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
+                                }
+                            }
+                            .padding(14)
+                            .frame(width: 340)
+                        }
+                        Text(state.connectionMode == .daemon ? "当前启用 Daemon 通道加速（不可用时自动回退 ADB）" : "兼容性优先，逐条走标准 ADB")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
                         Spacer()
                     }
                 }

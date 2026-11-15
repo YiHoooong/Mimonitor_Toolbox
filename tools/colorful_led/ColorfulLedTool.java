@@ -6,12 +6,24 @@ public class ColorfulLedTool {
     private static final String BSP_IFACE = "vendor.mi.hardware.bspmserver@2.0::IBspMServer";
     private static final String CONFIG_IFACE = "vendor.mi.hardware.bspmserver@2.0::IVendorConfig";
 
+    private static void releaseQuietly(HwParcel parcel) {
+        if (parcel != null) {
+            try {
+                parcel.release();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
     private static IHwBinder getConfigBinder() throws Exception {
         IHwBinder bsp = HwBinder.getService(BSP_IFACE, "default");
+        if (bsp == null) {
+            throw new IllegalStateException("HwBinder.getService(" + BSP_IFACE + ") returned null");
+        }
         HwParcel req = new HwParcel();
         HwParcel reply = new HwParcel();
-        req.writeInterfaceToken(BSP_IFACE);
         try {
+            req.writeInterfaceToken(BSP_IFACE);
             bsp.transact(6, req, reply, 0);
             reply.verifySuccess();
             req.releaseTemporaryStorage();
@@ -22,7 +34,8 @@ public class ColorfulLedTool {
             }
             return config;
         } finally {
-            reply.release();
+            releaseQuietly(reply);
+            releaseQuietly(req);
         }
     }
 
@@ -30,16 +43,17 @@ public class ColorfulLedTool {
         IHwBinder config = getConfigBinder();
         HwParcel req = new HwParcel();
         HwParcel reply = new HwParcel();
-        req.writeInterfaceToken(CONFIG_IFACE);
-        req.writeInt32(mode);
-        req.writeInt32(color);
         try {
+            req.writeInterfaceToken(CONFIG_IFACE);
+            req.writeInt32(mode);
+            req.writeInt32(color);
             config.transact(2, req, reply, 0);
             reply.verifySuccess();
             req.releaseTemporaryStorage();
             return reply.readInt32();
         } finally {
-            reply.release();
+            releaseQuietly(reply);
+            releaseQuietly(req);
         }
     }
 
@@ -74,12 +88,13 @@ public class ColorfulLedTool {
         }
     }
 
-    public static void main(String[] args) throws Exception {
-        if (args.length < 1) {
-            System.out.println("Usage: ColorfulLedTool <off|ambient|cycle|lighting|solid|raw> ...");
-            return;
+    static int[] resolveModeAndColor(String[] args, int offset) {
+        if (args == null || offset >= args.length) {
+            throw new IllegalArgumentException("Usage: ColorfulLedTool <off|ambient|cycle|lighting|solid|raw> ...");
         }
-        String cmd = args[0];
+        String cmd = args[offset];
+        String arg1 = offset + 1 < args.length ? args[offset + 1] : null;
+        String arg2 = offset + 2 < args.length ? args[offset + 2] : null;
         int mode;
         int color;
         if ("off".equals(cmd)) {
@@ -93,17 +108,34 @@ public class ColorfulLedTool {
             color = 1;
         } else if ("lighting".equals(cmd)) {
             mode = 11;
-            color = lightingColor(parse(args.length > 1 ? args[1] : "9", 9), parse(args.length > 2 ? args[2] : "1", 1));
+            color = lightingColor(parse(arg1 != null ? arg1 : "9", 9), parse(arg2 != null ? arg2 : "1", 1));
         } else if ("solid".equals(cmd)) {
             mode = 1;
-            color = solidColor(parse(args.length > 1 ? args[1] : "9", 9), parse(args.length > 2 ? args[2] : "0", 0));
+            color = solidColor(parse(arg1 != null ? arg1 : "9", 9), parse(arg2 != null ? arg2 : "0", 0));
         } else if ("raw".equals(cmd)) {
-            mode = parse(args.length > 1 ? args[1] : "0", 0);
-            color = parse(args.length > 2 ? args[2] : "0", 0);
+            mode = parse(arg1 != null ? arg1 : "0", 0);
+            color = parse(arg2 != null ? arg2 : "0", 0);
         } else {
             throw new IllegalArgumentException("Unknown command: " + cmd);
         }
-        int ret = setColorfulLed(mode, color);
-        System.out.println("SetColorfulLed mode=" + mode + " color=" + color + " ret=" + ret);
+        return new int[]{mode, color};
+    }
+
+    public static void main(String[] args) throws Exception {
+        if (args.length < 1) {
+            System.err.println("Usage: ColorfulLedTool <off|ambient|cycle|lighting|solid|raw> ...");
+            System.exit(1);
+            return;
+        }
+        try {
+            int[] pair = resolveModeAndColor(args, 0);
+            int mode = pair[0];
+            int color = pair[1];
+            int ret = setColorfulLed(mode, color);
+            System.out.println("SetColorfulLed mode=" + mode + " color=" + color + " ret=" + ret);
+        } catch (IllegalArgumentException iae) {
+            System.err.println("ERROR: " + iae.getMessage());
+            System.exit(1);
+        }
     }
 }

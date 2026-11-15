@@ -501,5 +501,111 @@ class ScanBlockRuleTests(unittest.TestCase):
         self.assertEqual([item.interface_name for item in networks], ["USB 网卡"])
 
 
+class ScanOptimizationAndEdgeCaseTests(unittest.TestCase):
+    """Forced subnet/prefix handling, /31, metric priority truncation, ERROR_NO_DATA, worker shrink."""
+
+    def test_force_subnets_and_force_devices_preserve_large_prefix_without_clamp(self):
+        records = [
+            raw("192.168.16.10", index=1, name="VPN LAN", prefix=20, hardware=False),
+            raw("10.20.30.4", index=2, name="大物理网", prefix=20, hardware=True),
+        ]
+        forced_subnet_nets = select_scan_networks(
+            records[:1], force_subnets=["192.168.16.0/20"]
+        )
+        self.assertEqual(len(forced_subnet_nets), 1)
+        self.assertEqual(str(forced_subnet_nets[0].network), "192.168.16.0/20")
+
+        forced_dev_nets = select_scan_networks(
+            records[1:], force_devices=["name:大物理网"]
+        )
+        self.assertEqual(len(forced_dev_nets), 1)
+        self.assertEqual(str(forced_dev_nets[0].network), "10.20.16.0/20")
+
+    def test_prefix_31_is_accepted_and_probed(self):
+        record = raw("192.168.10.2", index=1, name="P2P", prefix=31)
+        networks = select_scan_networks([record])
+        self.assertEqual(len(networks), 1)
+        self.assertEqual(str(networks[0].network), "192.168.10.2/31")
+        targets = network_scan.build_probe_targets(networks)
+        self.assertEqual([str(t.ip) for t in targets], ["192.168.10.3"])
+        self.assertTrue(network_scan.is_scan_adapter(record))
+
+    def test_build_probe_targets_truncates_by_interface_metric_priority(self):
+        high_metric_large = network_scan.ScanNetwork(
+            interface_name="高跃点大网",
+            interface_index=1,
+            local_ip=ipaddress.IPv4Address("10.0.0.1"),
+            network=ipaddress.IPv4Network("10.0.0.0/16"),
+            original_network=ipaddress.IPv4Network("10.0.0.0/16"),
+            metric=500,
+        )
+        low_metric_small = network_scan.ScanNetwork(
+            interface_name="低跃点主网",
+            interface_index=2,
+            local_ip=ipaddress.IPv4Address("192.168.1.2"),
+            network=ipaddress.IPv4Network("192.168.1.0/24"),
+            original_network=ipaddress.IPv4Network("192.168.1.0/24"),
+            metric=5,
+        )
+        targets = network_scan.build_probe_targets([high_metric_large, low_metric_small])
+        self.assertEqual(len(targets), network_scan.MAX_TOTAL_PROBE_TARGETS)
+        target_ips = {str(t.ip) for t in targets}
+        self.assertIn("192.168.1.100", target_ips)
+
+    def test_is_scan_adapter_matches_rejection_rules(self):
+        filtered = raw("192.168.1.10", index=1, name="WFP", filter_interface=True)
+        self.assertFalse(network_scan.is_scan_adapter(filtered))
+        public_ip = raw("8.8.8.8", index=2, name="WAN")
+        self.assertFalse(network_scan.is_scan_adapter(public_ip))
+
+    def test_enumerate_windows_adapter_addresses_handles_error_no_data(self):
+        fake_iphlpapi = mock.Mock()
+        fake_iphlpapi.GetAdaptersAddresses.return_value = network_scan.ERROR_NO_DATA
+        with mock.patch.object(network_scan, "sys") as fake_sys, \
+                mock.patch.object(network_scan.ctypes, "WinDLL", return_value=fake_iphlpapi):
+            fake_sys.platform = "win32"
+            self.assertEqual(network_scan.enumerate_windows_adapter_addresses(), [])
+
+    def test_probe_tcp_targets_shrinks_retry_workers(self):
+        targets = [
+            network_scan.ProbeTarget(
+                ip=ipaddress.IPv4Address(f"192.168.1.{i}"),
+                source_ip=ipaddress.IPv4Address("192.168.1.2"),
+            )
+            for i in range(10, 12)
+        ]
+        pool_sizes = []
+        real_executor = network_scan.ThreadPoolExecutor
+
+        def recording_executor(*, max_workers, **_kwargs):
+            pool_sizes.append(max_workers)
+            return real_executor(max_workers=max_workers)
+
+        attempt = [0]
+
+        def fake_socket_factory(*_args, **_kwargs):
+            sock = mock.MagicMock()
+            sock.__enter__.return_value = sock
+
+            def fake_connect_ex(_addr):
+                attempt[0] += 1
+                return 1 if attempt[0] <= 2 else 0
+
+            sock.connect_ex.side_effect = fake_connect_ex
+            return sock
+
+        with mock.patch.object(network_scan, "ThreadPoolExecutor", side_effect=recording_executor), \
+                mock.patch.object(network_scan, "PROBE_RETRY_DELAY_SECONDS", 0.0):
+            results = network_scan.probe_tcp_targets(
+                targets,
+                threading.Event(),
+                max_workers=64,
+                socket_factory=fake_socket_factory,
+            )
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(pool_sizes, [2, 2])
+
+
 if __name__ == "__main__":
     unittest.main()

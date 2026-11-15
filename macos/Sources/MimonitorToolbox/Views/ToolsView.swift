@@ -3,7 +3,7 @@ import UniformTypeIdentifiers
 
 struct ToolsView: View {
     @EnvironmentObject var state: AppState
-    @AppStorage("theme") private var theme: String = "dark"
+    @AppStorage("theme") private var theme: String = "auto"
     @AppStorage("close_behavior") private var closeBehavior: String = "tray"
     @State private var autostart = Autostart.isEnabled()
     @State private var pending4K: Bool = false

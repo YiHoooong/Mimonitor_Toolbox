@@ -996,6 +996,108 @@ class PresetOptionsGroupTests(unittest.TestCase):
         self.assertEqual(result.failed, [])
         self.assertGreater(len(adb.calls), 0)
 
+    def test_game_feature_condition_checks_live_mode_when_picture_group_disabled(self):
+        from mimonitor_toolbox import presets
+
+        class LiveModeAdb(FakeAdb):
+            def __init__(self, live_mode):
+                super().__init__(source="23")
+                self.live_mode = live_mode
+
+            def get(self, key, check=False):
+                if key == "picture_mode":
+                    return str(self.live_mode)
+                return super().get(key, check=check)
+
+        vals = full_values(mode=10, front_sight_index=3, mt_game_scope=0)
+        opts = {"picture": False, "display_sync": False, "game_tools": True, "screen_light": False, "audio": False}
+
+        adb_std = LiveModeAdb(live_mode=14)
+        res_std = presets.apply_preset(adb_std, vals, options=opts)
+        self.assertIn("准星", [name for name, _ in res_std.skipped])
+        self.assertNotIn(("put", "front_sight_index", "3", True), adb_std.calls)
+        self.assertIn(("put", "mt_game_scope", "0", True), adb_std.calls)
+
+        adb_game = LiveModeAdb(live_mode=25)
+        res_game = presets.apply_preset(adb_game, vals, options=opts)
+        self.assertIn("准星", res_game.applied)
+        self.assertIn(("put", "front_sight_index", "3", True), adb_game.calls)
+
+    def test_screen_light_handles_empty_and_null_strings_and_mode320_missing_edid(self):
+        from mimonitor_toolbox import core, presets
+
+        adb = FakeAdb(source="23")
+        vals = full_values()
+        vals["atmosphere_light_switcher_pm2"] = 4
+        vals["atmosphere_light_illumination"] = ""
+        vals["atmosphere_light_color_temp"] = "null"
+        vals["atmosphere_light_color_value"] = "none"
+        res = presets.apply_preset(adb, vals)
+        self.assertIn("屏幕灯", res.applied)
+        self.assertIn(
+            ("put", "atmosphere_light_illumination",
+             str(core.SCREEN_LIGHT_DEFAULTS["atmosphere_light_illumination"]), True),
+            adb.calls,
+        )
+
+        # mode_320 without freesync and with missing HDMI EDID/FreeSync JNI must fail safely
+        class MissingEdidAdb(FakeAdb):
+            def jni_batch_get_or_single(self, keys, check=False):
+                return {}
+
+        vals_no_fs = full_values(mode_320=1)
+        vals_no_fs.pop("freesync")
+        adb_missing = MissingEdidAdb(source="23")
+        res_missing = presets.apply_preset(adb_missing, vals_no_fs)
+        self.assertIn("320Hz 竞技模式", [name for name, _ in res_missing.failed])
+        self.assertFalse(
+            any(c[0] == "jni_set" and c[1] == "g_fusion_picture__hdmi_edid_version" for c in adb_missing.calls)
+        )
+
+    def test_apply_preset_condition_exception_notifies_on_item_and_deduplicates_hdmi_reads(self):
+        from unittest import mock
+        from mimonitor_toolbox import presets
+
+        class CountingHdmiAdb(FakeAdb):
+            def __init__(self):
+                super().__init__(source="23")
+                self.source_gets = 0
+                self.edid_reads = 0
+
+            def get(self, key, check=False):
+                if key == "mitv.tvplayer.hdmi.last.source":
+                    self.source_gets += 1
+                return super().get(key, check=check)
+
+            def jni_batch_get_or_single(self, keys, check=False):
+                self.edid_reads += 1
+                return {
+                    "g_fusion_picture__hdmi_edid_version": "2",
+                    "g_video__freesync_switch": "0",
+                }
+
+        adb = CountingHdmiAdb()
+        res = presets.apply_preset(adb, full_values(freesync=1, mode_320=1))
+        self.assertEqual(res.failed, [])
+        self.assertEqual(adb.source_gets, 1)
+        self.assertEqual(adb.edid_reads, 1)
+
+        events = []
+        broken_item = presets.PictureItem("broken", "坏条件项", lambda *_a: None, lambda _v: 1 / 0)
+        with mock.patch.object(presets, "PICTURE_ITEMS", (broken_item,)):
+            res_err = presets.apply_preset(
+                FakeAdb(), full_values(),
+                on_item=lambda item, state, reason: events.append((item.id, state, reason)),
+            )
+        self.assertEqual(len(res_err.skipped), 1)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][0], "broken")
+        self.assertEqual(events[0][1], "skipped")
+        self.assertIn("条件判断失败", events[0][2])
+
+        for item in presets.PICTURE_ITEMS:
+            self.assertEqual(presets.item_option_group(item.id), item.group)
+
 
 if __name__ == "__main__":
     unittest.main()

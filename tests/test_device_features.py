@@ -1486,47 +1486,37 @@ class NetworkSignatureTests(unittest.TestCase):
 class GuardianHealthTests(unittest.TestCase):
     """issue #22：5G 下 adb_wifi_enabled 被固件置 0 时，5555 TCP ADB 仍正常，保活判定不应失败。"""
 
-    def _status(self, *, wifi="0", adb_enabled="1"):
+    def _status(self, *, wifi="0", adb_enabled="1", adbd="running", user_state="User 0: installed=true stopped=false"):
         accessibility = device_features.GUARDIAN_ACCESSIBILITY
-        package = device_features.GUARDIAN_PACKAGE
-        legacy = device_features.GUARDIAN_LEGACY_PACKAGE
-
-        def shell(cmd):
-            if "enabled_accessibility_services" in cmd:
-                return accessibility
-            if "dumpsys package" in cmd:
-                return "User 0: installed=true stopped=false"
-            if cmd.startswith(f"pm path {legacy}"):
-                return ""
-            if cmd.startswith(f"pm path {package}"):
-                return "package:/data/app/guardian.apk"
-            if "pidof" in cmd:
-                return "4321"
-            if "persist.appcontrol_w_mask" in cmd:
-                return "-134250497"
-            if "adb_wifi_enabled" in cmd:
-                return wifi
-            if "adb_enabled" in cmd:
-                return adb_enabled
-            if "service.adb.tcp.port" in cmd:
-                return "5555"
-            if "persist.adb.tcp.port" in cmd:
-                return "5555"
-            if "init.svc.adbd" in cmd:
-                return "running"
-            return ""
+        calls = []
+        payload = "\n".join([
+            f"__SERVICES__={accessibility}",
+            f"__USER_STATE__={user_state}",
+            "__LEGACY__=",
+            "__INSTALLED__=package:/data/app/guardian.apk",
+            "__PID__=4321",
+            "__MASK__=-134250497",
+            f"__ADB_EN__={adb_enabled}",
+            f"__ADB_WIFI__={wifi}",
+            "__SVC_PORT__=5555",
+            "__PER_PORT__=5555",
+            f"__ADBD__={adbd}",
+        ])
 
         class FakeAdb:
             def transaction(self):
                 return nullcontext()
 
             def shell(self, cmd):
-                return shell(cmd)
+                calls.append(cmd)
+                return payload
 
         class Host(device_features.DeviceFeaturesMixin):
             adb = FakeAdb()
 
-        return device_features.DeviceFeaturesMixin._read_guardian_status(Host())
+        status = device_features.DeviceFeaturesMixin._read_guardian_status(Host())
+        self.assertEqual(len(calls), 1)
+        return status
 
     def test_wifi_disabled_on_5g_still_healthy(self):
         status = self._status(wifi="0")
@@ -1536,6 +1526,27 @@ class GuardianHealthTests(unittest.TestCase):
     def test_adb_disabled_is_unhealthy(self):
         status = self._status(adb_enabled="0")
         self.assertFalse(status["ok"])
+
+    def test_apply_guardian_status_surfaces_adbd_and_stopped_reasons(self):
+        class FakeLabel:
+            text = ""
+            style = ""
+
+            def setText(self, text):
+                self.text = text
+
+            def setStyleSheet(self, style):
+                self.style = style
+
+        class Host(device_features.DeviceFeaturesMixin):
+            guardian_status_label = FakeLabel()
+
+        host = Host()
+        status = self._status(adbd="stopped", user_state="User 0: installed=true stopped=true")
+        self.assertFalse(status["ok"])
+        host._apply_guardian_status(status)
+        self.assertIn("adbd 未运行", host.guardian_status_label.text)
+        self.assertIn("保活应用被系统停止", host.guardian_status_label.text)
 
 
 class SoundOutputDevicePipelineTests(unittest.TestCase):
@@ -1604,11 +1615,11 @@ class SoundOutputDevicePipelineTests(unittest.TestCase):
                 ])
 
             def jni_batch_get_or_single(self, keys, check=False):
-                if keys == ["g_video__freesync_switch"]:
-                    return {"g_video__freesync_switch": "3"}
-                if keys == ["g_fusion_picture__hdmi_edid_version"]:
-                    return {"g_fusion_picture__hdmi_edid_version": "5"}
-                return {}
+                mapping = {
+                    "g_video__freesync_switch": "3",
+                    "g_fusion_picture__hdmi_edid_version": "5",
+                }
+                return {k: mapping[k] for k in keys if k in mapping}
 
             def get(self, key, check=False):
                 if key == core.SOUND_OUTPUT_SETTINGS_KEY:
@@ -2241,6 +2252,227 @@ class DaemonSnapshotTests(unittest.TestCase):
         self.assertEqual(host.status_signal.events[-1], ("未连接",))
         self.assertNotIn(("已连接: MiMonitor",), host.status_signal.events)
         self.assertFalse(host._connection_in_progress)
+
+    def test_keepalive_and_monitor_skip_during_active_resume_states(self):
+        from mimonitor_toolbox import adb as adb_runtime, device_features
+
+        for flag in (
+            "_resume_reconnect_active",
+            "_resume_waiting_for_network",
+            "_resume_discovery_checking",
+            "_resume_manual_selection_required",
+        ):
+            with self.subTest(flag=flag):
+                host = self._host(adb_runtime.Adb("192.168.1.9"))
+                setattr(host, flag, True)
+                host._adb_keepalive_checking = False
+                host._adb_server_monitor_checking = False
+                host._adb_server_retry_after = 0.0
+                host._adb_busy_until = 0.0
+                with mock.patch.object(device_features, "async_run") as async_mock:
+                    host._keep_adb_alive()
+                    host._monitor_adb_server()
+                async_mock.assert_not_called()
+
+    def test_connect_failure_clears_ip_and_disconnect_captures_was_resuming(self):
+        from mimonitor_toolbox import adb as adb_runtime, device_features
+
+        adb_obj = adb_runtime.Adb("192.168.1.55")
+        host = self._host(adb_obj)
+        host.ip_entry = mock.Mock()
+        host.ip_entry.text.return_value = "192.168.1.55"
+        host.status_signal = FakeSignal()
+        host.message_signal = FakeSignal()
+        host.adb_connected = False
+        host._connection_in_progress = False
+        host._connection_intent_generation = 0
+        host._scan_running = False
+        host._cancel_resume_reconnect = lambda: None
+        host._cancel_scan = lambda reason=None: False
+        host._stop_source_polling = lambda: None
+        host._invalidate_connection_intent = lambda: setattr(
+            host, "_connection_intent_generation", host._connection_intent_generation + 1
+        ) or host._connection_intent_generation
+
+        with mock.patch.object(device_features, "async_run", side_effect=lambda fn: fn()), \
+                mock.patch.object(device_features, "ensure_adb_server", return_value=True), \
+                mock.patch.object(adb_obj, "connect", return_value=False):
+            host.connect()
+
+        self.assertEqual(adb_obj.ip, "")
+        self.assertEqual(host.status_signal.events[-1], ("连接失败",))
+        self.assertFalse(host._connection_in_progress)
+
+        host2 = self._host(adb_runtime.Adb("192.168.1.55"))
+        host2.status_signal = FakeSignal()
+        host2.adb_connected = False
+        host2._resume_reconnect_active = True
+        host2._connection_in_progress = False
+        host2._connection_intent_generation = 0
+        host2._scan_running = False
+        host2._cancel_resume_reconnect = lambda: setattr(host2, "_resume_reconnect_active", False)
+        host2._stop_source_polling = lambda: None
+        host2._invalidate_connection_intent = lambda: 1
+        host2.disconnect_adb()
+        self.assertEqual(host2.status_signal.events, [("未连接",)])
+
+    def test_refresh_page_data_empty_shell_marks_unloaded_and_game_daemon_empty_jni_falls_back(self):
+        from mimonitor_toolbox import adb as adb_runtime, device_features
+
+        adb_empty = adb_runtime.Adb("192.168.1.9", connection_mode="adb")
+        host = self._host(adb_empty)
+        host.adb_connected = True
+        host._page_data_keys = {"picturePage": {"settings": ["picture_backlight"], "jni": []}}
+        host._page_loading = set()
+        host._page_loaded = set()
+        host.values_signal = FakeSignal()
+        host.jni_values_signal = FakeSignal()
+        host.page_refresh_finished = FakeSignal()
+        host._show_loading_overlay = lambda _p: None
+        host._hide_loading_overlay = lambda _p: None
+        host._mark_adb_busy = lambda _s: None
+        host._connection_intent_generation = 0
+
+        with mock.patch.object(device_features, "async_run", side_effect=lambda fn: fn()), \
+                mock.patch.object(adb_empty, "shell", return_value=""):
+            host._refresh_page_data("picturePage")
+
+        page_name, loaded = host.page_refresh_finished.events[0]
+        self.assertEqual(page_name, "picturePage")
+        self.assertFalse(loaded)
+
+        daemon_adb = adb_runtime.Adb("192.168.1.9", connection_mode="daemon")
+        host2 = self._host(daemon_adb)
+        host2.adb_connected = True
+        host2._page_data_keys = {
+            "gamePage": {
+                "settings": ["mitv.tvplayer.hdmi.last.source"],
+                "jni": [],
+                "jni_mode": True,
+            }
+        }
+        host2._page_loading = set()
+        host2._page_loaded = set()
+        host2.values_signal = FakeSignal()
+        host2.jni_values_signal = FakeSignal()
+        host2.page_refresh_finished = FakeSignal()
+        host2._show_loading_overlay = lambda _p: None
+        host2._hide_loading_overlay = lambda _p: None
+        host2._mark_adb_busy = lambda _s: None
+        host2._connection_intent_generation = 0
+
+        with mock.patch.object(device_features, "async_run", side_effect=lambda fn: fn()), \
+                mock.patch.object(
+                    daemon_adb,
+                    "daemon_query",
+                    return_value={"settings": {"mitv.tvplayer.hdmi.last.source": "HDMI1"}, "jni": {}},
+                ), \
+                mock.patch.object(
+                    daemon_adb,
+                    "shell",
+                    return_value="mitv.tvplayer.hdmi.last.source=HDMI1\n",
+                ), \
+                mock.patch.object(
+                    daemon_adb,
+                    "jni_batch_get_or_single",
+                    return_value={
+                        "g_fusion_picture__hdmi_edid_version": "4",
+                        "g_video__freesync_switch": "1",
+                    },
+                ) as jni_fallback:
+            host2._refresh_page_data("gamePage")
+
+        jni_fallback.assert_called_once()
+        self.assertTrue(host2.page_refresh_finished.events[0][1])
+        jv = host2.jni_values_signal.events[0][0]
+        self.assertEqual(jv.get("mode_320"), 0)
+        self.assertEqual(jv.get("freesync"), 0)
+
+    def test_guardian_deployment_releases_transaction_during_sleep_and_checks_reconnect_error(self):
+        from contextlib import contextmanager
+        from mimonitor_toolbox import adb as adb_runtime, device_features
+
+        adb_obj = adb_runtime.Adb("192.168.1.9")
+        tx_state = {"active": False, "sleep_in_tx": None}
+
+        @contextmanager
+        def tracking_tx():
+            tx_state["active"] = True
+            try:
+                yield
+            finally:
+                tx_state["active"] = False
+
+        adb_obj.transaction = tracking_tx
+        host = self._host(adb_obj)
+        host.adb_connected = True
+        host._connection_intent_generation = 0
+        host.check_connection = lambda: True
+        host.guardian_status_signal = FakeSignal()
+        host.message_signal = FakeSignal()
+        host._guardian_shell = lambda _cmd: ""
+        host._guardian_install_and_configure = lambda _path: None
+        host._read_guardian_status = lambda: {"ok": True}
+
+        def fake_sleep(_secs):
+            tx_state["sleep_in_tx"] = tx_state["active"]
+
+        with mock.patch.object(device_features, "get_guardian_apk_path", return_value="guardian.apk"), \
+                mock.patch.object(device_features.os.path, "exists", return_value=True), \
+                mock.patch.object(device_features, "async_run", side_effect=lambda fn: fn()), \
+                mock.patch.object(device_features.time, "sleep", side_effect=fake_sleep), \
+                mock.patch.object(adb_obj, "reconnect", return_value=(False, "offline")):
+            host._deploy_guardian()
+
+        self.assertIs(tx_state["sleep_in_tx"], False)
+        self.assertIn("error", host.guardian_status_signal.events[-1][0])
+
+    def test_install_apk_disconnect_cleanup_and_polled_backlight_dedup(self):
+        from PyQt6.QtWidgets import QLabel, QSlider
+        from mimonitor_toolbox import adb as adb_runtime, device_features
+
+        adb_obj = adb_runtime.Adb("192.168.1.9")
+        host = self._host(adb_obj)
+        host.adb_connected = True
+        host._connection_intent_generation = 0
+        host._apk_install_in_progress = False
+        host.apk_install_finished = FakeSignal()
+        host._install_dialog = None
+        host._show_install_progress_dialog = lambda _name: None
+
+        fake_install_dlg = mock.Mock()
+        host._show_message_box = mock.Mock()
+        with mock.patch.object(device_features.QFileDialog, "getOpenFileName", return_value=("demo.apk", "")), \
+                mock.patch.object(device_features, "InstallProgressDialog", return_value=fake_install_dlg), \
+                mock.patch.object(device_features, "async_run", side_effect=lambda fn: fn()), \
+                mock.patch.object(device_features, "adb_run", side_effect=lambda *a, **k: setattr(host, "adb_connected", False) or "Success"):
+            host._install_apk()
+
+        self.assertEqual(host.apk_install_finished.events[0][0], False)
+        host._on_apk_install_finished(*host.apk_install_finished.events[0])
+        self.assertFalse(host._apk_install_in_progress)
+        fake_install_dlg.accept.assert_called_once()
+        fake_install_dlg.deleteLater.assert_called_once()
+
+        slider = QSlider()
+        slider.setRange(0, 100)
+        label = QLabel()
+        timer = mock.Mock()
+        host2 = self._host(adb_obj)
+        host2.current_vals = {}
+        host2.sliders = {"backlight": (slider, label)}
+        host2._slider_debounce_timers = {"backlight": timer}
+        host2.state_buttons = {}
+        host2._highlight_mode = lambda _m: None
+        host2._active_picture_scene_mode = lambda: 0
+
+        host2._apply_polled_values({
+            "xiaomi_picture_backlight": 60,
+            "picture_backlight": 40,
+        })
+        timer.stop.assert_called_once()
+        self.assertEqual(slider.value(), 60)
+        self.assertEqual(label.text(), "60")
 
 
 if __name__ == "__main__":

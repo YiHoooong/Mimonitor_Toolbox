@@ -21,9 +21,9 @@ from PyQt6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QPlainTextEdit,
     QSizePolicy,
     QSystemTrayIcon,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -47,6 +47,7 @@ from qfluentwidgets import (
     TitleLabel,
     ToggleButton,
     TransparentToolButton,
+    isDarkTheme,
     setTheme,
 )
 
@@ -285,10 +286,10 @@ class PagesMixin:
         log_title = SubtitleLabel("实时操作日志", log_card)
         log_layout.addWidget(log_title)
 
-        self.log_widget = QTextEdit(log_card)
+        self.log_widget = QPlainTextEdit(log_card)
         self.log_widget.setReadOnly(True)
         self.log_widget.setStyleSheet("""
-            QTextEdit {
+            QPlainTextEdit {
                 background-color: #1e1e1e;
                 color: #00ff00;
                 font-family: 'Consolas', 'Courier New', monospace;
@@ -299,7 +300,7 @@ class PagesMixin:
         """)
         self.log_widget.setFixedHeight(220)
         self.log_widget.document().setMaximumBlockCount(500)
-        self.log_widget.append("[00:00:00] 系统就绪，等待连接...")
+        self.log_widget.appendPlainText("[00:00:00] 系统就绪，等待连接...")
         log_layout.addWidget(self.log_widget)
 
         log_btn_row = QHBoxLayout()
@@ -486,7 +487,8 @@ class PagesMixin:
         layout.addLayout(title_row)
 
         self.game_mode_hint_label = BodyLabel("当前画面模式未知；高亮值尚未确认是否生效。", container)
-        self.game_mode_hint_label.setStyleSheet("color: #f0b85a; font-size: 12px;")
+        hint_color = "#f0b85a" if isDarkTheme() else "#b06c00"
+        self.game_mode_hint_label.setStyleSheet(f"color: {hint_color}; font-size: 12px;")
         layout.addWidget(self.game_mode_hint_label)
 
         # Game Switches
@@ -690,6 +692,7 @@ class PagesMixin:
         volume_debounce.setInterval(300)
         volume_debounce.timeout.connect(lambda: self.set_media_volume(volume_slider.value()))
         volume_slider.valueChanged.connect(lambda _v: volume_debounce.start())
+        self._register_slider_debounce_timer("volume_music_speaker", volume_debounce)
 
         layout.addWidget(volume_card)
 
@@ -1036,12 +1039,23 @@ class PagesMixin:
         host = getattr(self, "auto_task_cards_host", None)
         if host is None:
             return
+        tasks = self._auto_task_list()
+        editing_id = getattr(self, "_auto_task_editing_id", None)
+        existing_cards = getattr(self, "_auto_task_cards", [])
+        if any(getattr(card, "_picking_time", False) for card in existing_cards) or any(
+            card.is_editing()
+            and card.task_id == editing_id
+            and any(task.get("id") == card.task_id for task in tasks)
+            for card in existing_cards
+        ):
+            self._auto_task_sync_deferred = True
+            return
+        self._auto_task_sync_deferred = False
         layout = self.auto_task_cards_layout
         self._clear_task_cards(layout)
         options = self._auto_task_preset_options()
-        editing_id = getattr(self, "_auto_task_editing_id", None)
         cards = []
-        for task in self._auto_task_list():
+        for task in tasks:
             card = AutoTaskCard(task.get("id"),
                                 self._task_time(task, "start", "08:00"),
                                 self._task_time(task, "end", "10:00"),
@@ -1143,39 +1157,40 @@ class PagesMixin:
             records = []
             self.log(f"读取网卡列表失败，只能手输网段：{error}")
         dialog = ScanSettingsDialog(records, load_settings(), self)
-        accepted = dialog.exec()
-        if accepted:
-            devices = dialog.force_devices()
-            blocked = dialog.block_devices()
-            subnets = dialog.force_subnets()
-            update_settings({
-                "scan_force_devices": devices,
-                "scan_block_devices": blocked,
-                "scan_force_subnets": subnets,
-            })
-            self.log(
-                f"扫描设置已保存：强制网卡={devices or '无'}，不扫描网卡={blocked or '无'}，"
-                f"强制网段={subnets or '无'}"
-            )
-        dialog.deleteLater()
+        try:
+            accepted = dialog.exec()
+            if accepted:
+                devices = dialog.force_devices()
+                blocked = dialog.block_devices()
+                subnets = dialog.force_subnets()
+                update_settings({
+                    "scan_force_devices": devices,
+                    "scan_block_devices": blocked,
+                    "scan_force_subnets": subnets,
+                })
+                self.log(
+                    f"扫描设置已保存：强制网卡={devices or '无'}，不扫描网卡={blocked or '无'}，"
+                    f"强制网段={subnets or '无'}"
+                )
+        finally:
+            dialog.deleteLater()
 
     def _preset_apply(self, preset_id):
         self.apply_preset_by_id(preset_id)
-        # 应用后状态落盘，卡片上的「已应用」和画面页提示都要跟着变
-        QTimer.singleShot(3000, self._preset_sync)
 
     def _preset_restore_baseline(self):
         if not self.has_preset_snapshot():
             self.message_signal.emit("warn", "没有可恢复的状态", "还没有套用过预设")
             return
         self.restore_preset_snapshot()
-        QTimer.singleShot(3000, self._preset_sync)
 
     def _ask_preset_name(self, title, value=""):
         """Fluent 风格的命名对话框；取消或空名返回 None。"""
         dialog = PresetNameDialog(title, value, self)
-        names = dialog.exec() and dialog.preset_name()
-        dialog.deleteLater()
+        try:
+            names = dialog.exec() and dialog.preset_name()
+        finally:
+            dialog.deleteLater()
         return names or None
 
     def _preset_add(self):
@@ -1198,9 +1213,11 @@ class PagesMixin:
             preset.get("options"),
             self,
         )
-        accepted = dialog.exec()
-        options = dialog.options() if accepted else None
-        dialog.deleteLater()
+        try:
+            accepted = dialog.exec()
+            options = dialog.options() if accepted else None
+        finally:
+            dialog.deleteLater()
         if not accepted:
             return
         self.update_preset_options(preset_id, options)
@@ -1226,8 +1243,10 @@ class PagesMixin:
         users = [t for t in self._auto_task_list() if t.get("preset_id") == preset_id]
         extra = f"\n\n有 {len(users)} 个自动任务在引用它，删除后那些任务不会再生效。" if users else ""
         box = MessageBox("删除预设", f"确定删除预设「{name}」吗？{extra}", self)
-        accepted = box.exec()
-        box.deleteLater()
+        try:
+            accepted = box.exec()
+        finally:
+            box.deleteLater()
         if not accepted:
             return
         presets = [p for p in self._preset_list() if p.get("id") != preset_id]
@@ -1277,6 +1296,10 @@ class PagesMixin:
         for card in getattr(self, "_auto_task_cards", []):
             if card.task_id != task_id:
                 card.action_button.setEnabled(not editing)
+        if not editing and getattr(self, "_auto_task_sync_deferred", False):
+            if getattr(self, "_auto_task_editing_id", None) == task_id:
+                self._auto_task_editing_id = None
+            self._auto_task_sync()
 
     def _auto_task_set_enabled(self, task_id, enabled):
         tasks = self._auto_task_list()
@@ -1291,12 +1314,16 @@ class PagesMixin:
         if task is None:
             return
         dialog = AutoTaskOptionsDialog(task.get("options"), self)
-        if not dialog.exec():
-            return
+        try:
+            if not dialog.exec():
+                return
+            options = dialog.options()
+        finally:
+            dialog.deleteLater()
         tasks = self._auto_task_list()
         for item in tasks:
             if item.get("id") == task_id:
-                item["options"] = dialog.options()
+                item["options"] = options
         update_settings({"auto_tasks": tasks})
         self.log("自动任务选项已保存")
 
@@ -1309,8 +1336,10 @@ class PagesMixin:
             f"确定删除 {task.get('start')}–{task.get('end')} 这个任务吗？",
             self,
         )
-        accepted = box.exec()
-        box.deleteLater()
+        try:
+            accepted = box.exec()
+        finally:
+            box.deleteLater()
         if not accepted:
             return
         update_settings({"auto_tasks": [t for t in self._auto_task_list()
@@ -1852,7 +1881,10 @@ class PagesMixin:
             ("response_time_cycle", "响应时间 循环切换"),
             ("memc_cycle", "运动补偿 循环切换"),
             ("freesync_toggle", "FreeSync 开关切换"),
-            ("input_source_cycle", "信号源 循环切换"),
+            ("input_source_hdmi1", "信号源 切至 HDMI 1"),
+            ("input_source_hdmi2", "信号源 切至 HDMI 2"),
+            ("input_source_dp", "信号源 切至 DP"),
+            ("input_source_usbc", "信号源 切至 USB-C"),
             ("sound_output_cycle", "声音输出 循环切换"),
             ("volume_mute_toggle", "静音 开关切换"),
         ]
@@ -2303,7 +2335,15 @@ class PagesMixin:
 
         _debounce_timer.timeout.connect(on_commit)
         slider.valueChanged.connect(lambda v: _debounce_timer.start())
+        self._register_slider_debounce_timer(name, _debounce_timer)
         parent_layout.addWidget(card)
+
+    def _register_slider_debounce_timer(self, name, timer):
+        timers = getattr(self, "_slider_debounce_timers", None)
+        if timers is None:
+            timers = {}
+            self._slider_debounce_timers = timers
+        timers[name] = timer
 
     def _add_color_gain_slider(self, parent_layout, title, name, settings_key, jni_key):
         card = SimpleCardWidget(self)
@@ -2336,6 +2376,7 @@ class PagesMixin:
 
         _debounce_timer.timeout.connect(on_commit)
         slider.valueChanged.connect(lambda _v: _debounce_timer.start())
+        self._register_slider_debounce_timer(name, _debounce_timer)
         parent_layout.addWidget(card)
         self.color_gain_cards.append(card)
         card.setVisible(False)
@@ -2367,6 +2408,7 @@ class PagesMixin:
         _debounce_timer.setInterval(300)
         _debounce_timer.timeout.connect(lambda: self._set_screen_light_illumination(slider.value()))
         slider.valueChanged.connect(lambda v: _debounce_timer.start())
+        self._register_slider_debounce_timer(name, _debounce_timer)
         parent_layout.addWidget(card)
 
     def _btn_section(self, parent_layout, title, buttons, state_key=None, hint=None):

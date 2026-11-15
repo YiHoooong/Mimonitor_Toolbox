@@ -57,6 +57,7 @@ fileprivate struct GuardianStatus {
         if adbd != "running" { parts.append("adbd 未运行") }
         if !accessibility { parts.append("无障碍未授权") }
         if stopped { parts.append("被停止") }
+        if mask != "-134250497" { parts.append("保活白名单 mask 异常") }
         if parts.isEmpty { return "状态：已安装（部分检查未通过）" }
         return "状态：⚠️ \(parts.joined(separator: " / "))"
     }
@@ -91,6 +92,7 @@ final class AppState: ObservableObject {
     var lastAutomaticTaskError = ""
 
     @Published var connectionStatus: ConnectionStatus = .disconnected
+    @Published var connectionMode: ConnectionMode = ConnectionMode.load()
     @Published var currentValues: [String: String] = [:]
     @Published var logLines: [String] = []
     /// 每写一行日志就自增。界面靠它触发自动滚动 ——
@@ -213,6 +215,11 @@ final class AppState: ObservableObject {
     private var logFileHandle: FileHandle?
     private var logFileURL: URL?
     private var sourcePollTimer: Timer?
+    private var hdrPollTimer: Timer?
+    private var volumePollTimer: Timer?
+    private var monitorTimer: Timer?
+    private var startupConnectWork: DispatchWorkItem?
+    private var terminateObserver: NSObjectProtocol?
     private var sourcePollArmed = false
     private var monitorChecking = false
     private var monitorTick = 0
@@ -234,8 +241,9 @@ final class AppState: ObservableObject {
     }()
 
     init() {
+        adb.connectionMode = connectionMode
         startPresetFeatures()
-        log("系统就绪，等待连接...")
+        log("系统就绪，等待连接...（连接模式：\(connectionMode.shortLabel)）")
         if FileManager.default.isExecutableFile(atPath: adb.adbPath) {
             log("ADB: \(adb.adbPath)")
         } else {
@@ -272,12 +280,12 @@ final class AppState: ObservableObject {
         updateHdrMemoryStatus()
         updateFreesyncMemoryStatus()
         updateCrosshairModeStatus()
-        Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+        hdrPollTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
             self?.pollHdrState()
         }
         // 音量缓存：显示器自带的遥控器/按键也能改音量，定期回读一次，
         // 避免下次按 Mac 音量键时从过期值起步。
-        Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+        volumePollTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
             self?.refreshMediaVolumeState()
         }
         // 配了快捷键却没授权：启动时引导一次。
@@ -292,38 +300,103 @@ final class AppState: ObservableObject {
         runConnectionTask { self.adb.warmUpServer() }
 
         // 启动后自动连接上次设备（原版延迟 900ms，等窗口先出来）
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
+        let startupWork = DispatchWorkItem { [weak self] in
             self?.autoConnectOnStartup()
         }
+        startupConnectWork = startupWork
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9, execute: startupWork)
         // adb 链路监控（对应原版 _monitor_adb_server）。
         // 每 6 秒一跳：未连接时每跳都重试（故障恢复要快），已连接时每 5 跳体检一次。
-        Timer.scheduledTimer(withTimeInterval: 6.0, repeats: true) { [weak self] _ in
+        monitorTimer = Timer.scheduledTimer(withTimeInterval: 6.0, repeats: true) { [weak self] _ in
             guard let self else { return }
             self.monitorTick &+= 1
             if self.isConnected && self.monitorTick % 5 != 0 { return }
             self.monitorAdbServer()
         }
         // 退出时清理独占 adb server（issue #25）：否则 fork-server 残留并持续重连离线设备。
-        NotificationCenter.default.addObserver(
+        terminateObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification, object: nil, queue: .main
         ) { [weak self] _ in
             self?.cleanupOnExit()
         }
     }
 
+    private func cancelAllPendingWorkAndTimers() {
+        startupConnectWork?.cancel()
+        startupConnectWork = nil
+        pendingRefreshWork?.cancel()
+        pendingRefreshWork = nil
+        for item in cyclePending.values { item.work.cancel() }
+        cyclePending.removeAll()
+        for item in adjustPendingWork.values { item.cancel() }
+        adjustPendingWork.removeAll()
+        adjustPendingValues.removeAll()
+        mediaBrightnessCommit?.cancel()
+        mediaBrightnessCommit = nil
+        mediaVolumeCommit?.cancel()
+        mediaVolumeCommit = nil
+        HUDWindow.shared.endCountdown()
+    }
+
     /// 退出清理：停自愈/定时器并 kill 本应用独占的 adb server。
     private func cleanupOnExit() {
         shuttingDown = true
         connectionIntent.disconnect()
+        cancelAllPendingWorkAndTimers()
         sourcePollTimer?.invalidate()
+        sourcePollTimer = nil
+        hdrPollTimer?.invalidate()
+        hdrPollTimer = nil
+        volumePollTimer?.invalidate()
+        volumePollTimer = nil
+        monitorTimer?.invalidate()
+        monitorTimer = nil
         presetTimer?.invalidate()
+        presetTimer = nil
+        try? logFileHandle?.close()
+        logFileHandle = nil
         adb.killServer()
     }
 
     deinit {
+        startupConnectWork?.cancel()
+        sourcePollTimer?.invalidate()
+        hdrPollTimer?.invalidate()
+        volumePollTimer?.invalidate()
+        monitorTimer?.invalidate()
         presetTimer?.invalidate()
         pendingPresetSave?.cancel()
         if let observer = presetWakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
+        if let observer = terminateObserver { NotificationCenter.default.removeObserver(observer) }
+    }
+
+    func setConnectionMode(_ mode: ConnectionMode) {
+        guard mode != connectionMode else { return }
+        connectionMode = mode
+        mode.save()
+        log("连接模式已切换为：\(mode.label)")
+
+        let connectedNow = isConnected
+        let request = connectionIntent.generation
+        let activeIp = adb.ip
+        runBackground {
+            _ = self.adb.setConnectionMode(mode)
+            if mode == .daemon && connectedNow && !activeIp.isEmpty {
+                self.warmDaemonInBackground(request: request, targetIp: activeIp, reason: "模式切换预热")
+            }
+        }
+    }
+
+    private func warmDaemonInBackground(request: UInt64, targetIp: String, reason: String) {
+        let ready = (try? adb.ensureDaemon(check: false)) ?? false
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  self.isConnected,
+                  self.connectionIntent.isCurrent(request),
+                  self.adb.ip == targetIp,
+                  self.connectionMode == .daemon else { return }
+            self.log(ready ? "混合加速 Daemon 就绪（\(reason)）" : "混合加速 Daemon 暂未就绪，已保留标准 ADB 回退")
+        }
     }
 
     /// 探活并自愈。
@@ -349,43 +422,97 @@ final class AppState: ObservableObject {
 
         let wasConnected = isConnected    // 在主线程序上读，避免后台 sync 主线程
         let request = connectionIntent.generation
-        if adb.ip.isEmpty { adb.ip = target }
+        let modeSnapshot = connectionMode
         monitorChecking = true
         runConnectionTask {
             defer { DispatchQueue.main.async { self.monitorChecking = false } }
 
-            if wasConnected && self.adb.deviceState() == "device" { return }   // 一切正常
+            let probe = self.adb.transaction { () -> (ok: Bool, state: String, model: String, daemonOk: Bool?) in
+                guard DispatchQueue.main.sync(execute: {
+                    self.connectionIntent.isCurrent(request) && self.connectionIntent.allowsAutomaticRecovery
+                }) else {
+                    return (false, "cancelled", "", nil)
+                }
 
-            if !self.adb.isServerAlive() { self.adb.restartServer() }
-            let (ok, state) = self.adb.ensureConnected()
-            let model = ok ? self.adb.getModel() : ""
+                if self.adb.ip.isEmpty { self.adb.ip = target }
+
+                if wasConnected && self.adb.deviceState() == "device" && self.adb.transportWorks() {
+                    var daemonOk: Bool?
+                    if modeSnapshot == .daemon {
+                        daemonOk = (try? self.adb.ensureDaemon(check: false)) ?? false
+                    }
+                    return (true, "device", "", daemonOk)
+                }
+
+                if !self.adb.isServerAlive() { self.adb.restartServer() }
+                let (ok, state) = self.adb.ensureConnected()
+                guard ok else {
+                    if !wasConnected && self.adb.ip == target {
+                        self.adb.ip = ""
+                    }
+                    return (false, state, "", nil)
+                }
+                self.adb.unignoreScanIP(target)
+                self.adb.ensureJars()
+                var daemonOk: Bool?
+                if modeSnapshot == .daemon {
+                    daemonOk = (try? self.adb.ensureDaemon(check: false)) ?? false
+                }
+                let model = self.adb.getModel()
+                return (true, state, model, daemonOk)
+            }
+
+            if probe.state == "cancelled" { return }
 
             DispatchQueue.main.async {
                 guard self.connectionIntent.isCurrent(request),
-                      self.connectionIntent.allowsAutomaticRecovery else { return }
-                if ok {
+                      self.connectionIntent.allowsAutomaticRecovery else {
+                    if !self.isConnected && self.adb.ip == target {
+                        self.adb.ip = ""
+                    }
+                    return
+                }
+                if probe.ok {
                     let ip = target
-                    self.connectionStatus = .connected(model.isEmpty ? ip : "\(model) · \(ip)")
+                    let detail = probe.model.isEmpty ? ip : "\(probe.model) · \(ip)"
+                    self.connectionStatus = .connected(detail)
                     if !wasConnected {
                         // 关键：恢复后必须把连接状态也置回已连接，
                         // 否则界面一直以为"未连接"，点任何页面都会被弹回主页。
-                        self.log("已连接: \(ip)")
+                        self.log("已连接: \(detail)")
                         self.loadedPages = []
+                        self.loadingPages = []
                         self.refreshPage("picture")
                         self.refreshPage("game")
+                        self.refreshPage("source")
                         self.pollHdrState(force: true)
                         self.checkAutomaticTasks()
+                        self.check4KState()
+                        self.checkGuardian()
+                        self.refreshMediaVolumeState()
                     } else {
                         self.log("ADB 链路已恢复")
                     }
+                    if probe.daemonOk == true && !wasConnected {
+                        self.log("混合加速 Daemon 已就绪")
+                    }
                     self.lastMonitorFailState = ""
                 } else if self.isConnected {
+                    self.adb.ip = ""
+                    self.adb.resetDaemonState(removeForward: false)
                     self.connectionStatus = .disconnected
-                    self.log("ADB 链路恢复失败: \(state)")
-                } else if self.lastMonitorFailState != state {
+                    self.currentValues = [:]
+                    self.loadedPages = []
+                    self.loadingPages = []
+                    self.activeSource = "未知"
+                    self.activeSoundOutput = "未知"
+                    self.hdrLastState = nil
+                    self.stopSourcePolling()
+                    self.log("ADB 链路恢复失败: \(probe.state)")
+                } else if self.lastMonitorFailState != probe.state {
                     // 未连接状态下只在失败原因变化时记一次，避免每 6 秒刷屏
-                    self.lastMonitorFailState = state
-                    self.log("自动重连失败: \(state)")
+                    self.lastMonitorFailState = probe.state
+                    self.log("自动重连失败: \(probe.state)")
                 }
             }
         }
@@ -521,15 +648,24 @@ final class AppState: ObservableObject {
             let (ok, state) = self.adb.ensureConnected()
 
             if ok {
+                guard DispatchQueue.main.sync(execute: { self.connectionIntent.isCurrent(request) }) else { return }
                 self.adb.unignoreScanIP(ip)
                 // 连接后先确保 JNI 依赖的 jar 已部署到设备（原版 check_and_heal_jar）
                 self.adb.ensureJars()
+                var daemonReady = false
+                if self.adb.isDaemonMode {
+                    daemonReady = (try? self.adb.ensureDaemon(check: false)) ?? false
+                }
+                guard DispatchQueue.main.sync(execute: { self.connectionIntent.isCurrent(request) }) else { return }
                 let model = self.adb.getModel()
                 let detail = model.isEmpty ? ip : "\(model) · \(ip)"
                 DispatchQueue.main.async {
                     guard self.connectionIntent.isCurrent(request) else { return }
                     self.connectionStatus = .connected(detail)
                     self.log(isAuto ? "启动自动连接成功: \(detail)" : "已连接: \(detail)")
+                    if self.connectionMode == .daemon {
+                        self.log(daemonReady ? "混合加速 Daemon 已就绪" : "混合加速 Daemon 预热未就绪，已保留标准 ADB 回退")
+                    }
                     self.loadedPages = []
                     self.loadingPages = []
                     self.activeSource = "未知"
@@ -546,7 +682,7 @@ final class AppState: ObservableObject {
                         self.scannedDevices.insert(ip, at: 0)
                         self.selectedDevice = ip
                     }
-                    // 连接后预刷画面、游戏与信号源（信号源页只读 settings，约 80ms，确保菜单栏和快捷键同步）
+                    // 连接后预刷画面、游戏与信号源（Daemon 模式下仅毫秒级；确保菜单栏和快捷键同步）
                     self.refreshPage("picture")
                     self.refreshPage("game")
                     self.refreshPage("source")
@@ -560,6 +696,9 @@ final class AppState: ObservableObject {
             } else {
                 DispatchQueue.main.async {
                     guard self.connectionIntent.isCurrent(request) else { return }
+                    if self.adb.ip == ip {
+                        self.adb.ip = ""
+                    }
                     self.connectionStatus = .disconnected
                     if isAuto {
                         self.log("启动自动连接失败: \(state)，开始扫描内网")
@@ -596,10 +735,15 @@ final class AppState: ObservableObject {
     func disconnectAdb() {
         pendingPresetSave?.cancel()
         pendingPresetSave = nil
+        cancelAllPendingWorkAndTimers()
+        for page in Self.refreshablePages {
+            _ = pageRefreshIntent.begin(page)
+        }
         // Keep dirty identity; reconnecting this same display can still save the edit safely.
         let ip = adb.ip
         connectionIntent.disconnect()
         adb.ip = ""
+        adb.resetDaemonState(removeForward: false)
         connectionStatus = .disconnected
         currentValues = [:]
         loadedPages = []
@@ -610,6 +754,10 @@ final class AppState: ObservableObject {
         mediaVolumeHardware = nil
         mediaVolumeMuted = nil
         mediaVolumeNeedsUnmute = false
+        mediaMuteToggleInFlight = false
+        memcPrompt = nil
+        guardianMigrationPrompt = false
+        crosshairLastMode = nil
         hdrLastState = nil
         stopSourcePolling()
         if !ip.isEmpty {
@@ -787,10 +935,9 @@ final class AppState: ObservableObject {
         guard isConnected else { return }
         guard !isPresetBusy else { return }
         guard Self.refreshablePages.contains(page) else { return }
-        guard !loadedPages.contains(page) else { return }
+        guard !loadedPages.contains(page), !loadingPages.contains(page) else { return }
         let connectionRequest = connectionIntent.generation
         let pageRequest = pageRefreshIntent.begin(page)
-        loadedPages.insert(page)
         loadingPages.insert(page)
 
         let settingsKeys: [String]
@@ -804,38 +951,84 @@ final class AppState: ObservableObject {
         }
 
         runBackground {
-            // ── 第一阶段：settings（约 0.1s）──────────────────────────
+            // ── Hybrid Daemon 快速通道：1 次 QUERY 合并 settings + jni + flags ──
+            var daemonQueryUsed = false
             var settingsVals: [String: String] = [:]
-            if !settingsKeys.isEmpty {
-                settingsVals = self.adb.settingsGetBatch(settingsKeys)
-                if let rawSound = settingsVals[RegisterMap.soundOutputKey],
-                   let normalizedSound = RegisterMap.normalizeSoundOutput(rawSound) {
-                    settingsVals[RegisterMap.soundOutputKey] = String(normalizedSound)
+            var jniVals: [String: String] = [:]
+            var refreshedVolume: Int?
+            var refreshedMuted: Bool?
+
+            if self.adb.isDaemonMode {
+                var queryJni = jniKeys
+                if page == "game" {
+                    queryJni += [
+                        "g_fusion_picture__dp_edid_version",
+                        "g_video__dp_adaptive_sync",
+                        "g_fusion_picture__hdmi_edid_version",
+                        "g_video__freesync_switch",
+                    ]
                 }
-                if page == "picture" {
-                    let phase1Mode = MemcSupport.parseInt(settingsVals["picture_mode"])
-                    if MemcSupport.isGameMode(phase1Mode),
-                       let gameMemc = MemcSupport.parseInt(settingsVals[MemcSupport.gameSettingKey]) {
-                        settingsVals[MemcSupport.primarySettingKey] = String(gameMemc)
+                let queryFlags = page == "source" ? ["volume", "muted"] : []
+                if let q = try? self.adb.daemonQuery(
+                    settingsKeys: settingsKeys,
+                    jniKeys: queryJni,
+                    flags: queryFlags
+                ) {
+                    daemonQueryUsed = true
+                    for k in settingsKeys {
+                        if let v = q.settings[k], !v.isEmpty, v != "null", v != "N/A" {
+                            settingsVals[k] = v
+                        }
+                    }
+                    for k in queryJni {
+                        if let v = q.jni[k] {
+                            jniVals[k] = String(v)
+                        }
+                    }
+                    if page == "source" {
+                        if let rawVol = q.flags["volume"], let v = Int(rawVol), (0...100).contains(v) {
+                            refreshedVolume = v
+                            settingsVals["volume_music_speaker"] = String(v)
+                        }
+                        if let rawMuted = q.flags["muted"] {
+                            refreshedMuted = (rawMuted == "1" || rawMuted.lowercased() == "true")
+                        }
                     }
                 }
             }
-            var refreshedVolume: Int?
-            var refreshedMuted: Bool?
-            if page == "source" {
-                refreshedVolume = self.adb.mediaVolume()
-                refreshedMuted = self.adb.mediaMuted()
-                if let vol = refreshedVolume {
-                    settingsVals["volume_music_speaker"] = String(vol)
+
+            if !daemonQueryUsed {
+                // ── 标准 ADB 第一阶段：settings（约 0.1s）──────────────────
+                if !settingsKeys.isEmpty {
+                    settingsVals = self.adb.settingsGetBatch(settingsKeys)
+                }
+                if page == "source" {
+                    refreshedVolume = self.adb.mediaVolume()
+                    refreshedMuted = self.adb.mediaMuted()
+                    if let vol = refreshedVolume {
+                        settingsVals["volume_music_speaker"] = String(vol)
+                    }
                 }
             }
-            if !settingsVals.isEmpty {
+
+            if let rawSound = settingsVals[RegisterMap.soundOutputKey],
+               let normalizedSound = RegisterMap.normalizeSoundOutput(rawSound) {
+                settingsVals[RegisterMap.soundOutputKey] = String(normalizedSound)
+            }
+            if page == "picture" {
+                let phase1Mode = MemcSupport.parseInt(settingsVals["picture_mode"])
+                if MemcSupport.isGameMode(phase1Mode),
+                   let gameMemc = MemcSupport.parseInt(settingsVals[MemcSupport.gameSettingKey]) {
+                    settingsVals[MemcSupport.primarySettingKey] = String(gameMemc)
+                }
+            }
+
+            if !daemonQueryUsed && !settingsVals.isEmpty {
                 DispatchQueue.main.async {
                     guard self.isConnected,
                           self.connectionIntent.isCurrent(connectionRequest),
                           self.pageRefreshIntent.isCurrent(page, pageRequest) else { return }
                     self.mergeValues(settingsVals)
-                    // 首屏数据到手就撤遮罩，不必等慢一档的 JNI
                     self.loadingPages.remove(page)
                     if let t0 = self.pageAppearTimes[page] {
                         let ms = Int(Date().timeIntervalSince(t0) * 1000)
@@ -844,10 +1037,8 @@ final class AppState: ObservableObject {
                 }
             }
 
-            // ── 第二阶段：JNI 回读（约 0.9s，瓶颈在设备端启动 app_process）──
-            // 慢，所以单独一步：先把上面拿到的值显示出来，这一批到了再静默修正。
-            var jniVals: [String: String] = [:]
-            if !jniKeys.isEmpty {
+            // ── 第二阶段：JNI 回读（标准模式单独走 app_process；Daemon 模式已在上面拿到）──
+            if !daemonQueryUsed && !jniKeys.isEmpty {
                 jniVals = self.adb.jniBatchGet(keys: jniKeys)
             }
 
@@ -855,22 +1046,38 @@ final class AppState: ObservableObject {
             for (k, v) in jniVals { merged[k] = v }
             self.applyJniOverrides(&merged)
             if page == "game" {
-                self.applyGameJniMode(&merged)
+                if daemonQueryUsed {
+                    Self.deriveGameJniMode(&merged, from: jniVals)
+                } else {
+                    self.applyGameJniMode(&merged)
+                }
             }
 
-            // 只把「与 settings 不同」的键挑出来作为修正量
             var corrections: [String: String] = [:]
-            for (k, v) in merged where settingsVals[k] != v {
-                corrections[k] = v
+            if daemonQueryUsed {
+                corrections = merged
+            } else {
+                for (k, v) in merged where settingsVals[k] != v {
+                    corrections[k] = v
+                }
             }
+
+            let readSucceeded = !merged.isEmpty || refreshedVolume != nil || refreshedMuted != nil
 
             DispatchQueue.main.async {
+                defer {
+                    if self.pageRefreshIntent.isCurrent(page, pageRequest) {
+                        self.loadingPages.remove(page)
+                    }
+                }
                 guard self.isConnected,
                       self.connectionIntent.isCurrent(connectionRequest),
                       self.pageRefreshIntent.isCurrent(page, pageRequest) else { return }
+                if readSucceeded {
+                    self.loadedPages.insert(page)
+                }
                 if !corrections.isEmpty { self.mergeValues(corrections) }
 
-                // 拿到新鲜的 picture_mode + front_sight_index 后按模式纠正准星
                 if page == "picture" || page == "game" {
                     self.reconcileCrosshairModeState()
                 }
@@ -895,15 +1102,29 @@ final class AppState: ObservableObject {
                         self.mediaVolumeMuted = muted
                     }
                 }
-                self.loadingPages.remove(page)
                 if let t0 = self.pageAppearTimes[page] {
                     let ms = Int(Date().timeIntervalSince(t0) * 1000)
                     self.pageAppearTimes[page] = nil
-                    self.log("已刷新 \(page) 页面数据（合计 \(ms)ms）")
+                    self.log("已刷新 \(page) 页面数据（合计 \(ms)ms\(daemonQueryUsed ? " · Daemon" : "")）")
                 } else {
-                    self.log("已刷新 \(page) 页面数据")
+                    self.log("已刷新 \(page) 页面数据\(daemonQueryUsed ? "（Daemon）" : "")")
                 }
             }
+        }
+    }
+
+    private static func deriveGameJniMode(_ values: inout [String: String], from jni: [String: String]) {
+        let src = Int(values["mitv.tvplayer.hdmi.last.source"] ?? "") ?? -1
+        if src == 29 || src == 30 {
+            values["mode_320"] = (Int(jni["g_fusion_picture__dp_edid_version"] ?? "") == 3) ? "1" : "0"
+            values["freesync"] = (Int(jni["g_video__dp_adaptive_sync"] ?? "") == 1) ? "1" : "0"
+        } else {
+            let flags = PicturePresetPlan.parseHdmiEdidFlags(
+                edidRaw: jni["g_fusion_picture__hdmi_edid_version"],
+                freesyncRaw: jni["g_video__freesync_switch"]
+            )
+            values["mode_320"] = flags.mode320 ? "1" : "0"
+            values["freesync"] = flags.freesync ? "1" : "0"
         }
     }
 
@@ -944,6 +1165,7 @@ final class AppState: ObservableObject {
     func setMode(_ value: Int) {
         guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
         guard isConnected else { return log("未连接") }
+        let request = connectionIntent.generation
         let name = RegisterMap.modeNames[value] ?? "\(value)"
         currentValues["picture_mode"] = String(value)
         log("模式: \(name)")
@@ -951,6 +1173,7 @@ final class AppState: ObservableObject {
         runPictureChange(delay: 1.5) {
             self.adb.settingsPut("picture_mode", String(value))
             DispatchQueue.main.async {
+                guard self.isConnected, self.connectionIntent.isCurrent(request) else { return }
                 self.scheduleCoalescedRefresh(delay: 1.2, pages: ["picture"])
             }
         }
@@ -961,11 +1184,15 @@ final class AppState: ObservableObject {
         guard isConnected else { return log("未连接") }
         let mode = intValue("picture_mode", default: -1)
         guard let name = RegisterMap.modeNames[mode] else { log("无法获取当前模式"); return }
+        let request = connectionIntent.generation
         log("恢复 \(name) 模式默认设置...")
         runPictureChange(delay: 3.2) {
-            self.adb.jniSet(key: "g_fusion_picture__pic_reset_def_bypicmode", value: "0")
-            self.adb.refreshPq()
+            try? self.adb.batchWrites {
+                self.adb.jniSet(key: "g_fusion_picture__pic_reset_def_bypicmode", value: "0")
+                self.adb.refreshPq()
+            }
             DispatchQueue.main.async {
+                guard self.isConnected, self.connectionIntent.isCurrent(request) else { return }
                 self.scheduleCoalescedRefresh(delay: 3, pages: ["picture"])
             }
         }
@@ -999,11 +1226,13 @@ final class AppState: ObservableObject {
                 self.adb.jniRamp(key: jniKey, from: rampFrom, to: value,
                                  settingsKeys: settingsKeys, step: step)
             } else {
-                if let jniKey {
-                    self.adb.jniSet(key: jniKey, value: String(value))
-                    self.adb.refreshPq()
+                try? self.adb.batchWrites {
+                    if let jniKey {
+                        self.adb.jniSet(key: jniKey, value: String(value))
+                        self.adb.refreshPq()
+                    }
+                    self.adb.settingsPutBatch(settingsKeys.map { ($0, String(value)) })
                 }
-                self.adb.settingsPutBatch(settingsKeys.map { ($0, String(value)) })
             }
         }
     }
@@ -1016,9 +1245,11 @@ final class AppState: ObservableObject {
         currentValues["picture_color_temperature"] = String(sv)
         log("色温: \(names[sv] ?? "\(sv)")")
         runPictureChange {
-            self.adb.jniSet(key: "g_video__clr_temp", value: String(jv))
-            self.adb.settingsPut("picture_color_temperature", String(sv))
-            self.adb.refreshPq()
+            try? self.adb.batchWrites {
+                self.adb.jniSet(key: "g_video__clr_temp", value: String(jv))
+                self.adb.settingsPut("picture_color_temperature", String(sv))
+                self.adb.refreshPq()
+            }
         }
     }
 
@@ -1040,13 +1271,15 @@ final class AppState: ObservableObject {
         log("\(title): \(value)")
 
         runPictureChange {
-            self.adb.jniSet(key: "g_video__clr_temp", value: String(RegisterMap.colorTempToMtk[3] ?? 0))
-            self.adb.settingsPut("picture_color_temperature", "3")
-            self.adb.setColorGains(red: String(red), green: String(green), blue: String(blue))
-            self.adb.settingsPut("picture_red_gain", String(red))
-            self.adb.settingsPut("picture_green_gain", String(green))
-            self.adb.settingsPut("picture_blue_gain", String(blue))
-            self.adb.refreshPq()
+            try? self.adb.batchWrites {
+                self.adb.jniSet(key: "g_video__clr_temp", value: String(RegisterMap.colorTempToMtk[3] ?? 0))
+                self.adb.settingsPut("picture_color_temperature", "3")
+                self.adb.setColorGains(red: String(red), green: String(green), blue: String(blue))
+                self.adb.settingsPut("picture_red_gain", String(red))
+                self.adb.settingsPut("picture_green_gain", String(green))
+                self.adb.settingsPut("picture_blue_gain", String(blue))
+                self.adb.refreshPq()
+            }
         }
     }
 
@@ -1061,10 +1294,12 @@ final class AppState: ObservableObject {
             saveLocalDimmingMemory(m)
         }
         runPictureChange {
-            self.adb.jniSet(key: "g_video__vid_local_dimming", value: String(value))
-            self.adb.settingsPut("picture_local_dimming", String(value))
-            self.adb.settingsPut("tv_picture_video_local_dimming", String(value))
-            self.adb.refreshPq()
+            try? self.adb.batchWrites {
+                self.adb.jniSet(key: "g_video__vid_local_dimming", value: String(value))
+                self.adb.settingsPut("picture_local_dimming", String(value))
+                self.adb.settingsPut("tv_picture_video_local_dimming", String(value))
+                self.adb.refreshPq()
+            }
         }
     }
 
@@ -1091,11 +1326,13 @@ final class AppState: ObservableObject {
         currentValues["tv_picture_light_sensor"] = String(value)
         log("自动调整亮度: \(on ? "开" : "关")")
         runPictureChange {
-            // settings put 必须由 adb shell 执行（shell 持有 WRITE_SECURE_SETTINGS）；
-            // 塞进 service call TvService 会被 tvservice 的 uid 静默拒绝 —— 所以这两条
-            // 是两次独立调用，不要"优化"成一条 TvService 命令。
-            self.adb.jniSet(key: "g_video__light_sensor_switch", value: String(value), upd: 1)
-            self.adb.settingsPut("tv_picture_light_sensor", String(value))
+            try? self.adb.batchWrites {
+                // settings put 必须由 adb shell 执行（shell 持有 WRITE_SECURE_SETTINGS）；
+                // 塞进 service call TvService 会被 tvservice 的 uid 静默拒绝 ——
+                // Daemon 模式下也会由 putSupported 检查自动走批量 ADB 回退。
+                self.adb.jniSet(key: "g_video__light_sensor_switch", value: String(value), upd: 1)
+                self.adb.settingsPut("tv_picture_light_sensor", String(value))
+            }
         }
     }
 
@@ -1107,10 +1344,12 @@ final class AppState: ObservableObject {
         currentValues["settings_display_hdr_color_tone"] = String(uiValue)
         log("HDR 色调映射: \(names[uiValue] ?? "\(uiValue)")")
         runPictureChange {
-            self.adb.hdrToneMapping(String(mtk))
-            self.adb.settingsPut("picture_hdr_tone_mapping", String(mtk))
-            self.adb.settingsPut("settings_display_hdr_color_tone", String(uiValue))
-            self.adb.refreshPq()
+            try? self.adb.batchWrites {
+                self.adb.hdrToneMapping(String(mtk))
+                self.adb.settingsPut("picture_hdr_tone_mapping", String(mtk))
+                self.adb.settingsPut("settings_display_hdr_color_tone", String(uiValue))
+                self.adb.refreshPq()
+            }
         }
     }
 
@@ -1120,9 +1359,11 @@ final class AppState: ObservableObject {
         currentValues["picture_dynamic_definition"] = String(value)
         log("动态清晰度: \(["关", "低", "中", "高"][value])")
         runPictureChange {
-            self.adb.jniSet(key: "g_video__vid_insert_black", value: String(value))
-            self.adb.settingsPut("picture_dynamic_definition", String(value))
-            self.adb.refreshPq()
+            try? self.adb.batchWrites {
+                self.adb.jniSet(key: "g_video__vid_insert_black", value: String(value))
+                self.adb.settingsPut("picture_dynamic_definition", String(value))
+                self.adb.refreshPq()
+            }
         }
     }
 
@@ -1148,26 +1389,35 @@ final class AppState: ObservableObject {
         let hostRefreshHz = HDRDetector.externalDisplayRefreshRateHz()
 
         runBackground {
-            let (freshSettings, freshJni) = self.adb.transaction {
-                let s = self.adb.settingsGetBatch([
-                    "picture_mode",
-                    "picture_preset_scenario",
-                    "mitv.tvplayer.hdmi.last.source",
-                    "picture_content_adaptive",
-                    "freesync",
-                    "mode_320",
-                ])
-                let j = self.adb.jniBatchGet(keys: [
-                    "g_video__picture_mode",
-                    "g_video__freesync_switch",
-                    "g_video__dp_adaptive_sync",
-                    "g_fusion_picture__hdmi_edid_version",
-                    "g_fusion_picture__dp_edid_version",
-                    "g_video__dlg_vrr_switch",
-                    "g_video__vid_content_adaptive",
-                    MemcSupport.normalJniKey,
-                    MemcSupport.gameJniKey,
-                ])
+            let memcSettingsKeys = [
+                "picture_mode",
+                "picture_preset_scenario",
+                "mitv.tvplayer.hdmi.last.source",
+                "picture_content_adaptive",
+                "freesync",
+                "mode_320",
+            ]
+            let memcJniKeys = [
+                "g_video__picture_mode",
+                "g_video__freesync_switch",
+                "g_video__dp_adaptive_sync",
+                "g_fusion_picture__hdmi_edid_version",
+                "g_fusion_picture__dp_edid_version",
+                "g_video__dlg_vrr_switch",
+                "g_video__vid_content_adaptive",
+                MemcSupport.normalJniKey,
+                MemcSupport.gameJniKey,
+            ]
+            let (freshSettings, freshJni): ([String: String], [String: String]) = self.adb.transaction {
+                if self.adb.isDaemonMode,
+                   let q = try? self.adb.daemonQuery(settingsKeys: memcSettingsKeys, jniKeys: memcJniKeys) {
+                    var s: [String: String] = [:]
+                    for (k, v) in q.settings where !v.isEmpty && v != "null" && v != "N/A" { s[k] = v }
+                    let j = q.jni.mapValues(String.init)
+                    return (s, j)
+                }
+                let s = self.adb.settingsGetBatch(memcSettingsKeys)
+                let j = self.adb.jniBatchGet(keys: memcJniKeys)
                 return (s, j)
             }
             let evaluation = MemcSupport.evaluate(
@@ -1185,8 +1435,9 @@ final class AppState: ObservableObject {
                       !self.isPresetBusy,
                       !self.presetConfiguration.applicationIncomplete else { return }
 
-                if let mode = evaluation.pictureMode {
-                    self.currentValues["picture_mode"] = String(mode)
+                // 只写小米侧 settings picture_mode，切勿把 MTK 内部枚举写入 currentValues["picture_mode"]
+                if let xiaomiMode = MemcSupport.parseInt(freshSettings["picture_mode"]) {
+                    self.currentValues["picture_mode"] = String(xiaomiMode)
                 }
 
                 if evaluation.outcome == .disallowedMode {
@@ -1217,30 +1468,36 @@ final class AppState: ObservableObject {
         guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
         guard isConnected else { return log("未连接") }
         guard (1...3).contains(value) else { return }
+        let request = connectionIntent.generation
         currentValues["picture_mode"] = "9"
         currentValues[MemcSupport.primarySettingKey] = String(value)
         log("运动补偿: 已切至电影模式并设为 \(MemcSupport.levelLabel(value))")
         runPictureChange(delay: 1.5) {
-            self.adb.settingsPut("picture_mode", "9")
-            Thread.sleep(forTimeInterval: 0.3)
-            self.executeMemcCommands(MemcSupport.writeCommands(value: value, pictureMode: 9))
+            try? self.adb.batchWrites {
+                self.adb.settingsPut("picture_mode", "9")
+                self.adb.batchSleep(300)
+                self.executeMemcCommands(MemcSupport.writeCommands(value: value, pictureMode: 9))
+            }
             DispatchQueue.main.async {
+                guard self.isConnected, self.connectionIntent.isCurrent(request) else { return }
                 self.scheduleCoalescedRefresh(delay: 1.2, pages: ["picture"])
             }
         }
     }
 
     private func executeMemcCommands(_ commands: [PresetCommand]) {
-        for command in commands {
-            switch command {
-            case .jni(let key, let value, let upd):
-                adb.jniSet(key: key, value: value, upd: upd)
-            case .setting(let key, let value):
-                adb.settingsPut(key, value)
-            case .refresh:
-                adb.refreshPq()
-            case .colorGains, .hdrToneMapping, .soundOutput:
-                break
+        try? adb.batchWrites {
+            for command in commands {
+                switch command {
+                case .jni(let key, let value, let upd):
+                    adb.jniSet(key: key, value: value, upd: upd)
+                case .setting(let key, let value):
+                    adb.settingsPut(key, value)
+                case .refresh:
+                    adb.refreshPq()
+                case .colorGains, .hdrToneMapping, .soundOutput:
+                    break
+                }
             }
         }
     }
@@ -1278,65 +1535,82 @@ final class AppState: ObservableObject {
         currentValues[key] = String(value)
         log(message)
         runBackground {
-            self.adb.settingsPut(key, String(value))
-            self.adb.refreshPq()
+            try? self.adb.batchWrites {
+                self.adb.settingsPut(key, String(value))
+                self.adb.refreshPq()
+            }
         }
     }
 
     func setCrosshair(_ value: Int) {
         guard isConnected else { return log("未连接") }
-        // 用户在游戏模式下的主动选择同步进记忆：关掉即清记忆（避免下次回到
-        // 游戏模式又被自动还原回来），选了样式则更新记忆值。
-        if value == 0 {
-            clearCrosshairMemory()
-        } else {
-            saveCrosshairMemory(value)
-        }
+        let request = connectionIntent.generation
+        let identity = adb.ip
         currentValues["front_sight_index"] = String(value)
         log("准星: \(value == 0 ? "关" : "\(value)")")
         runBackground {
-            self.adb.settingsPut("front_sight_index", String(value))
-            // 游戏模式下重触发让准星生效（移植自 _fs -> _set_game_feature(retrigger=True)）
-            let mode = self.adb.settingsGet("picture_mode")
-            if RegisterMap.isGamePictureMode(mode) {
-                self.adb.settingsPut("picture_mode", "14")
-                Thread.sleep(forTimeInterval: 0.5)
-                self.adb.settingsPut("picture_mode", "10")
-            } else {
-                self.adb.refreshPq()
+            var updated = false
+            try? self.adb.batchWrites {
+                let mode = self.adb.settingsGet("picture_mode").trimmingCharacters(in: .whitespacesAndNewlines)
+                self.adb.settingsPut("front_sight_index", String(value))
+                // 游戏模式下重触发让准星生效，同时保留当前游戏模式/HDR子模式值
+                if RegisterMap.isGamePictureMode(mode), !mode.isEmpty {
+                    let bounceMode = (mode == "14") ? "10" : "14"
+                    self.adb.settingsPut("picture_mode", bounceMode)
+                    self.adb.batchSleep(500)
+                    self.adb.settingsPut("picture_mode", mode)
+                } else {
+                    self.adb.refreshPq()
+                }
+                updated = true
+            }
+            DispatchQueue.main.async {
+                guard updated,
+                      self.isConnected,
+                      self.connectionIntent.isCurrent(request),
+                      self.adb.ip == identity else { return }
+                if value == 0 {
+                    self.clearCrosshairMemory()
+                } else {
+                    self.saveCrosshairMemory(value)
+                }
+                self.updateCrosshairModeStatus()
             }
         }
     }
 
     func setMode320(_ on: Bool) {
         guard isConnected else { return log("未连接") }
+        let request = connectionIntent.generation
         currentValues["mode_320"] = on ? "1" : "0"
         log("320Hz: \(on ? "开" : "关")")
         runBackground {
-            let src = self.adb.settingsGet("mitv.tvplayer.hdmi.last.source")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if src == "29" || src == "30" {
-                self.adb.jniSet(key: "g_fusion_picture__dp_edid_version", value: on ? "3" : "2")
-            } else {
-                let m = self.adb.jniBatchGet(keys: ["g_fusion_picture__hdmi_edid_version",
-                                                    "g_video__freesync_switch"])
-                let flags = PicturePresetPlan.parseHdmiEdidFlags(
-                    edidRaw: m["g_fusion_picture__hdmi_edid_version"],
-                    freesyncRaw: m["g_video__freesync_switch"]
-                )
-                let desiredFsSwitch = flags.freesync ? "3" : "0"
-                let currentFsSwitch = (m["g_video__freesync_switch"] ?? "")
+            try? self.adb.batchWrites {
+                let src = self.adb.settingsGet("mitv.tvplayer.hdmi.last.source")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                if currentFsSwitch != desiredFsSwitch {
-                    self.adb.jniSet(key: "g_video__freesync_switch", value: desiredFsSwitch)
+                if src == "29" || src == "30" {
+                    self.adb.jniSet(key: "g_fusion_picture__dp_edid_version", value: on ? "3" : "2")
+                } else {
+                    let m = self.adb.jniBatchGet(keys: ["g_fusion_picture__hdmi_edid_version",
+                                                        "g_video__freesync_switch"])
+                    let flags = PicturePresetPlan.parseHdmiEdidFlags(
+                        edidRaw: m["g_fusion_picture__hdmi_edid_version"],
+                        freesyncRaw: m["g_video__freesync_switch"]
+                    )
+                    let desiredFsSwitch = flags.freesync ? "3" : "0"
+                    let currentFsSwitch = (m["g_video__freesync_switch"] ?? "")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if currentFsSwitch != desiredFsSwitch {
+                        self.adb.jniSet(key: "g_video__freesync_switch", value: desiredFsSwitch)
+                    }
+                    self.adb.jniSet(
+                        key: "g_fusion_picture__hdmi_edid_version",
+                        value: String(PicturePresetPlan.hdmiEdidVersion(mode320: on, freesync: flags.freesync))
+                    )
                 }
-                self.adb.jniSet(
-                    key: "g_fusion_picture__hdmi_edid_version",
-                    value: String(PicturePresetPlan.hdmiEdidVersion(mode320: on, freesync: flags.freesync))
-                )
+                self.adb.refreshPq()
             }
-            self.adb.refreshPq()
-            self.refreshAfterEdidChange()
+            self.refreshAfterEdidChange(request: request)
         }
     }
 
@@ -1346,6 +1620,7 @@ final class AppState: ObservableObject {
     func toggleFreesync() {
         guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
         guard isConnected else { return log("未连接") }
+        let request = connectionIntent.generation
         runBackground {
             let src = self.adb.settingsGet("mitv.tvplayer.hdmi.last.source")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1362,23 +1637,23 @@ final class AppState: ObservableObject {
                     freesyncRaw: m["g_video__freesync_switch"]
                 ).freesync
             }
-            DispatchQueue.main.async { self.setFreesync(!isOn) }
+            DispatchQueue.main.async {
+                guard self.isConnected, self.connectionIntent.isCurrent(request) else { return }
+                self.setFreesync(!isOn)
+            }
         }
     }
 
     func setFreesync(_ on: Bool) {
         guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
         guard isConnected else { return log("未连接") }
+        let request = connectionIntent.generation
+        let identity = adb.ip
         currentValues["freesync"] = on ? "1" : "0"
         log("FreeSync: \(on ? "开" : "关")")
 
         let useMemory = freesyncMemoryEnabled && !memoriesSuspendedByPreset
         runPictureChange(delay: 1.8) {
-            // ── 先读设备真实状态，再决定要不要记录 / 还原 ──
-            // 不能用缓存里的 currentValues["freesync"]：它来自 JNI 回读，
-            // 而 JNI 读取偶发失败会把缓存留在 0。于是「从关到开才记录」会误判成
-            // 「本来就是关的」→ 记录下已被上一次 FreeSync 改过的模式；
-            // 「从开到关才还原」也会误判成「本来就是关的」→ 直接跳过还原。
             let src = self.adb.settingsGet("mitv.tvplayer.hdmi.last.source")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let isDP = (src == "29" || src == "30")
@@ -1402,20 +1677,18 @@ final class AppState: ObservableObject {
             var restoreMode: Int? = nil
             if useMemory {
                 if on && !wasOn {
-                    // 画面模式同样现读，避免缓存过期把游戏模式记成"开启前"
                     let mode = Int(self.adb.settingsGet("picture_mode")
                         .trimmingCharacters(in: .whitespacesAndNewlines)) ?? -1
-                    // 只记「标准 / 游戏 / 电影」这三个标准模式。
-                    // Dolby Vision、游戏子模式（SDR 游戏 RPG 之类）这些不是用户手动选的档位，
-                    // 记下来再还原会很突兀 —— 而且它们在 FreeSync 开关时本来就会被自动切换。
                     if RegisterMap.modeNames[mode] != nil {
                         UserDefaults.standard.set(mode, forKey: "freesync_previous_mode")
                         DispatchQueue.main.async {
+                            guard self.isConnected, self.connectionIntent.isCurrent(request) else { return }
                             self.log("FreeSync 模式记忆: 记录开启前模式 \(RegisterMap.modeNames[mode] ?? "\(mode)")")
                         }
                     } else {
                         UserDefaults.standard.removeObject(forKey: "freesync_previous_mode")
                         DispatchQueue.main.async {
+                            guard self.isConnected, self.connectionIntent.isCurrent(request) else { return }
                             self.log("FreeSync 模式记忆: 当前是 \(RegisterMap.sceneNames[mode] ?? "未知模式")，非标准模式不记录")
                         }
                     }
@@ -1425,31 +1698,38 @@ final class AppState: ObservableObject {
                 }
             }
 
-            self.adb.jniSet(key: key, value: on ? onRaw : "0")
-            if !isDP {
-                self.adb.jniSet(
-                    key: "g_fusion_picture__hdmi_edid_version",
-                    value: String(PicturePresetPlan.hdmiEdidVersion(mode320: hdmiMode320, freesync: on))
-                )
+            try? self.adb.batchWrites {
+                self.adb.jniSet(key: key, value: on ? onRaw : "0")
+                if !isDP {
+                    self.adb.jniSet(
+                        key: "g_fusion_picture__hdmi_edid_version",
+                        value: String(PicturePresetPlan.hdmiEdidVersion(mode320: hdmiMode320, freesync: on))
+                    )
+                }
+                if !on, let restoreMode {
+                    self.adb.settingsPut("picture_mode", String(restoreMode))
+                }
+                self.adb.refreshPq()
             }
-            // 关闭时先切回原先的画面模式，再 refresh_pq（顺序与原版一致）
-            if !on, let restoreMode {
-                self.adb.settingsPut("picture_mode", String(restoreMode))
-            }
-            self.adb.refreshPq()
 
             DispatchQueue.main.async {
+                guard self.isConnected,
+                      self.connectionIntent.isCurrent(request),
+                      self.adb.ip == identity else { return }
                 if !on, let restoreMode {
                     self.currentValues["picture_mode"] = String(restoreMode)
                     self.log("FreeSync 模式记忆: 已切回 \(RegisterMap.sceneNames[restoreMode] ?? "\(restoreMode)")")
                 }
             }
-            self.refreshAfterEdidChange()
+            self.refreshAfterEdidChange(request: request)
         }
     }
 
-    private func refreshAfterEdidChange() {
+    private func refreshAfterEdidChange(request: UInt64? = nil) {
         DispatchQueue.main.async {
+            if let request, (!self.isConnected || !self.connectionIntent.isCurrent(request)) {
+                return
+            }
             self.scheduleCoalescedRefresh(delay: 1.5, pages: ["picture", "game"])
         }
     }
@@ -1463,9 +1743,16 @@ final class AppState: ObservableObject {
         activeSource = name
         log("信号源: \(name)")
         runBackground {
-            self.adb.shell("am force-stop com.xiaomi.mitv.tvplayer")
-            self.adb.shell("am start -a com.xiaomi.mitv.tvplayer.EXTSRC_PLAY -n com.xiaomi.mitv.tvplayer/.ExternalSourceActivity --ei input \(value) -f 0x10000000")
-            self.adb.refreshPq()
+            do {
+                try self.adb.batchWrites(check: true) {
+                    try self.adb.setInputSource(value)
+                    self.adb.refreshPq()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.log("切换信号源失败: \(error.localizedDescription)")
+                }
+            }
         }
     }
 
@@ -1487,8 +1774,15 @@ final class AppState: ObservableObject {
 
         runPictureChange {
             do {
-                try self.adb.setSoundOutput(normalized, target: targetSerial)
-                try self.adb.checkedShell("settings put global \(RegisterMap.soundOutputKey) \(normalized)", target: targetSerial)
+                if self.adb.isDaemonMode && targetSerial == self.adb.serial {
+                    try self.adb.batchWrites(check: true) {
+                        try self.adb.setSoundOutput(normalized, target: targetSerial)
+                        self.adb.settingsPut(RegisterMap.soundOutputKey, String(normalized))
+                    }
+                } else {
+                    try self.adb.setSoundOutput(normalized, target: targetSerial)
+                    try self.adb.checkedShell("settings put global \(RegisterMap.soundOutputKey) \(normalized)", target: targetSerial)
+                }
             } catch {
                 DispatchQueue.main.async {
                     guard self.connectionIntent.isCurrent(request) else { return }
@@ -1533,16 +1827,18 @@ final class AppState: ObservableObject {
         let colorValue = intValue("atmosphere_light_color_value", default: 0)
         log(message)
         runBackground {
-            self.adb.settingsPut("atmosphere_light_switcher_pm2", String(mode))
-            self.adb.settingsPut("atmosphere_light_illumination", String(illumination))
-            self.adb.settingsPut("atmosphere_light_color_temp", String(colorTemp))
-            self.adb.settingsPut("atmosphere_light_color_value", String(colorValue))
-            switch mode {
-            case 0: self.adb.colorfulLed(action: "lighting", args: [String(illumination), String(colorTemp)])
-            case 1: self.adb.colorfulLed(action: "ambient")
-            case 2: self.adb.colorfulLed(action: "solid", args: [String(illumination), String(colorValue)])
-            case 3: self.adb.colorfulLed(action: "cycle")
-            default: self.adb.colorfulLed(action: "off")
+            try? self.adb.batchWrites {
+                self.adb.settingsPut("atmosphere_light_switcher_pm2", String(mode))
+                self.adb.settingsPut("atmosphere_light_illumination", String(illumination))
+                self.adb.settingsPut("atmosphere_light_color_temp", String(colorTemp))
+                self.adb.settingsPut("atmosphere_light_color_value", String(colorValue))
+                switch mode {
+                case 0: self.adb.colorfulLed(action: "lighting", args: [String(illumination), String(colorTemp)])
+                case 1: self.adb.colorfulLed(action: "ambient")
+                case 2: self.adb.colorfulLed(action: "solid", args: [String(illumination), String(colorValue)])
+                case 3: self.adb.colorfulLed(action: "cycle")
+                default: self.adb.colorfulLed(action: "off")
+                }
             }
         }
     }
@@ -1568,7 +1864,9 @@ final class AppState: ObservableObject {
             if !FileManager.default.fileExists(atPath: url.path) {
                 FileManager.default.createFile(atPath: url.path, contents: nil)
             }
-            logFileHandle = try? FileHandle(forWritingTo: url)
+            let handle = try? FileHandle(forWritingTo: url)
+            _ = try? handle?.seekToEnd()
+            logFileHandle = handle
             log("本地日志记录: 开启")
         } else {
             try? logFileHandle?.close()
@@ -1626,9 +1924,32 @@ final class AppState: ObservableObject {
         let connectionRequest = connectionIntent.generation
         let pollRequest = pageRefreshIntent.begin("sourcePoll")
         runBackground {
-            let vals = self.adb.settingsGetBatch(PageDataKeys.sourceSettings)
-            let polledVol = self.adb.mediaVolume()
-            let polledMuted = self.adb.mediaMuted()
+            var vals: [String: String] = [:]
+            var polledVol: Int?
+            var polledMuted: Bool?
+
+            if self.adb.isDaemonMode,
+               let q = try? self.adb.daemonQuery(
+                   settingsKeys: PageDataKeys.sourceSettings,
+                   flags: ["volume", "muted"]
+               ) {
+                for k in PageDataKeys.sourceSettings {
+                    if let v = q.settings[k], !v.isEmpty, v != "null", v != "N/A" {
+                        vals[k] = v
+                    }
+                }
+                if let rawVol = q.flags["volume"], let v = Int(rawVol), (0...100).contains(v) {
+                    polledVol = v
+                }
+                if let rawMuted = q.flags["muted"] {
+                    polledMuted = (rawMuted == "1" || rawMuted.lowercased() == "true")
+                }
+            } else {
+                vals = self.adb.settingsGetBatch(PageDataKeys.sourceSettings)
+                polledVol = self.adb.mediaVolume()
+                polledMuted = self.adb.mediaMuted()
+            }
+
             guard !vals.isEmpty || polledVol != nil || polledMuted != nil else { return }
             DispatchQueue.main.async {
                 guard self.sourcePollArmed, self.isConnected,
@@ -1652,7 +1973,9 @@ final class AppState: ObservableObject {
                         self.log("声音输出变化: \(soundName)")
                     }
                 }
-                if self.mediaVolumePreview == nil || self.mediaVolumePreview == self.mediaVolumeHardware {
+                if !self.mediaVolumeCommitInFlight,
+                   self.mediaVolumeCommit == nil,
+                   (self.mediaVolumePreview == nil || self.mediaVolumePreview == self.mediaVolumeHardware) {
                     if let polledVol {
                         self.mediaVolumePreview = polledVol
                         self.mediaVolumeHardware = polledVol
@@ -1724,10 +2047,12 @@ final class AppState: ObservableObject {
 
     func installApk(_ url: URL) {
         guard isConnected else { log("请先连接显示器"); return }
+        let request = connectionIntent.generation
         log("正在安装: \(url.lastPathComponent) ...")
         runBackground {
             let r = self.adb.installApk(url.path)
             DispatchQueue.main.async {
+                guard self.connectionIntent.isCurrent(request) else { return }
                 if r.contains("Success") {
                     self.log("APK 安装成功")
                 } else {
@@ -1801,15 +2126,18 @@ final class AppState: ObservableObject {
     /// Override size 存在且任一边大于 1920x1080 即视为已开启。
     func check4KState() {
         guard isConnected else { return }
+        let request = connectionIntent.generation
+        let identity = adb.ip
         runBackground {
             let override = self.adb.getOverrideSize()
             let density = self.adb.getOverrideDensity()
             DispatchQueue.main.async {
+                guard self.isConnected,
+                      self.connectionIntent.isCurrent(request),
+                      self.adb.ip == identity else { return }
                 let is4k = override.map { $0.width > 1920 || $0.height > 1080 } ?? false
                 let changed = (self.is4KUI != is4k)
                 if changed { self.is4KUI = is4k }
-                // 只在状态变化时记日志：工具页每次出现都会检测一遍，
-                // 无脑记录会把日志刷满
                 if changed || override == nil {
                     let sizeText = override.map { "\($0.width)×\($0.height)" } ?? "无 Override（面板原生）"
                     let densityText = density.map { "，DPI \($0)" } ?? ""
@@ -1838,10 +2166,15 @@ final class AppState: ObservableObject {
 
     func checkGuardian() {
         guard isConnected else { return log("请先连接显示器") }
+        let request = connectionIntent.generation
+        let identity = adb.ip
         guardianStatus = "状态：正在检测..."
         runBackground {
             let s = self.readGuardianStatus()
             DispatchQueue.main.async {
+                guard self.isConnected,
+                      self.connectionIntent.isCurrent(request),
+                      self.adb.ip == identity else { return }
                 self.guardianStatus = s.summary
                 // 把结论一起写进日志：只写"检测完成"的话，导出日志看不到守护到底正不正常
                 self.log("ADB 保活守护检测完成 —— \(s.summary)")
@@ -1857,23 +2190,27 @@ final class AppState: ObservableObject {
     func migrateGuardian() {
         guard isConnected else { return log("请先连接显示器") }
         guard let apk = AdbClient.guardianApkPath() else { log("找不到保活 APK（assets/adb_guardian/adbguardian-signed.apk）"); return }
+        let request = connectionIntent.generation
+        let identity = adb.ip
         guardianStatus = "状态：正在升级..."
         log("正在把 ADB 保活守护从旧版本（\(Guardian.legacyPackage)）升级到 \(Guardian.package) ...")
         runBackground {
-            // 顺序必须是先卸旧再装新：两个 guardian 并存会同时写 ADB 设置、互相干扰。
-            // 卸载只能在桌面端做 —— 应用自身无权卸载其他应用。
             if self.adb.shell("pm path \(Guardian.legacyPackage) 2>/dev/null").contains("package:") {
                 self.cleanLegacyGuardianAccessibility()
                 self.adb.shell("cmd deviceidle whitelist -\(Guardian.legacyPackage) 2>/dev/null || true")
                 let removed = self.adb.uninstallPackage(Guardian.legacyPackage)
                 if !removed.contains("Success") {
                     DispatchQueue.main.async {
+                        guard self.connectionIntent.isCurrent(request), self.adb.ip == identity else { return }
                         self.guardianStatus = "状态：升级失败"
                         self.log("卸载旧版本失败: \(removed.trimmingCharacters(in: .whitespacesAndNewlines))")
                     }
                     return
                 }
-                DispatchQueue.main.async { self.log("已卸载旧版本 \(Guardian.legacyPackage)") }
+                DispatchQueue.main.async {
+                    guard self.connectionIntent.isCurrent(request) else { return }
+                    self.log("已卸载旧版本 \(Guardian.legacyPackage)")
+                }
             }
             let r = self.adb.installApk(apk)
             if r.contains("Success") {
@@ -1882,14 +2219,24 @@ final class AppState: ObservableObject {
                 self.enableGuardianAccessibility()
                 self.startGuardianCommands()
                 Thread.sleep(forTimeInterval: 3)
-                _ = self.adb.reconnect()
+                let rec = self.adb.reconnect()
+                guard rec == "connected" else {
+                    DispatchQueue.main.async {
+                        guard self.connectionIntent.isCurrent(request), self.adb.ip == identity else { return }
+                        self.guardianStatus = "状态：升级后重连失败（\(rec)）"
+                        self.log("ADB 保活守护已安装，但重连设备失败（\(rec)）")
+                    }
+                    return
+                }
                 let s = self.readGuardianStatus()
                 DispatchQueue.main.async {
+                    guard self.connectionIntent.isCurrent(request), self.adb.ip == identity else { return }
                     self.guardianStatus = s.summary
-                    self.log("ADB 保活守护升级完成")
+                    self.log("ADB 保活守护升级完成 —— \(s.summary)")
                 }
             } else {
                 DispatchQueue.main.async {
+                    guard self.connectionIntent.isCurrent(request), self.adb.ip == identity else { return }
                     self.guardianStatus = "状态：升级失败"
                     self.log("ADB 保活守护升级失败: \(r.trimmingCharacters(in: .whitespacesAndNewlines))")
                 }
@@ -1905,22 +2252,34 @@ final class AppState: ObservableObject {
         let kept = current.split(separator: ":").map(String.init)
             .filter { !$0.hasPrefix("\(Guardian.legacyPackage)/") }
         guard kept.count != current.split(separator: ":").count else { return }
-        adb.shell("settings put secure enabled_accessibility_services '\(kept.joined(separator: ":"))'")
+        adb.shell("settings put secure enabled_accessibility_services \(AdbClient.shellQuoteIfNeeded(kept.joined(separator: ":")))")
         log("已清理旧包的辅助功能条目（\(Guardian.legacyPackage)）")
     }
 
     func deployGuardian() {
         guard isConnected else { return log("请先连接显示器") }
         guard let apk = AdbClient.guardianApkPath() else { log("找不到保活 APK（assets/adb_guardian/adbguardian-signed.apk）"); return }
+        let request = connectionIntent.generation
+        let identity = adb.ip
         guardianStatus = "状态：正在部署/修复..."
         log("正在部署 ADB 保活守护...")
         runBackground {
-            // 手动点「部署/修复」时也顺手清掉旧包，避免留下两个守护
             if self.adb.shell("pm path \(Guardian.legacyPackage) 2>/dev/null").contains("package:") {
-                DispatchQueue.main.async { self.log("检测到旧版本 \(Guardian.legacyPackage)，先清理再部署") }
+                DispatchQueue.main.async {
+                    guard self.connectionIntent.isCurrent(request) else { return }
+                    self.log("检测到旧版本 \(Guardian.legacyPackage)，先清理再部署")
+                }
                 self.cleanLegacyGuardianAccessibility()
                 self.adb.shell("cmd deviceidle whitelist -\(Guardian.legacyPackage) 2>/dev/null || true")
-                _ = self.adb.uninstallPackage(Guardian.legacyPackage)
+                let removed = self.adb.uninstallPackage(Guardian.legacyPackage)
+                if !removed.contains("Success") {
+                    DispatchQueue.main.async {
+                        guard self.connectionIntent.isCurrent(request), self.adb.ip == identity else { return }
+                        self.guardianStatus = "状态：部署失败（旧版本卸载失败）"
+                        self.log("卸载旧版本 \(Guardian.legacyPackage) 失败: \(removed.trimmingCharacters(in: .whitespacesAndNewlines))")
+                    }
+                    return
+                }
             }
             let r = self.adb.installApk(apk)
             if r.contains("Success") {
@@ -1929,14 +2288,24 @@ final class AppState: ObservableObject {
                 self.enableGuardianAccessibility()
                 self.startGuardianCommands()
                 Thread.sleep(forTimeInterval: 3)
-                _ = self.adb.reconnect()
+                let rec = self.adb.reconnect()
+                guard rec == "connected" else {
+                    DispatchQueue.main.async {
+                        guard self.connectionIntent.isCurrent(request), self.adb.ip == identity else { return }
+                        self.guardianStatus = "状态：部署后重连失败（\(rec)）"
+                        self.log("ADB 保活守护已安装，但重连设备失败（\(rec)）")
+                    }
+                    return
+                }
                 let s = self.readGuardianStatus()
                 DispatchQueue.main.async {
+                    guard self.connectionIntent.isCurrent(request), self.adb.ip == identity else { return }
                     self.guardianStatus = s.summary
-                    self.log("ADB 保活守护部署完成")
+                    self.log("ADB 保活守护部署完成 —— \(s.summary)")
                 }
             } else {
                 DispatchQueue.main.async {
+                    guard self.connectionIntent.isCurrent(request), self.adb.ip == identity else { return }
                     self.guardianStatus = "状态：部署失败"
                     self.log("ADB 保活守护部署失败: \(r.trimmingCharacters(in: .whitespacesAndNewlines))")
                 }
@@ -1946,6 +2315,8 @@ final class AppState: ObservableObject {
 
     func startGuardian() {
         guard isConnected else { return log("请先连接显示器") }
+        let request = connectionIntent.generation
+        let identity = adb.ip
         guardianStatus = "状态：正在启动保活..."
         runBackground {
             self.enableGuardianAccessibility()
@@ -1953,8 +2324,11 @@ final class AppState: ObservableObject {
             Thread.sleep(forTimeInterval: 2)
             let s = self.readGuardianStatus()
             DispatchQueue.main.async {
+                guard self.isConnected,
+                      self.connectionIntent.isCurrent(request),
+                      self.adb.ip == identity else { return }
                 self.guardianStatus = s.summary
-                self.log("ADB 保活守护已启动")
+                self.log("ADB 保活守护已启动 —— \(s.summary)")
             }
         }
     }
@@ -1962,6 +2336,11 @@ final class AppState: ObservableObject {
     private func enableGuardianAccessibility() {
         let current = adb.shell("settings get secure enabled_accessibility_services 2>/dev/null")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        let currentLower = current.lowercased()
+        if currentLower.contains("error") || currentLower.contains("exception") || currentLower.contains("offline") {
+            log("读取无障碍服务列表失败: \(current)")
+            return
+        }
         let services: String
         if current.isEmpty || current == "null" {
             services = Guardian.accessibility
@@ -1970,8 +2349,14 @@ final class AppState: ObservableObject {
         } else {
             services = "\(current):\(Guardian.accessibility)"
         }
-        adb.shell("settings put secure enabled_accessibility_services '\(services)'")
-        adb.shell("settings put secure accessibility_enabled 1")
+        let put1 = adb.shell("settings put secure enabled_accessibility_services \(AdbClient.shellQuoteIfNeeded(services))")
+        let put2 = adb.shell("settings put secure accessibility_enabled 1")
+        for out in [put1, put2] where !out.isEmpty {
+            let lower = out.lowercased()
+            if lower.contains("error") || lower.contains("exception") || lower.contains("permission") {
+                log("写入无障碍配置异常: \(out)")
+            }
+        }
     }
 
     private func startGuardianCommands() {
@@ -1980,27 +2365,42 @@ final class AppState: ObservableObject {
     }
 
     private func readGuardianStatus() -> GuardianStatus {
-        let acc = adb.shell("settings get secure enabled_accessibility_services 2>/dev/null")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let path = adb.shell("pm path \(Guardian.package) 2>/dev/null")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let pid = adb.shell("pidof \(Guardian.package) 2>/dev/null")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let mask = adb.shell("getprop persist.appcontrol_w_mask 2>/dev/null")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let adbEnabled = adb.shell("settings get global adb_enabled 2>/dev/null")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let wifiEnabled = adb.shell("settings get global adb_wifi_enabled 2>/dev/null")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let servicePort = adb.shell("getprop service.adb.tcp.port 2>/dev/null")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let persistPort = adb.shell("getprop persist.adb.tcp.port 2>/dev/null")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let adbd = adb.shell("getprop init.svc.adbd 2>/dev/null")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let stopped = adb.shell("dumpsys package \(Guardian.package) 2>/dev/null | grep stopped=true | head -n 1").isEmpty == false
-        let legacyPath = adb.shell("pm path \(Guardian.legacyPackage) 2>/dev/null")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // 单次 shell 合并读取全部 11 项状态，从 ~1.5s 降至 ~60ms
+        let pkg = Guardian.package
+        let legacy = Guardian.legacyPackage
+        let script = """
+        echo "__ACC__=$(settings get secure enabled_accessibility_services 2>/dev/null)"; \
+        echo "__PATH__=$(pm path \(pkg) 2>/dev/null)"; \
+        echo "__PID__=$(pidof \(pkg) 2>/dev/null)"; \
+        echo "__MASK__=$(getprop persist.appcontrol_w_mask 2>/dev/null)"; \
+        echo "__ADB_EN__=$(settings get global adb_enabled 2>/dev/null)"; \
+        echo "__WIFI_EN__=$(settings get global adb_wifi_enabled 2>/dev/null)"; \
+        echo "__SRV_PORT__=$(getprop service.adb.tcp.port 2>/dev/null)"; \
+        echo "__PERSIST_PORT__=$(getprop persist.adb.tcp.port 2>/dev/null)"; \
+        echo "__ADBD__=$(getprop init.svc.adbd 2>/dev/null)"; \
+        echo "__STOPPED__=$(dumpsys package \(pkg) 2>/dev/null | grep -m1 'stopped=true')"; \
+        echo "__LEGACY__=$(pm path \(legacy) 2>/dev/null)"
+        """
+        let raw = adb.shell(script)
+        var fields: [String: String] = [:]
+        for line in raw.split(separator: "\n") {
+            guard line.hasPrefix("__"), let eq = line.firstIndex(of: "=") else { continue }
+            let key = String(line[..<eq])
+            let val = String(line[line.index(after: eq)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            fields[key] = val
+        }
+        let acc = fields["__ACC__"] ?? ""
+        let path = fields["__PATH__"] ?? ""
+        let pid = fields["__PID__"] ?? ""
+        let mask = fields["__MASK__"] ?? ""
+        let adbEnabled = fields["__ADB_EN__"] ?? ""
+        let wifiEnabled = fields["__WIFI_EN__"] ?? ""
+        let servicePort = fields["__SRV_PORT__"] ?? ""
+        let persistPort = fields["__PERSIST_PORT__"] ?? ""
+        let adbd = fields["__ADBD__"] ?? ""
+        let stopped = !(fields["__STOPPED__"] ?? "").isEmpty
+        let legacyPath = fields["__LEGACY__"] ?? ""
+
         return GuardianStatus(
             installed: !path.isEmpty && path.hasPrefix("package:"),
             pid: pid,
@@ -2204,15 +2604,21 @@ final class AppState: ObservableObject {
 
     private func applyCrosshairModeValue(_ value: Int, message: String) {
         crosshairReconcileBusy = true
+        let request = connectionIntent.generation
+        let identity = adb.ip
         runBackground {
-            self.adb.settingsPut("front_sight_index", String(value))
-            self.adb.refreshPq()
+            try? self.adb.batchWrites {
+                self.adb.settingsPut("front_sight_index", String(value))
+                self.adb.refreshPq()
+            }
             DispatchQueue.main.async {
+                self.crosshairReconcileBusy = false
+                guard self.isConnected,
+                      self.connectionIntent.isCurrent(request),
+                      self.adb.ip == identity else { return }
                 self.log(message)
                 self.mergeValues(["front_sight_index": String(value)])
                 self.updateCrosshairModeStatus()
-                // 重入的 reconcile 由 busy 标记挡住，结束后再放开
-                self.crosshairReconcileBusy = false
             }
         }
     }
@@ -2221,8 +2627,12 @@ final class AppState: ObservableObject {
 
     func setAutostart(_ enabled: Bool) {
         let exe = Bundle.main.executablePath ?? CommandLine.arguments.first ?? ""
-        Autostart.setEnabled(enabled, executablePath: exe)
-        log(enabled ? "已设置开机自启动（下次登录生效）" : "已取消开机自启动")
+        do {
+            try Autostart.setEnabled(enabled, executablePath: exe)
+            log(enabled ? "已设置开机自启动（下次登录生效）" : "已取消开机自启动")
+        } catch {
+            log("设置开机自启动失败: \(error.localizedDescription)")
+        }
     }
 
     // MARK: - 菜单栏快捷项
@@ -2435,7 +2845,10 @@ final class AppState: ObservableObject {
         case "response_time_cycle": cycleResponseTime()
         case "memc_cycle": cycleMemc()
         case "freesync_toggle": toggleFreesync()
-        case "input_source_cycle": cycleSource()
+        case "input_source_hdmi1": switchSourceHotkey(23)
+        case "input_source_hdmi2": switchSourceHotkey(24)
+        case "input_source_dp": switchSourceHotkey(29)
+        case "input_source_usbc": switchSourceHotkey(30)
         case "sound_output_cycle": cycleSoundOutput()
         case "volume_mute_toggle": toggleMediaMuteExplicit(showHUD: true)
         default: break
@@ -2489,26 +2902,39 @@ final class AppState: ObservableObject {
         let next = order[index]
 
         currentValues[valueKey] = String(next)
+        scheduleStagedHotkey(
+            groupKey: actionId,
+            label: label,
+            value: next,
+            displayValue: nameFor(next),
+            apply: apply
+        )
+    }
 
+    private func scheduleStagedHotkey(groupKey: String,
+                                      label: String,
+                                      value: Int,
+                                      displayValue: String,
+                                      apply: @escaping (Int) -> Void) {
         let delay = effectiveHotkeyDelay
-        cyclePending[actionId]?.work.cancel()
-        cyclePending[actionId] = nil
+        cyclePending[groupKey]?.work.cancel()
+        cyclePending[groupKey] = nil
 
         // 关掉倒计时：立即下发，HUD 也不显示进度条
         guard delay > 0 else {
-            HUDWindow.shared.show(title: label, value: nameFor(next))
-            apply(next)
+            HUDWindow.shared.show(title: label, value: displayValue)
+            apply(value)
             return
         }
 
-        HUDWindow.shared.show(title: label, value: nameFor(next), countdown: delay)
+        HUDWindow.shared.show(title: label, value: displayValue, countdown: delay)
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            self.cyclePending[actionId] = nil
-            apply(next)
+            self.cyclePending[groupKey] = nil
+            apply(value)
             HUDWindow.shared.endCountdown()
         }
-        cyclePending[actionId] = (next, work)
+        cyclePending[groupKey] = (value, work)
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
@@ -2573,10 +2999,17 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func cycleSource() {
-        cycleStep(actionId: "input_source_cycle", label: "信号源", order: [23, 24, 29, 30],
-                  valueKey: "mitv.tvplayer.hdmi.last.source",
-                  nameFor: { RegisterMap.sourceNames[$0] ?? "\($0)" }) { [weak self] v in
+    private func switchSourceHotkey(_ value: Int) {
+        guard isConnected else { return log("未连接") }
+        let name = RegisterMap.sourceNames[value] ?? "\(value)"
+        currentValues["mitv.tvplayer.hdmi.last.source"] = String(value)
+        activeSource = name
+        scheduleStagedHotkey(
+            groupKey: "input_source_direct",
+            label: "信号源",
+            value: value,
+            displayValue: name
+        ) { [weak self] v in
             self?.setSource(v)
         }
     }
@@ -2708,6 +3141,8 @@ final class AppState: ObservableObject {
     private var mediaVolumeCommit: DispatchWorkItem?
     /// 是否有一次下发正在跑
     private var mediaVolumeCommitInFlight = false
+    /// 是否正在进行未知静音状态的首次探测切换
+    private var mediaMuteToggleInFlight = false
     /// 回退通道只提示一次，避免连按刷屏
     private var mediaVolumeFallbackLogged = false
 
@@ -2726,12 +3161,26 @@ final class AppState: ObservableObject {
     /// 连按/待下发期间跳过，避免把预览基准带偏。
     func refreshMediaVolumeState() {
         guard isConnected else { return }
+        guard !mediaVolumeCommitInFlight, mediaVolumeCommit == nil else { return }
         guard mediaVolumePreview == nil || mediaVolumePreview == mediaVolumeHardware else { return }
+        let request = connectionIntent.generation
+        let identity = adb.ip
         runBackground {
-            let volume = self.adb.mediaVolume()
-            let muted = self.adb.mediaMuted()
+            var volume: Int?
+            var muted: Bool?
+            if self.adb.isDaemonMode,
+               let q = try? self.adb.daemonQuery(flags: ["volume", "muted"]) {
+                if let rv = q.flags["volume"], let v = Int(rv), (0...100).contains(v) { volume = v }
+                if let rm = q.flags["muted"] { muted = (rm == "1" || rm.lowercased() == "true") }
+            }
+            if volume == nil { volume = self.adb.mediaVolume() }
+            if muted == nil { muted = self.adb.mediaMuted() }
             DispatchQueue.main.async {
-                guard self.isConnected else { return }
+                guard self.isConnected,
+                      self.connectionIntent.isCurrent(request),
+                      self.adb.ip == identity,
+                      !self.mediaVolumeCommitInFlight,
+                      self.mediaVolumeCommit == nil else { return }
                 if let volume {
                     self.mediaVolumePreview = volume
                     self.mediaVolumeHardware = volume
@@ -2799,14 +3248,19 @@ final class AppState: ObservableObject {
         guard isConnected, let value = mediaVolumePreview else { return }
         let unmute = mediaVolumeNeedsUnmute
         guard mediaVolumeHardware != value || unmute else { return }
+        let request = connectionIntent.generation
+        let identity = adb.ip
         mediaVolumeNeedsUnmute = false
         mediaVolumeCommitInFlight = true
         let showUI = showVolumeOSD
         runBackground {
             let usedBinder = self.adb.setMediaVolume(value, unmuteFirst: unmute, showUI: showUI)
             DispatchQueue.main.async {
-                self.mediaVolumeHardware = value
                 self.mediaVolumeCommitInFlight = false
+                guard self.isConnected,
+                      self.connectionIntent.isCurrent(request),
+                      self.adb.ip == identity else { return }
+                self.mediaVolumeHardware = value
                 if !usedBinder, !self.mediaVolumeFallbackLogged {
                     self.mediaVolumeFallbackLogged = true
                     self.log("音量键: AudioService binder 不可用，已回退 input keyevent")
@@ -2818,6 +3272,8 @@ final class AppState: ObservableObject {
     /// UI 滑块 / 自定义快捷键 / 菜单栏直接设置显示器音量（0~100）。
     func setMediaVolumeValue(_ value: Int, unmuteIfNeeded: Bool = true) {
         guard isConnected else { return log("未连接") }
+        let request = connectionIntent.generation
+        let identity = adb.ip
         let target = clamp(value, 0, 100)
         let shouldUnmute = unmuteIfNeeded && mediaVolumeMuted == true
         if shouldUnmute { mediaVolumeMuted = false }
@@ -2829,6 +3285,9 @@ final class AppState: ObservableObject {
         runBackground {
             let usedBinder = self.adb.setMediaVolume(target, unmuteFirst: shouldUnmute, showUI: showUI)
             DispatchQueue.main.async {
+                guard self.isConnected,
+                      self.connectionIntent.isCurrent(request),
+                      self.adb.ip == identity else { return }
                 self.log("音量: \(target)")
                 if !usedBinder, !self.mediaVolumeFallbackLogged {
                     self.mediaVolumeFallbackLogged = true
@@ -2854,10 +3313,18 @@ final class AppState: ObservableObject {
         if let known = mediaVolumeMuted {
             applyMediaMute(!known, showHUD: showHUD, allowNativeOSD: allowNativeOSD)
         } else {
+            guard !mediaMuteToggleInFlight else { return }
+            mediaMuteToggleInFlight = true
+            let request = connectionIntent.generation
+            let identity = adb.ip
             // 状态未知（刚连接/被外部改过）：先回读再切换
             runBackground {
                 let current = self.adb.mediaMuted() ?? false
                 DispatchQueue.main.async {
+                    self.mediaMuteToggleInFlight = false
+                    guard self.isConnected,
+                          self.connectionIntent.isCurrent(request),
+                          self.adb.ip == identity else { return }
                     self.applyMediaMute(!current, showHUD: showHUD, allowNativeOSD: allowNativeOSD)
                 }
             }
@@ -2865,6 +3332,8 @@ final class AppState: ObservableObject {
     }
 
     private func applyMediaMute(_ muted: Bool, showHUD: Bool = true, allowNativeOSD: Bool = true) {
+        let request = connectionIntent.generation
+        let identity = adb.ip
         mediaVolumeMuted = muted
         // 更新的静音动作覆盖掉「按键先解除静音」的意图，避免收尾提交把它又打开
         mediaVolumeNeedsUnmute = false
@@ -2879,6 +3348,9 @@ final class AppState: ObservableObject {
         runBackground {
             let usedBinder = self.adb.setMediaMuted(muted, showUI: showUI)
             DispatchQueue.main.async {
+                guard self.isConnected,
+                      self.connectionIntent.isCurrent(request),
+                      self.adb.ip == identity else { return }
                 self.log("静音: \(muted ? "开" : "关")")
                 if !usedBinder, !self.mediaVolumeFallbackLogged {
                     self.mediaVolumeFallbackLogged = true

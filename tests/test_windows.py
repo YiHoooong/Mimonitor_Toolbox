@@ -380,6 +380,72 @@ class HdrTargetDetectionTests(unittest.TestCase):
             self.assertIsNone(windows.query_target_display_refresh_rate())
         fake_enum_settings.assert_not_called()
 
+    def test_list_windows_displays_skips_inactive_monitors(self):
+        from mimonitor_toolbox import windows
+
+        def fake_enum_devices(lpDevice, iDevNum, lpDisplayDevice, dwFlags):
+            device = lpDisplayDevice._obj
+            if lpDevice is None:
+                if iDevNum > 0:
+                    return 0
+                device.DeviceName = r"\\.\DISPLAY1"
+                device.DeviceString = "Adapter"
+                device.StateFlags = windows.DISPLAY_DEVICE_ATTACHED_TO_DESKTOP
+                return 1
+            if iDevNum == 0:
+                device.DeviceID = _monitor_entry("BOE0D16", 1)[0]
+                device.DeviceString = "Inactive Ghost Monitor"
+                device.StateFlags = 0
+                return 1
+            if iDevNum == 1:
+                device.DeviceID = _monitor_entry("XMI3009", 2)[0]
+                device.DeviceString = "Active Mi Monitor"
+                device.StateFlags = windows.DISPLAY_DEVICE_ACTIVE
+                return 1
+            return 0
+
+        with mock.patch.object(windows.sys, "platform", "win32"), \
+                mock.patch.object(windows, "user32", mock.Mock(EnumDisplayDevicesW=fake_enum_devices)):
+            displays = windows.list_windows_displays()
+
+        self.assertEqual(len(displays), 1)
+        self.assertIn("XMI3009", displays[0]["device_id"])
+
+    def test_resolve_hdr_target_display_requires_vendor_prefix_not_substring(self):
+        from mimonitor_toolbox import windows
+
+        displays = [
+            {"device_name": r"\\.\DISPLAY1", "device_id": r"\\?\DISPLAY#DELA001#5&XMI&0", "label": "Dell"},
+            {"device_name": r"\\.\DISPLAY2", "device_id": r"\\?\DISPLAY#BOE0D16#5&0", "label": "Panel"},
+        ]
+        self.assertIsNone(windows.resolve_hdr_target_display(displays))
+
+    def test_autostart_path_falls_back_when_appdata_missing_and_writes_utf8_for_py(self):
+        import tempfile
+        from mimonitor_toolbox import windows
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {k: v for k, v in os.environ.items() if k != "APPDATA"}
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch("os.path.expanduser", return_value=tmpdir):
+                path = windows.get_autostart_path()
+                self.assertTrue(path.startswith(os.path.join(tmpdir, "AppData", "Roaming")))
+                ok = windows.install_autostart(executable=r"C:\中文路径\main.py")
+                self.assertTrue(ok)
+                with open(path, "r", encoding="utf-8") as stream:
+                    content = stream.read()
+                self.assertIn("chcp 65001 >nul", content)
+                self.assertIn(r"C:\中文路径\main.py", content)
+                self.assertIn("--minimized", content)
+
+    def test_get_executable_path_handles_nuitka_compiled(self):
+        from mimonitor_toolbox import windows
+
+        with mock.patch.object(windows.sys, "frozen", False, create=True), \
+                mock.patch.object(windows.sys, "__compiled__", True, create=True), \
+                mock.patch.object(windows.sys, "executable", r"C:\App\RedmiToolbox.exe"):
+            self.assertEqual(windows.get_executable_path(), r"C:\App\RedmiToolbox.exe")
+
 
 if __name__ == "__main__":
     unittest.main()

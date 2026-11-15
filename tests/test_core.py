@@ -82,16 +82,30 @@ class CleanupStaleExtractDirsTests(unittest.TestCase):
         return d
 
     def test_removes_dead_extract_dirs(self):
+        import os
+        import time
         from mimonitor_toolbox import core
 
         dead_onefile = self._make_dir("onefile_123_456")
         dead_mei = self._make_dir("_MEI12345")
-        self._make_dir("unrelated_dir", dll_name=None)
+        unrelated = self._make_dir("unrelated_dir", dll_name=None)
+
+        old_ts = time.time() - 600
+        for p in (dead_onefile, dead_onefile / "python313.dll", dead_mei, dead_mei / "python313.dll", unrelated):
+            os.utime(p, (old_ts, old_ts))
 
         core.cleanup_stale_extract_dirs(str(self.base))
 
         self.assertFalse(dead_onefile.exists())
         self.assertFalse(dead_mei.exists())
+        self.assertTrue(unrelated.exists())
+
+    def test_skips_recent_extract_dir(self):
+        from mimonitor_toolbox import core
+
+        recent_mei = self._make_dir("_MEI99999")
+        core.cleanup_stale_extract_dirs(str(self.base), min_age_seconds=300.0)
+        self.assertTrue(recent_mei.exists())
 
     def test_skips_dirs_without_python_dll(self):
         from mimonitor_toolbox import core
@@ -214,8 +228,98 @@ class ConnectionModeTests(unittest.TestCase):
 
         detail_calls = []
         host_with_detail = type("Host", (), {"log_detail": detail_calls.append})()
-        core.emit_detail_log(host_with_detail, "明细条目")
+        with mock.patch.object(core, "get_settings_path", return_value=str(self.config_path)):
+            core.emit_detail_log(host_with_detail, "明细条目")
         self.assertEqual(detail_calls, ["明细条目"])
+
+
+class SettingsSafetyTests(unittest.TestCase):
+    """Settings backup, validation, relative path, retry, and verbose_log cache behavior."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.config_path = Path(self.temp_dir.name) / "config.json"
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_corrupt_config_backed_up_and_unreadable_refuses_overwrite(self):
+        from mimonitor_toolbox import core
+
+        self.config_path.write_text("{corrupt json", encoding="utf-8")
+        with mock.patch.object(core, "get_settings_path", return_value=str(self.config_path)):
+            loaded = core.load_settings()
+            self.assertEqual(loaded["connection_mode"], core.CONNECTION_MODE_ADB)
+            backup_file = Path(f"{self.config_path}.corrupt.bak")
+            self.assertTrue(backup_file.exists())
+            self.assertEqual(backup_file.read_text(encoding="utf-8"), "{corrupt json")
+
+        self.config_path.write_text('{"last_ip": "192.168.1.9"}', encoding="utf-8")
+        with mock.patch.object(core, "get_settings_path", return_value=str(self.config_path)), \
+                mock.patch.object(core, "_read_settings_json", side_effect=PermissionError(13, "denied")):
+            self.assertFalse(core.update_settings({"last_ip": "192.168.1.88"}))
+            self.assertEqual(self.config_path.read_text(encoding="utf-8"), '{"last_ip": "192.168.1.9"}')
+
+    def test_list_settings_validation_coerces_bad_types(self):
+        import json
+        from mimonitor_toolbox import core
+
+        self.config_path.write_text(
+            json.dumps({
+                "scan_force_devices": "not-a-list",
+                "scan_block_devices": ["eth0", {"bad": 1}, 123, True],
+                "scan_force_subnets": 42,
+                "tray_items": None,
+            }),
+            encoding="utf-8",
+        )
+        with mock.patch.object(core, "get_settings_path", return_value=str(self.config_path)):
+            loaded = core.load_settings()
+        self.assertEqual(loaded["scan_force_devices"], [])
+        self.assertEqual(loaded["scan_block_devices"], ["eth0", "123"])
+        self.assertEqual(loaded["scan_force_subnets"], [])
+        self.assertEqual(loaded["tray_items"], ["picture_mode", "local_dimming", "backlight"])
+
+    def test_relative_settings_path_and_replace_retry(self):
+        import os
+        from mimonitor_toolbox import core
+
+        old_cwd = os.getcwd()
+        os.chdir(self.temp_dir.name)
+        try:
+            real_replace = os.replace
+            attempts = [0]
+
+            def flaky_replace(src, dst):
+                attempts[0] += 1
+                if attempts[0] == 1:
+                    raise PermissionError(5, "Access denied")
+                return real_replace(src, dst)
+
+            with mock.patch.dict(os.environ, {"MIMONITOR_SETTINGS_PATH": "config.json"}), \
+                    mock.patch.object(core.os, "replace", side_effect=flaky_replace), \
+                    mock.patch.object(core.time, "sleep"):
+                self.assertTrue(core.update_settings({"last_ip": "192.168.1.55"}))
+            self.assertEqual(attempts[0], 2)
+            self.assertTrue((Path(self.temp_dir.name) / "config.json").exists())
+        finally:
+            os.chdir(old_cwd)
+
+    def test_emit_detail_log_uses_cache_and_invalidation(self):
+        from mimonitor_toolbox import core
+
+        log_calls = []
+        host = type("Host", (), {"log": log_calls.append})()
+        with mock.patch.object(core, "get_settings_path", return_value=str(self.config_path)):
+            core.invalidate_verbose_log_cache()
+            core.update_settings({"verbose_log": True})
+            with mock.patch.object(core.json, "load", wraps=core.json.load) as load_spy:
+                core.emit_detail_log(host, "first")
+                core.emit_detail_log(host, "second")
+                self.assertEqual(load_spy.call_count, 1)
+            core.update_settings({"verbose_log": False})
+            core.emit_detail_log(host, "third")
+        self.assertEqual(log_calls, ["first", "second"])
 
 
 if __name__ == "__main__":

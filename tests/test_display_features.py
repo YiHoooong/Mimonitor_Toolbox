@@ -1,7 +1,18 @@
+import time
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
+
+
+_qt_application = None
+
+
+def setUpModule():
+    global _qt_application
+    from PyQt6.QtWidgets import QApplication
+
+    _qt_application = QApplication.instance() or QApplication([])
 
 
 class DisplayFeatureTests(unittest.TestCase):
@@ -211,8 +222,12 @@ class CrosshairModeReconcileTests(unittest.TestCase):
         calls = []
 
         class Host(DisplayFeaturesMixin):
-            def _set_game_feature(self, key, value, message, retrigger_game_mode=False):
+            def _set_game_feature(
+                self, key, value, message, retrigger_game_mode=False, on_success=None
+            ):
                 calls.append((key, value, retrigger_game_mode))
+                if callable(on_success):
+                    on_success()
 
             def _update_crosshair_mode_status_label(self):
                 pass
@@ -1746,6 +1761,8 @@ class MonitorVolumeFeatureTests(unittest.TestCase):
                 if should_fail:
                     raise RuntimeError("adb failed")
 
+        timer_events = []
+
         class Host(display_features.DisplayFeaturesMixin):
             adb_connected = True
             adb = FakeAdb()
@@ -1761,11 +1778,12 @@ class MonitorVolumeFeatureTests(unittest.TestCase):
             _adjust_hotkey_pending = {}
             _adjust_hotkey_timers = {
                 "volume": SimpleNamespace(
-                    stop=lambda: None,
-                    setInterval=lambda _ms: None,
-                    start=lambda: None,
+                    stop=lambda: timer_events.append("stop"),
+                    setInterval=lambda ms: timer_events.append(("interval", ms)),
+                    start=lambda: timer_events.append("start"),
                 )
             }
+            Host_timer_events = timer_events
             _adjust_hotkey_resolving = set()
             _control_rollback_values = {}
             values_signal = SimpleNamespace(emit=lambda d: emitted.append(dict(d)))
@@ -1803,6 +1821,12 @@ class MonitorVolumeFeatureTests(unittest.TestCase):
         self.assertEqual(host.tray_entry_value("volume"), 15)
 
         host.tray_set_value("volume", 42)
+        # 即使关闭快捷键倒计时，托盘滑块仍按 300ms 去抖等待提交
+        self.assertIn(("interval", 300), host.Host_timer_events)
+        self.assertIn("start", host.Host_timer_events)
+        self.assertEqual(calls, [])
+
+        host._commit_pending_adjustment("volume")
         self.assertEqual(host.current_vals["volume_music_speaker"], 42)
         self.assertEqual(host.current_vals["media_muted"], 0)
         self.assertIn(("set_media_volume", 42, True, False, True), calls)
@@ -2540,6 +2564,554 @@ class FullPresetIntegrationTests(unittest.TestCase):
                 "  · 跳过 色增益（色温不是「自定义」，色增益不生效）",
             ],
         )
+
+
+class DisplayFeatureRegressionFixTests(unittest.TestCase):
+    """回归覆盖 FreeSync/MEMC/色增益/失败回滚/HDR连接恢复/自动任务交接等修复。"""
+
+    def _make_control_host(self, *, fail_adb=False, source="23", edid="2", fs="0", extra_vals=None):
+        import inspect
+        from PyQt6.QtCore import QObject
+        from mimonitor_toolbox import display_features
+
+        calls = []
+        logs = []
+        emitted = []
+        jni_emitted = []
+        highlights = []
+        mode_highlights = []
+        refreshes = []
+        switch_states = []
+
+        class FakeTimer:
+            def __init__(self):
+                self.stops = 0
+                self.starts = []
+                self.intervals = []
+
+            def stop(self):
+                self.stops += 1
+
+            def setInterval(self, ms):
+                self.intervals.append(ms)
+
+            def start(self, *args):
+                self.starts.append(args)
+
+        class FakeSwitch:
+            def __init__(self):
+                self.checked = False
+                self.blocked = []
+
+            def blockSignals(self, flag):
+                self.blocked.append(flag)
+                return False
+
+            def setChecked(self, val):
+                self.checked = bool(val)
+                switch_states.append(bool(val))
+
+        class FakeAdb:
+            def __init__(self):
+                self.queries = {}
+
+            def transaction(self):
+                return nullcontext()
+
+            def shell(self, cmd, check=False):
+                calls.append(("shell", cmd, check))
+
+            def get(self, key, check=False):
+                calls.append(("get", key, check))
+                if key == "mitv.tvplayer.hdmi.last.source":
+                    return source
+                return self.queries.get(key, "")
+
+            def jni_get(self, key, check=False):
+                calls.append(("jni_get", key, check))
+                return ""
+
+            def jni_batch_get_or_single(self, keys, check=False):
+                calls.append(("jni_batch", tuple(keys)))
+                return {
+                    "g_fusion_picture__hdmi_edid_version": edid,
+                    "g_video__freesync_switch": fs,
+                }
+
+            def put(self, key, val, check=False):
+                calls.append(("put", key, val, check))
+                if fail_adb:
+                    raise RuntimeError("adb put failed")
+
+            def jni_set(self, key, val, upd=3, check=False):
+                calls.append(("jni_set", key, val, upd, check))
+                if fail_adb:
+                    raise RuntimeError("adb jni_set failed")
+
+            def jni_set_color_gains(self, r, g, b, check=False):
+                calls.append(("jni_set_color_gains", r, g, b, check))
+                if fail_adb:
+                    raise RuntimeError("adb gains failed")
+
+            def hdr_tone_mapping(self, value, upd=3, check=False):
+                calls.append(("hdr_tone_mapping", value, upd, check))
+                if fail_adb:
+                    raise RuntimeError("adb hdr failed")
+
+            def check_and_heal_jar(self):
+                pass
+
+            def refresh_pq(self, check=False):
+                calls.append(("refresh_pq", check))
+                if fail_adb:
+                    raise RuntimeError("adb refresh failed")
+
+            def media_muted(self, check=False):
+                calls.append(("media_muted", check))
+                return False
+
+            def set_media_muted(self, muted, show_ui=False, check=False):
+                calls.append(("set_media_muted", muted, show_ui, check))
+                if fail_adb:
+                    raise RuntimeError("adb mute failed")
+
+        class Host(display_features.DisplayFeaturesMixin, QObject):
+            def __init__(self):
+                super().__init__()
+                self.adb_connected = True
+                self.adb = FakeAdb()
+                self.current_vals = dict(extra_vals or {})
+                self.state_buttons = {}
+                self.mode_btns = {}
+                self.sliders = {}
+                self.osd = None
+                self.light_sensor_switch = FakeSwitch()
+                self.source_label = SimpleNamespace(setText=lambda _t: None)
+                self._source_names = {"23": "HDMI 1", "29": "DP"}
+                self._cycle_hotkey_pending = {}
+                self._cycle_hotkey_timers = {}
+                self._control_rollback_values = {}
+                self._adjust_hotkey_pending = {}
+                self._adjust_hotkey_timers = {}
+                self._adjust_hotkey_resolving = set()
+                self._picture_mode_switch_seq = 0
+                self._local_dimming_toggle_suspended = False
+                self._local_dimming_memory_suppress_until = 0.0
+                self._local_dimming_toggle_resolving = False
+                self._media_mute_resolving = False
+                self._adb_busy_until = 0.0
+                self._display_change_refresh_suppress_until = 0.0
+                self._page_loaded = {"picturePage", "gamePage", "sourcePage", "lightPage"}
+                self._preset_sync_timer = FakeTimer()
+                self._preset_verify_timer = FakeTimer()
+                self.values_signal = SimpleNamespace(emit=lambda d: emitted.append(dict(d)))
+                self.jni_values_signal = SimpleNamespace(emit=lambda d: jni_emitted.append(dict(d)))
+
+            def isVisible(self):
+                return True
+
+            def isMinimized(self):
+                return False
+
+            def check_connection(self):
+                return self.adb_connected
+
+            def _mark_adb_busy(self, seconds=2.0):
+                pass
+
+            def _suppress_display_change_refresh(self, seconds=2.0):
+                pass
+
+            def _note_picture_change(self):
+                pass
+
+            def _start_source_polling(self):
+                pass
+
+            def _optimistic_highlight(self, key, val):
+                highlights.append((key, val))
+
+            def _highlight_mode(self, mode):
+                mode_highlights.append(mode)
+
+            def _refresh_pages(self, pages, delay_ms=0, force=False):
+                refreshes.append((tuple(pages), delay_ms, force))
+
+            def _force_refresh_page(self, page):
+                refreshes.append((("force", page), 0, True))
+
+            def log(self, msg):
+                logs.append(msg)
+
+            def log_detail(self, msg):
+                logs.append(msg)
+
+            def _run_adb_action(self, label, operation, on_success=None, on_failure=None):
+                try:
+                    operation()
+                except Exception as exc:
+                    if on_failure:
+                        if len(inspect.signature(on_failure).parameters) > 0:
+                            on_failure(exc)
+                        else:
+                            on_failure()
+                    return
+                if on_success:
+                    on_success()
+
+        host = Host()
+        return host, calls, logs, emitted, jni_emitted, highlights, mode_highlights, refreshes, switch_states
+
+    def test_freesync_hotkey_uses_prior_state_and_refreshes_before_restoring_mode(self):
+        from mimonitor_toolbox import display_features
+
+        settings = {
+            "freesync_mode_memory_enabled": True,
+            "freesync_previous_mode": None,
+            "active_preset_id": None,
+            "hotkey_countdown_enabled": False,
+        }
+        host, calls, *_ = self._make_control_host(extra_vals={"freesync": 0, "picture_mode": 14})
+        with mock.patch.object(display_features, "load_settings", side_effect=lambda: dict(settings)), \
+                mock.patch.object(display_features, "update_settings", side_effect=settings.update):
+            host.trigger_hotkey_action("freesync_toggle")
+            self.assertEqual(settings["freesync_previous_mode"], 14)
+
+            calls.clear()
+            host.adb = host.adb.__class__()
+            host.current_vals["picture_mode"] = 10
+            host._stage_cycle_hotkey_action(
+                "freesync_toggle", "freesync", [(0, "关"), (1, "开")], "FreeSync",
+                lambda val, _name: host._fsync(val == 1),
+            )
+
+        refresh_idx = calls.index(("refresh_pq", True))
+        mode_idx = calls.index(("put", "picture_mode", "14", True))
+        self.assertLess(refresh_idx, mode_idx)
+        self.assertEqual(calls[-1], ("refresh_pq", True))
+        self.assertEqual(host.current_vals["picture_mode"], 14)
+
+    def test_set_memc_does_not_overwrite_xiaomi_picture_mode_with_mtk_enum(self):
+        from mimonitor_toolbox import core, display_features
+
+        host, calls, *_ = self._make_control_host(extra_vals={"picture_mode": 10, core.MEMC_SETTINGS_KEY: 0})
+        host.adb.queries["picture_mode"] = "10"
+
+        def fake_jni_batch(keys, check=False):
+            return {"g_video__picture_mode": "69"}
+
+        host.adb.jni_batch_get_or_single = fake_jni_batch
+        with mock.patch.object(display_features, "evaluate_memc_conditions") as eval_mock, \
+                mock.patch.object(display_features, "write_memc_value") as write_mock:
+            eval_mock.return_value = SimpleNamespace(case="C", mode=69)
+            host._set_memc(2, "中")
+        write_mock.assert_called_once()
+        self.assertEqual(host.current_vals["picture_mode"], 10)
+        self.assertEqual(host.current_vals[core.MEMC_SETTINGS_KEY], 2)
+
+    def test_color_gain_staging_no_ui_adb_and_async_resolve_plus_rollback(self):
+        from mimonitor_toolbox import core, display_features
+
+        # 1) 暂存阶段（未 commit）不得发任何 ADB 读/写；且保留原始色温以便回滚
+        host, calls, _, emitted, _, highlights, *_ = self._make_control_host(
+            extra_vals={"picture_color_temperature": 1, "picture_red_gain": 1000}
+        )
+        host._adjust_hotkey_timers["red_gain"] = SimpleNamespace(
+            stop=lambda: None, setInterval=lambda _ms: None, start=lambda: None
+        )
+        cfg = core.ADJUSTABLE_HOTKEY_PARAMS["red_gain"]
+        with mock.patch.object(display_features, "load_settings", return_value={"hotkey_countdown_enabled": True, "hotkey_countdown_seconds": 0.5}):
+            host._stage_adjustable_display_value("red_gain", cfg, 1100, show_hud=False)
+        self.assertEqual(calls, [])
+        self.assertEqual(host.current_vals["picture_color_temperature"], 1)
+
+        # 未连接时中止 commit，必须回滚暂存值
+        host.adb_connected = False
+        host._commit_pending_adjustment("red_gain")
+        self.assertEqual(host.current_vals["picture_red_gain"], 1000)
+
+        # 2) 已连接但缺失 green/blue 增益时，在 worker 内异步补读；且仅 put 单轴
+        host2, calls2, *_ = self._make_control_host(
+            extra_vals={"picture_color_temperature": 3, "picture_red_gain": 1024}
+        )
+        host2.adb.queries["picture_green_gain"] = "1080"
+        host2.adb.queries["picture_blue_gain"] = "960"
+        host2._set_color_gain("红增益", "picture_red_gain", "g_video__clr_gain_r", 1120)
+        self.assertIn(("jni_set_color_gains", 1120, 1080, 960, True), calls2)
+        self.assertEqual([c for c in calls2 if c[0] == "put"], [("put", "picture_red_gain", "1120", True)])
+        self.assertFalse(any(c[0] == "jni_set" and c[1] == "g_video__clr_temp" for c in calls2))
+        self.assertEqual(host2.current_vals["picture_green_gain"], 1080)
+        self.assertEqual(host2.current_vals["picture_blue_gain"], 960)
+
+        # 3) 写入失败时，不得残留在色温 3 或新增益值
+        host3, _, _, emitted3, _, highlights3, *_ = self._make_control_host(
+            fail_adb=True,
+            extra_vals={"picture_color_temperature": 1, "picture_red_gain": 1000, "picture_green_gain": 1024, "picture_blue_gain": 1024},
+        )
+        host3._adjust_hotkey_timers["red_gain"] = SimpleNamespace(
+            stop=lambda: None, setInterval=lambda _ms: None, start=lambda: None
+        )
+        with mock.patch.object(display_features, "load_settings", return_value={"hotkey_countdown_enabled": False}):
+            host3._stage_adjustable_display_value("red_gain", cfg, 1150, show_hud=False)
+        self.assertEqual(host3.current_vals["picture_color_temperature"], 1)
+        self.assertEqual(host3.current_vals["picture_red_gain"], 1000)
+        self.assertEqual(highlights3[-1], ("picture_color_temperature", 1))
+        self.assertEqual(emitted3[-1]["picture_color_temperature"], 1)
+
+    def test_failure_with_none_previous_clears_state_and_disconnect_reverts(self):
+        from mimonitor_toolbox import core, display_features
+
+        # previous is None 时，失败应清理 current_vals 并取消按钮高亮
+        host, _calls, _logs, _emitted, _jni_emitted, highlights, mode_highlights, *_ = self._make_control_host(
+            fail_adb=True
+        )
+        host._set_mode(10, "游戏")
+        self.assertNotIn("picture_mode", host.current_vals)
+        self.assertEqual(mode_highlights[-1], None)
+
+        host._320(True)
+        self.assertNotIn("mode_320", host.current_vals)
+        self.assertEqual(highlights[-1], ("mode_320", None))
+
+        host._fsync(True)
+        self.assertNotIn("freesync", host.current_vals)
+        self.assertEqual(highlights[-1], ("freesync", None))
+
+        host._jni("g_video__vid_od_response_time", 2, "picture_response_time", "响应时间: 快速")
+        self.assertNotIn("picture_response_time", host.current_vals)
+        self.assertEqual(highlights[-1], ("picture_response_time", None))
+
+        host._set_color_temp(2, 1, "色温: 标准")
+        self.assertNotIn("picture_color_temperature", host.current_vals)
+        self.assertEqual(highlights[-1], ("picture_color_temperature", None))
+
+        host._commit_screen_light("屏幕灯模式: 常亮", {"atmosphere_light_switcher_pm2": 1})
+        self.assertNotIn("atmosphere_light_switcher_pm2", host.current_vals)
+        self.assertEqual(highlights[-1], ("atmosphere_light_switcher_pm2", None))
+
+        # _set_light_sensor 未连接时应还原 switch
+        host.adb_connected = False
+        host.light_sensor_switch.checked = True
+        host._set_light_sensor(True)
+        self.assertFalse(host.light_sensor_switch.checked)
+
+        # 循环快捷键断开后 commit 应回滚 staged 值
+        host.adb_connected = True
+        host.current_vals["picture_mode"] = 14
+        host._cycle_hotkey_timers["picture_mode_cycle"] = SimpleNamespace(
+            stop=lambda: None, setInterval=lambda _ms: None, start=lambda: None
+        )
+        with mock.patch.object(display_features, "load_settings", return_value={"hotkey_countdown_enabled": True, "hotkey_countdown_seconds": 0.5}):
+            host._stage_cycle_hotkey_action(
+                "picture_mode_cycle", "picture_mode", [(14, "标准"), (10, "游戏")], "画面模式",
+                lambda val, name: host._set_mode(val, name),
+            )
+        self.assertEqual(host.current_vals["picture_mode"], 10)
+        host.adb_connected = False
+        host._commit_cycle_hotkey_action("picture_mode_cycle")
+        self.assertEqual(host.current_vals["picture_mode"], 14)
+
+        # _set_adjustable_display_value 失败回滚且不强制刷新 picturePage
+        host2, _, _, emitted2, _, _, _, refreshes2, _ = self._make_control_host(
+            fail_adb=True, extra_vals={"picture_contrast": 50}
+        )
+        host2._set_adjustable_display_value("contrast", core.ADJUSTABLE_HOTKEY_PARAMS["contrast"], 75)
+        self.assertEqual(host2.current_vals["picture_contrast"], 50)
+        self.assertEqual(emitted2[-1], {"picture_contrast": 50})
+        self.assertEqual(refreshes2, [])
+
+    def test_poll_hdr_memory_skips_state_while_disconnected_and_applies_on_connect(self):
+        from mimonitor_toolbox import display_features
+
+        host, *_ = self._make_control_host()
+        host.adb_connected = False
+        host._hdr_last_state = None
+        host._display_last_mode = None
+        host._hdr_state_source = None
+        host._hdr_windows_state = None
+        applied_checks = []
+        host._query_windows_hdr_state = lambda: True
+        host._query_windows_display_mode = lambda: (2560, 1440, 240)
+        host._update_hdr_memory_status_label = lambda *_a: None
+        host._schedule_hdr_memory_apply = lambda delay_ms=120: applied_checks.append(delay_ms)
+        host._schedule_picture_refresh_after_hdr_change = lambda *a, **kw: None
+        host._hdr_memory_enabled = lambda: True
+
+        host._poll_hdr_memory_state("timer")
+        self.assertIsNone(host._hdr_last_state)
+        self.assertIsNone(host._display_last_mode)
+        self.assertEqual(applied_checks, [])
+
+        host.adb_connected = True
+        host._poll_hdr_memory_state("connected")
+        self.assertIs(host._hdr_last_state, True)
+        self.assertEqual(applied_checks, [120])
+
+    def test_auto_task_direct_a_to_b_carries_baseline_and_failure_keeps_snapshot(self):
+        from mimonitor_toolbox import display_features
+        from mimonitor_toolbox.presets import ApplyResult
+
+        settings = {
+            "active_preset_id": "pa",
+            "presets": [
+                {"id": "pa", "name": "A", "values": {"picture_mode": 9}},
+                {"id": "pb", "name": "B", "values": {"picture_mode": 10}},
+            ],
+            "auto_tasks": [
+                {
+                    "id": "ta",
+                    "preset_id": "pa",
+                    "start": "08:00",
+                    "end": "10:00",
+                    "snapshot": {"values": {"picture_mode": 14, "picture_contrast": 48}, "active_preset_id": None},
+                },
+                {"id": "tb", "preset_id": "pb", "start": "10:00", "end": "12:00", "snapshot": None},
+            ],
+        }
+        host, *_ = self._make_control_host()
+        host._auto_task_active_id = "ta"
+        host._auto_task_checking = False
+        host._auto_task_waiting_id = None
+        host._auto_task_deferred_id = None
+        host.active_preset_id = lambda: settings.get("active_preset_id")
+        host._read_picture_values = lambda: {"picture_mode": 9, "picture_contrast": 99}
+        host._refresh_preset_views = lambda: None
+        host._show_preset_switching_overlay = lambda: None
+        host._hide_preset_switching_overlay = lambda: None
+        host._schedule_preset_verify = lambda _ms: None
+
+        # A -> B 若写入失败，保留 A 为活动任务且保留 A 的原始基线快照
+        fake_now = time.struct_time((2026, 11, 15, 10, 30, 0, 6, 319, -1))
+        with mock.patch.object(display_features, "load_settings", side_effect=lambda: dict(settings)), \
+                mock.patch.object(display_features, "update_settings", side_effect=settings.update), \
+                mock.patch.object(display_features.time, "localtime", return_value=fake_now), \
+                mock.patch.object(display_features, "apply_preset", side_effect=RuntimeError("boom")):
+            host._auto_task_tick()
+        self.assertEqual(host._auto_task_active_id, "ta")
+        self.assertEqual(settings["auto_tasks"][0]["snapshot"]["values"], {"picture_mode": 14, "picture_contrast": 48})
+        self.assertIsNone(settings["auto_tasks"][1]["snapshot"])
+
+        # A -> B 成功时，把 A 的原始基线快照转移给 B，不采样 A 的值覆盖基线
+        with mock.patch.object(display_features, "load_settings", side_effect=lambda: dict(settings)), \
+                mock.patch.object(display_features, "update_settings", side_effect=settings.update), \
+                mock.patch.object(display_features.time, "localtime", return_value=fake_now), \
+                mock.patch.object(display_features, "apply_preset", return_value=ApplyResult(applied=["画面模式"])):
+            host._auto_task_tick()
+        self.assertEqual(host._auto_task_active_id, "tb")
+        self.assertIsNone(settings["auto_tasks"][0]["snapshot"])
+        self.assertEqual(settings["auto_tasks"][1]["snapshot"]["values"], {"picture_mode": 14, "picture_contrast": 48})
+
+    def test_p2_fixes_tray_offset_submode_crosshair_preset_fail_and_hdmi_refresh(self):
+        from mimonitor_toolbox import core, display_features
+        from mimonitor_toolbox.presets import ApplyResult
+
+        host, calls, _logs, _emitted, _jni_emitted, _hl, _mhl, refreshes, _ = self._make_control_host(
+            extra_vals={"atmosphere_light_illumination": 0, "picture_mode": 25}
+        )
+        # 1) atmosphere_illumination tray_entry_value 含 +1 ui_offset
+        self.assertEqual(host.tray_entry_value("atmosphere_illumination"), 1)
+
+        # 2) _set_game_feature(retrigger_game_mode=True) 保留 25 子模式，而非写死 10
+        with mock.patch.object(display_features.time, "sleep"):
+            host._set_game_feature("front_sight_index", 3, "准星: 3", retrigger_game_mode=True)
+        self.assertIn(("put", "picture_mode", "25", True), calls)
+        self.assertNotIn(("put", "picture_mode", "10", True), calls)
+
+        # 3) _fs 取消确认或 ADB 失败时不落盘 crosshair_memory
+        settings = {"crosshair_game_mode_only": True, "crosshair_memory": 2}
+        host_fail, *_ = self._make_control_host(fail_adb=True, extra_vals={"picture_mode": 14})
+        host_fail._update_crosshair_mode_status_label = lambda: None
+        with mock.patch.object(display_features, "load_settings", side_effect=lambda: dict(settings)), \
+                mock.patch.object(display_features, "update_settings", side_effect=settings.update), \
+                mock.patch.object(display_features.DisplayFeaturesMixin, "_confirm_switch_to_game_mode", return_value=False):
+            host_fail._fs(5)
+            self.assertEqual(settings["crosshair_memory"], 2)
+        with mock.patch.object(display_features, "load_settings", side_effect=lambda: dict(settings)), \
+                mock.patch.object(display_features, "update_settings", side_effect=settings.update), \
+                mock.patch.object(display_features.DisplayFeaturesMixin, "_confirm_switch_to_game_mode", return_value=True):
+            host_fail._fs(5)
+            self.assertEqual(settings["crosshair_memory"], 2)
+
+        # 4) _apply_picture_values 停止 _preset_sync_timer，且 failed 项不污染 current_vals
+        host._show_preset_switching_overlay = lambda: None
+        host._hide_preset_switching_overlay = lambda: None
+        host._schedule_preset_verify = lambda _ms: None
+        fake_res = ApplyResult(applied=["背光"], failed=[("对比度", "timeout")])
+        with mock.patch.object(display_features, "apply_preset", return_value=fake_res):
+            host._apply_picture_values({"picture_backlight": 66, "picture_contrast": 88}, "应用测试")
+        self.assertEqual(host._preset_sync_timer.stops, 1)
+        self.assertEqual(host.current_vals["picture_backlight"], 66)
+        self.assertNotIn("picture_contrast", host.current_vals)
+
+        # 5) _stage_cycle_hotkey_action 支持字符串子模式 "25" 与声音输出 "3"
+        host.current_vals["picture_mode"] = "25"
+        host._cycle_hotkey_timers["picture_mode_cycle"] = SimpleNamespace(
+            stop=lambda: None, setInterval=lambda _ms: None, start=lambda: None
+        )
+        committed_vals = []
+        with mock.patch.object(display_features, "load_settings", return_value={"hotkey_countdown_enabled": False}):
+            host._stage_cycle_hotkey_action(
+                "picture_mode_cycle", "picture_mode", [(14, "标准"), (10, "游戏"), (9, "电影")], "画面模式",
+                lambda v, _n: committed_vals.append(v),
+            )
+        self.assertEqual(committed_vals, [9])
+
+        # 6) toggle_media_mute 在缺失 media_muted 解析期间阻止并发重复触发
+        pending_ops = []
+        host_mute, *_ = self._make_control_host()
+        host_mute._run_adb_action = lambda label, op, ok=None, fail=None: pending_ops.append((label, op, ok, fail))
+        host_mute.toggle_media_mute()
+        host_mute.toggle_media_mute()
+        self.assertEqual(len(pending_ops), 1)
+        pending_ops[0][1]()
+        pending_ops[0][2]()
+        self.assertFalse(host_mute._media_mute_resolving)
+        self.assertEqual(len(pending_ops), 2)
+
+        # 7) HDMI 切换成功刷新 picturePage 和 gamePage
+        host._set("mitv.tvplayer.hdmi.last.source", "23", "输入源: HDMI 1")
+        self.assertIn((("picturePage", "gamePage"), 800, True), refreshes)
+
+    def test_direct_input_source_hotkeys_and_fallback(self):
+        from mimonitor_toolbox import display_features
+
+        host, calls, _logs, emitted, _jni_emitted, _hl, _mhl, refreshes, _ = self._make_control_host()
+        set_source_calls = []
+        host.adb.set_input_source = lambda val, check=False: set_source_calls.append((val, check))
+
+        # input_source_cycle 已移除，触发不产生操作
+        with mock.patch.object(display_features, "load_settings", return_value={"hotkey_countdown_enabled": False}):
+            host.trigger_hotkey_action("input_source_cycle")
+        self.assertEqual(set_source_calls, [])
+
+        # 连按不同直切热键共享 input_source_direct 槽位并更新 HUD/状态
+        timer = SimpleNamespace(stops=0, intervals=[], starts=0)
+        timer.stop = lambda: setattr(timer, "stops", timer.stops + 1)
+        timer.setInterval = lambda ms: timer.intervals.append(ms)
+        timer.start = lambda: setattr(timer, "starts", timer.starts + 1)
+        host._cycle_hotkey_timers["input_source_direct"] = timer
+
+        hud_calls = []
+        host.osd = SimpleNamespace(
+            show_hud=lambda *a, **kw: hud_calls.append((a, kw)),
+            end_countdown=lambda: None,
+        )
+        with mock.patch.object(display_features, "load_settings", return_value={"hotkey_countdown_enabled": True, "hotkey_countdown_seconds": 0.6}):
+            host.trigger_hotkey_action("input_source_hdmi1")
+            host.trigger_hotkey_action("input_source_dp")
+            self.assertEqual(host.current_vals["mitv.tvplayer.hdmi.last.source"], 29)
+            self.assertEqual(hud_calls[-1], (("信号源", "DP"), {"countdown": 0.6}))
+            self.assertEqual(set_source_calls, [])
+            host._commit_cycle_hotkey_action("input_source_direct")
+
+        self.assertEqual(set_source_calls, [(29, True)])
+        self.assertIn(("refresh_pq", True), calls)
+        self.assertIn({"mitv.tvplayer.hdmi.last.source": 29}, emitted)
+
+        # 关闭倒计时后 USBC 直接下发
+        with mock.patch.object(display_features, "load_settings", return_value={"hotkey_countdown_enabled": False}):
+            host.trigger_hotkey_action("input_source_usbc")
+        self.assertEqual(set_source_calls[-1], (30, True))
 
 
 if __name__ == "__main__":

@@ -25,7 +25,9 @@ enum NetworkScan {
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = in_port_t(port).bigEndian
-        addr.sin_addr = in_addr(s_addr: inet_addr(host))
+        guard host.withCString({ inet_pton(AF_INET, $0, &addr.sin_addr) }) == 1 else {
+            return false
+        }
 
         let ret = withUnsafePointer(to: &addr) { ptr in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
@@ -105,7 +107,19 @@ enum NetworkScan {
         process.standardOutput = pipe
         process.standardError = Pipe()
         do { try process.run() } catch { return [] }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        var data = Data()
+        let group = DispatchGroup()
+        group.enter()
+        DispatchQueue.global().async {
+            data = pipe.fileHandleForReading.readDataToEndOfFile()
+            group.leave()
+        }
+        if group.wait(timeout: .now() + 5) == .timedOut {
+            process.terminate()
+            _ = group.wait(timeout: .now() + 1)
+            process.waitUntilExit()
+            return []
+        }
         process.waitUntilExit()
 
         let text = String(data: data, encoding: .utf8) ?? ""

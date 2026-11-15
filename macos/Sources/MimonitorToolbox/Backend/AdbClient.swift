@@ -1,19 +1,99 @@
 import Foundation
 import MimonitorPresetCore
+#if canImport(Darwin)
+import Darwin
+private let tcpStreamType: Int32 = SOCK_STREAM
+private func posixConnect(_ fd: Int32, _ addr: UnsafePointer<sockaddr>, _ len: socklen_t) -> Int32 {
+    Darwin.connect(fd, addr, len)
+}
+#elseif canImport(Glibc)
+import Glibc
+private let tcpStreamType: Int32 = Int32(SOCK_STREAM.rawValue)
+private func posixConnect(_ fd: Int32, _ addr: UnsafePointer<sockaddr>, _ len: socklen_t) -> Int32 {
+    Glibc.connect(fd, addr, len)
+}
+#endif
 
 struct ProcessResult {
     let output: String
     let exitCode: Int32
 }
 
-/// ADB 客户端（移植自 adb.py）：封装对独立 adb server 的调用。
+struct DaemonQueryResult: Equatable {
+    let settings: [String: String]
+    let jni: [String: Int]
+    let flags: [String: String]
+    let elapsedMs: Int?
+}
+
+struct DaemonBatchStep: Equatable {
+    let index: Int
+    let ok: Bool
+    let detail: String
+}
+
+enum DaemonBatchOp: Equatable {
+    case put(key: String, value: String)
+    case jniSet(key: String, value: Int, upd: Int)
+    case jniRamp(key: String, from: Int, to: Int, upd: Int, stepMs: Int, stepSize: Int)
+    case colorGains(red: Int, green: Int, blue: Int)
+    case hdrToneMapping(value: Int, upd: Int)
+    case soundOutput(deviceId: Int)
+    case setSource(sourceId: Int)
+    case led(action: String, args: [String])
+    case volSet(value: Int, unmuteFirst: Bool, showUi: Bool)
+    case volMute(muted: Bool, showUi: Bool)
+    case key(code: String)
+    case sleep(ms: Int)
+    case refreshPq
+}
+
+private final class LockedDataBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = Data()
+
+    func set(_ data: Data) {
+        lock.lock()
+        storage = data
+        lock.unlock()
+    }
+
+    func get() -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+}
+
+/// ADB 客户端（移植自 adb.py）：封装对独立 adb server 的调用，并支持混合加速 Daemon 通道。
 final class AdbClient {
     let adbPath: String
     let serverPort: String
     var ip: String = ""
+    var connectionMode: ConnectionMode = .adb
+
     private let channelLock = NSRecursiveLock()
     private let ignoredScanLock = NSLock()
     private var ignoredScanIPs: Set<String> = []
+    private let daemonStateLock = NSRecursiveLock()
+    private let lifecycleLock = NSLock()
+
+    private var spawnBlocked: Bool = false
+    private var daemonReady: Bool = false
+    private var daemonIp: String = ""
+    private var daemonForwardPort: Int?
+    private var daemonPutSupported: Bool?
+    private var daemonVolSupported: Bool?
+    private var daemonJarHealedIp: String = ""
+    private var daemonRetryAfter: Date = .distantPast
+    private var daemonNeedsRestart: Bool = false
+
+    private var batchDepth: Int = 0
+    private var batchOps: [DaemonBatchOp] = []
+    private var batchReadCache: [String: String] = [:]
+    private var batchJniCache: [String: Int] = [:]
+    /// 仅供单元测试将 `adb forward` 成功后的本地端口重定向到测试 TCP 服务器
+    var testForwardPortOverride: Int?
 
     func clearIgnoredScanIPs() {
         ignoredScanLock.lock()
@@ -53,12 +133,20 @@ final class AdbClient {
     }
 
     init(adbPath: String = AdbClient.locateAdb(),
-         serverPort: String = ProcessInfo.processInfo.environment["MIMONITOR_ADB_SERVER_PORT"] ?? "5038") {
+         serverPort: String = ProcessInfo.processInfo.environment["MIMONITOR_ADB_SERVER_PORT"] ?? "5038",
+         connectionMode: ConnectionMode = .adb) {
         self.adbPath = adbPath
         self.serverPort = serverPort
+        self.connectionMode = connectionMode
     }
 
     var serial: String { ip.isEmpty ? "" : "\(ip):5555" }
+
+    var isDaemonMode: Bool {
+        daemonStateLock.lock()
+        defer { daemonStateLock.unlock() }
+        return connectionMode == .daemon
+    }
 
     // MARK: - 资源定位
 
@@ -113,12 +201,49 @@ final class AdbClient {
         return cache
     }
 
+    // MARK: - 安全引用与参数检查
+
+    static func isSafeToken(_ token: String) -> Bool {
+        !token.isEmpty && token.allSatisfy { ch in
+            ch.isASCII && (ch.isLetter || ch.isNumber || ch == "_" || ch == "." || ch == "-" || ch == "/" || ch == ":")
+        }
+    }
+
+    static func shellQuoteIfNeeded(_ value: String) -> String {
+        if isSafeToken(value) { return value }
+        return "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private static func hasAdbDisconnectMarker(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        return lower.contains("device offline")
+            || lower.contains("device not found")
+            || lower.contains("not found")
+            || lower.contains("offline")
+            || lower.contains("unauthorized")
+            || lower.contains("closed")
+    }
+
     // MARK: - 进程执行
 
     @discardableResult
-    func run(_ args: [String], timeout: TimeInterval = 15) -> ProcessResult {
-        channelLock.lock()
-        defer { channelLock.unlock() }
+    func run(_ args: [String], timeout: TimeInterval = 15, useChannelLock: Bool = true) -> ProcessResult {
+        if useChannelLock {
+            channelLock.lock()
+        }
+        defer {
+            if useChannelLock {
+                channelLock.unlock()
+            }
+        }
+
+        lifecycleLock.lock()
+        let blocked = spawnBlocked
+        lifecycleLock.unlock()
+        if blocked && args.first != "kill-server" {
+            return ProcessResult(output: "应用正在退出，已取消 ADB 命令", exitCode: -1)
+        }
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: adbPath)
         process.arguments = args
@@ -137,23 +262,229 @@ final class AdbClient {
             return ProcessResult(output: "执行失败: \(error.localizedDescription)", exitCode: -1)
         }
 
-        var outData = Data()
-        var errData = Data()
+        let outBox = LockedDataBox()
+        let errBox = LockedDataBox()
         let group = DispatchGroup()
         group.enter()
-        DispatchQueue.global().async { outData = stdout.fileHandleForReading.readDataToEndOfFile(); group.leave() }
+        DispatchQueue.global().async {
+            outBox.set(stdout.fileHandleForReading.readDataToEndOfFile())
+            group.leave()
+        }
         group.enter()
-        DispatchQueue.global().async { errData = stderr.fileHandleForReading.readDataToEndOfFile(); group.leave() }
+        DispatchQueue.global().async {
+            errBox.set(stderr.fileHandleForReading.readDataToEndOfFile())
+            group.leave()
+        }
 
         if group.wait(timeout: .now() + timeout) == .timedOut {
             process.terminate()
-            _ = group.wait(timeout: .now() + 2)
+            if group.wait(timeout: .now() + 1.5) == .timedOut && process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+                _ = group.wait(timeout: .now() + 1.0)
+            }
         }
         process.waitUntilExit()
 
-        let output = (String(data: outData, encoding: .utf8) ?? "")
-            + (String(data: errData, encoding: .utf8) ?? "")
+        let output = (String(data: outBox.get(), encoding: .utf8) ?? "")
+            + (String(data: errBox.get(), encoding: .utf8) ?? "")
         return ProcessResult(output: output, exitCode: process.terminationStatus)
+    }
+
+    // MARK: - 跨平台 POSIX Socket（server 探活 & Daemon 通道）
+
+    static func isTcpOpen(host: String, port: Int, timeout: Double = 1.0) -> Bool {
+        guard port > 0 && port <= 65535 else { return false }
+        var addr = sockaddr_in()
+        #if canImport(Darwin)
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        #endif
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = in_port_t(UInt16(port)).bigEndian
+        let pton = host.withCString { cstr in
+            inet_pton(AF_INET, cstr, &addr.sin_addr)
+        }
+        guard pton == 1 else { return false }
+
+        let fd = socket(AF_INET, tcpStreamType, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+
+        let flags = fcntl(fd, F_GETFL, 0)
+        guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) >= 0 else { return false }
+
+        let ret = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                posixConnect(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if ret == 0 { return true }
+        guard errno == EINPROGRESS else { return false }
+
+        var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+        let ready = poll(&pfd, 1, Int32(max(1, Int(timeout * 1000))))
+        guard ready > 0 else { return false }
+
+        var err: Int32 = 0
+        var errLen = socklen_t(MemoryLayout<Int32>.size)
+        guard getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errLen) == 0 else { return false }
+        return err == 0
+    }
+
+    static func pickFreeLocalPort() -> Int? {
+        let fd = socket(AF_INET, tcpStreamType, 0)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+
+        var reuse: Int32 = 1
+        _ = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+
+        var addr = sockaddr_in()
+        #if canImport(Darwin)
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        #endif
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = 0
+        _ = "127.0.0.1".withCString { inet_pton(AF_INET, $0, &addr.sin_addr) }
+
+        let bindResult = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                bind(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bindResult == 0 else { return nil }
+
+        var boundAddr = sockaddr_in()
+        var addrLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let nameResult = withUnsafeMutablePointer(to: &boundAddr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                getsockname(fd, sa, &addrLen)
+            }
+        }
+        guard nameResult == 0 else { return nil }
+        let port = Int(UInt16(bigEndian: boundAddr.sin_port))
+        return port > 0 ? port : nil
+    }
+
+    /// 通过本机 TCP 端口与常驻 MtkDirectTool Daemon 交换多行文本协议。
+    /// 必须显式读到完整 `END` 行才算成功；连接中断/截断/超时一律返回 nil。
+    static func rawSocketExchange(port: Int, payload: String, timeout: TimeInterval = 4.0) -> [String]? {
+        guard port > 0 && port <= 65535 else { return nil }
+
+        var addr = sockaddr_in()
+        #if canImport(Darwin)
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        #endif
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = in_port_t(UInt16(port)).bigEndian
+        guard "127.0.0.1".withCString({ inet_pton(AF_INET, $0, &addr.sin_addr) }) == 1 else {
+            return nil
+        }
+
+        let fd = socket(AF_INET, tcpStreamType, 0)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+
+        var nodelay: Int32 = 1
+        _ = setsockopt(fd, Int32(IPPROTO_TCP), TCP_NODELAY, &nodelay, socklen_t(MemoryLayout<Int32>.size))
+
+        let flags = fcntl(fd, F_GETFL, 0)
+        guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) >= 0 else { return nil }
+
+        let deadline = Date().addingTimeInterval(max(0.1, timeout))
+        let connectRes = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                posixConnect(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if connectRes != 0 {
+            guard errno == EINPROGRESS else { return nil }
+            let connectMs = Int32(max(1, min(timeout, 0.5) * 1000))
+            var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+            let ready = poll(&pfd, 1, connectMs)
+            guard ready > 0 else { return nil }
+            var err: Int32 = 0
+            var errLen = socklen_t(MemoryLayout<Int32>.size)
+            guard getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errLen) == 0, err == 0 else { return nil }
+        }
+
+        let wireText = payload.hasSuffix("\n") ? payload : payload + "\n"
+        let bytes = Array(wireText.utf8)
+        var sent = 0
+        while sent < bytes.count {
+            let remainingMs = Int32(deadline.timeIntervalSinceNow * 1000)
+            guard remainingMs > 0 else { return nil }
+            let chunkSize = bytes.count - sent
+            let written = bytes.withUnsafeBytes { rawBuf in
+                guard let base = rawBuf.baseAddress else { return -1 }
+                return send(fd, base.advanced(by: sent), chunkSize, 0)
+            }
+            if written > 0 {
+                sent += written
+                continue
+            }
+            if written == 0 { return nil }
+            let err = errno
+            if err == EINTR { continue }
+            if err == EAGAIN || err == EWOULDBLOCK {
+                var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+                if poll(&pfd, 1, remainingMs) <= 0 { return nil }
+                continue
+            }
+            return nil
+        }
+
+        var rawAccum = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        var lines: [String] = []
+        var sawEnd = false
+        var scanCursor = 0
+
+        func extractCompleteLines() {
+            while scanCursor < rawAccum.count {
+                guard let nlIndex = rawAccum[scanCursor...].firstIndex(of: 0x0A) else { break }
+                var lineSlice = rawAccum[scanCursor..<nlIndex]
+                if lineSlice.last == 0x0D {
+                    lineSlice = lineSlice.dropLast()
+                }
+                let line = String(decoding: lineSlice, as: UTF8.self)
+                scanCursor = nlIndex + 1
+                if line == "END" {
+                    sawEnd = true
+                    return
+                }
+                lines.append(line)
+            }
+        }
+
+        while !sawEnd {
+            let remainingMs = Int32(deadline.timeIntervalSinceNow * 1000)
+            guard remainingMs > 0 else { return nil }
+            var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let ready = poll(&pfd, 1, remainingMs)
+            if ready < 0 {
+                if errno == EINTR { continue }
+                return nil
+            }
+            if ready == 0 { return nil }
+
+            let count = recv(fd, &buffer, buffer.count, 0)
+            if count > 0 {
+                rawAccum.append(contentsOf: buffer[0..<count])
+                extractCompleteLines()
+            } else if count == 0 {
+                // 对端关闭：若未收到完整 END 哨兵则视为截断失败
+                extractCompleteLines()
+                break
+            } else {
+                let err = errno
+                if err == EINTR { continue }
+                if err == EAGAIN || err == EWOULDBLOCK { continue }
+                return nil
+            }
+        }
+
+        guard sawEnd, !lines.isEmpty else { return nil }
+        return lines
     }
 
     // MARK: - 基础命令
@@ -190,7 +521,8 @@ final class AdbClient {
 
     @discardableResult
     func shell(_ command: String) -> String {
-        run(["-s", serial, "shell", command], timeout: 25)
+        guard !serial.isEmpty else { return "" }
+        return run(["-s", serial, "shell", command], timeout: 25)
             .output.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -217,15 +549,20 @@ final class AdbClient {
 
     @discardableResult
     func disconnect(ip: String) -> String {
+        daemonStateLock.lock()
+        let shouldStopDaemon = !ip.isEmpty && (daemonIp == ip || daemonIp.isEmpty)
+        if shouldStopDaemon {
+            mediaVolumeBinderVerified = nil
+        }
+        daemonStateLock.unlock()
+        if shouldStopDaemon {
+            stopDaemon(nonBlockingForwardRemoval: true)
+        }
         guard !ip.isEmpty else { return "" }
-        return run(["disconnect", "\(ip):5555"], timeout: 5).output
+        return run(["disconnect", "\(ip):5555"], timeout: 5, useChannelLock: false).output
     }
 
     /// 等设备进入 device 状态。
-    ///
-    /// `adb connect` 只是把 TCP 连接挂上去就立刻返回，此时 `get-state` 往往还是
-    /// `offline`（adbd 握手还没完成）。只查一次就会把成功的连接误判成失败，
-    /// 所以要轮询等它翻转。`unauthorized` 不会自愈，直接返回。
     func waitForDevice(timeout: TimeInterval = 6) -> String {
         let deadline = Date().addingTimeInterval(timeout)
         var state = deviceState()
@@ -237,19 +574,14 @@ final class AdbClient {
         return state
     }
 
-    /// 重启 adb server。
-    ///
-    /// 长时间运行的 server 会失效：TCP 已经断了、但 server 仍持有旧 transport，
-    /// 此时 `adb connect` 会报 "No route to host" 或 "already connected"，
-    /// 而 kill + start 出一个全新的 server 立刻就能连上。
     private var lastServerRestart = Date.distantPast
 
     func restartServer() {
         lastServerRestart = Date()
+        resetDaemonState(removeForward: false)
         _ = run(["kill-server"], timeout: 5)
         Thread.sleep(forTimeInterval: 0.8)
         spawnStartServerDetached()
-        // 等 server 真正开始监听再往下走：紧接着就 connect 的话很容易落到 offline
         for _ in 0..<10 {
             if isServerAlive() { break }
             Thread.sleep(forTimeInterval: 0.3)
@@ -257,54 +589,44 @@ final class AdbClient {
         Thread.sleep(forTimeInterval: 0.3)
     }
 
-    /// 距上次重启 server 是否已过冷却期。
-    ///
-    /// 恢复过程本身要十几秒（设备侧 adbd 得先清掉旧的 transport），期间重启 server
-    /// 会把正在进行的握手打断，于是「重试越勤 → 越连不上」。所以重启必须限流。
     func serverRestartAllowed(cooldown: TimeInterval = 25) -> Bool {
         Date().timeIntervalSince(lastServerRestart) >= cooldown
     }
 
-    /// 对应原版 ensure_connected：已连接就直接返回，否则连接并等待就绪。
-    ///
-    /// 注意这里**故意不做 `disconnect`**：实测在「卡在 offline」时，先 disconnect 会让
-    /// server 转入 "No route to host"，越修越坏；而 kill-server + start-server 才是
-    /// 唯一能可靠治好的手段，所以失败后直接走重启 server 这条路。
     func ensureConnected() -> (ok: Bool, state: String) {
-        guard !ip.isEmpty else { return (false, "unknown") }
+        return transaction {
+            guard !ip.isEmpty else { return (false, "unknown") }
 
-        // get-state 说 device 还不够，要确认真能跑命令（可能是残留的死连接）
-        var state = deviceState()
-        if state == "device" && transportWorks() { return (true, state) }
+            var state = deviceState()
+            if state == "device" && transportWorks() { return (true, state) }
 
-        _ = run(["connect", serial], timeout: 10)
-        state = waitForDevice(timeout: 6)
-        if state == "device" && transportWorks() { return (true, state) }
-
-        // 连不上或卡在 offline：重启 server 后再试一轮。
-        // 受冷却期限制——恢复需要时间，重启太勤反而打断自己。
-        if serverRestartAllowed() {
-            restartServer()
             _ = run(["connect", serial], timeout: 10)
-            state = waitForDevice(timeout: 10)
+            state = waitForDevice(timeout: 6)
+            if state == "device" && transportWorks() { return (true, state) }
+
+            if serverRestartAllowed() {
+                restartServer()
+                _ = run(["connect", serial], timeout: 10)
+                state = waitForDevice(timeout: 10)
+            }
+            return (state == "device" && transportWorks(), state)
         }
-        return (state == "device" && transportWorks(), state)
     }
 
     /// 探监听端口而非 `adb version`（纯客户端命令，server 没起也返回 0，假阳性）。
     func isServerAlive() -> Bool {
-        NetworkScan.isTcpOpen(host: "127.0.0.1", port: Int(serverPort) ?? 5038, timeout: 1.0)
+        Self.isTcpOpen(host: "127.0.0.1", port: Int(serverPort) ?? 5038, timeout: 1.0)
     }
 
     /// 退出时清理本应用独占的 adb server，避免 fork-server 残留持续重连（issue #25）。
     func killServer() {
-        _ = run(["kill-server"], timeout: 5)
+        lifecycleLock.lock()
+        spawnBlocked = true
+        lifecycleLock.unlock()
+        resetDaemonState(removeForward: false)
+        _ = run(["kill-server"], timeout: 5, useChannelLock: false)
     }
 
-    /// 预热：提前把 adb server 拉起来。
-    ///
-    /// 冷启动时第一条 adb 命令要顺带等 server 起来，紧接着 connect 很容易落到 offline。
-    /// 启动时先预热，自动连接那一步就能快好几秒。
     func warmUpServer() {
         if isServerAlive() { return }
         spawnStartServerDetached()
@@ -315,8 +637,12 @@ final class AdbClient {
         }
     }
 
-    /// detached 拉起 start-server：bootstrap 客户端不能被超时 kill（会连带杀死 daemon）。
     private func spawnStartServerDetached() {
+        lifecycleLock.lock()
+        let blocked = spawnBlocked
+        lifecycleLock.unlock()
+        guard !blocked else { return }
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: adbPath)
         process.arguments = ["start-server"]
@@ -328,22 +654,21 @@ final class AdbClient {
         try? process.run()
     }
 
-    /// 硬重连（保活守护部署后、设备重启后调用）。
     @discardableResult
     func reconnect() -> String {
+        resetDaemonState(removeForward: true)
         let (ok, state) = ensureConnected()
         return ok ? "connected" : state
     }
 
-    /// 安装 APK（-r 覆盖安装，-d 允许降级），返回 adb 原始输出。
     func installApk(_ path: String) -> String {
-        run(["-s", serial, "install", "-r", "-d", path], timeout: 120).output
+        guard !serial.isEmpty else { return "error: no target" }
+        return run(["-s", serial, "install", "-r", "-d", path], timeout: 120).output
     }
 
-    /// 卸载指定包，返回 adb 原始输出（成功时包含 "Success"）。
-    /// 改包名后清理旧版本用：应用自身无权卸载别的应用，只能由桌面端执行。
     func uninstallPackage(_ package: String) -> String {
-        run(["-s", serial, "uninstall", package], timeout: 120).output
+        guard !serial.isEmpty else { return "error: no target" }
+        return run(["-s", serial, "uninstall", package], timeout: 120).output
     }
 
     func deviceState() -> String {
@@ -352,8 +677,6 @@ final class AdbClient {
             .output.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// 设备型号，用于连接后确认对端确实是显示器（原版 get_model）。
-    /// 命令失败时 adb 会把错误文本原样吐出来（如 "adb: device offline"），不能当型号用。
     func getModel() -> String {
         let raw = shell("getprop ro.product.model").trimmingCharacters(in: .whitespacesAndNewlines)
         let lower = raw.lowercased()
@@ -364,32 +687,785 @@ final class AdbClient {
         return looksLikeError ? "" : raw
     }
 
-    /// 通道是否真的能用。
-    ///
-    /// `get-state` 返回 "device" **不代表**连接可用：adb server 会保留上一条已经死掉的
-    /// TCP 连接，这时 get-state 说 device，但任何真实命令都会失败并把设备标成 offline。
-    /// 所以必须用一条真实命令确认。
     func transportWorks() -> Bool {
         shell("echo __mimonitor_probe__").contains("__mimonitor_probe__")
     }
 
-    func settingsGet(_ key: String) -> String {
-        shell("settings get global \(key)")
+    // MARK: - 混合加速 Daemon 生命周期 & 通信
+
+    @discardableResult
+    func setConnectionMode(_ mode: ConnectionMode) -> ConnectionMode {
+        daemonStateLock.lock()
+        let previous = connectionMode
+        connectionMode = mode
+        daemonRetryAfter = .distantPast
+        if mode != .daemon && previous == .daemon {
+            batchDepth = 0
+            batchOps.removeAll()
+            batchReadCache.removeAll()
+            batchJniCache.removeAll()
+        }
+        daemonStateLock.unlock()
+
+        if mode != .daemon && previous == .daemon {
+            stopDaemon()
+        }
+        return mode
     }
 
-    /// 一次 shell 调用批量读取多个 setting。
-    ///
-    /// 用 `settings list global` 一次拿回全部 global 设置（约 460 条 / 80ms），
-    /// 再在本地挑出需要的键。对比：
-    ///   - 逐个 `settings get`：21 次 adb 进程启动 ≈ 2.3s
-    ///   - 合并成一条 shell 循环：21 次设备端进程 ≈ 0.94s
-    ///   - `settings list global`：一次往返 ≈ 0.08s（快一个数量级）
+    func resetDaemonState(removeForward: Bool = true, nonBlockingForwardRemoval: Bool = false) {
+        daemonStateLock.lock()
+        let oldPort = daemonForwardPort
+        let oldIp = daemonIp
+        daemonReady = false
+        daemonIp = ""
+        daemonForwardPort = nil
+        daemonPutSupported = nil
+        daemonVolSupported = nil
+        daemonJarHealedIp = ""
+        daemonRetryAfter = .distantPast
+        daemonNeedsRestart = false
+        mediaVolumeBinderVerified = nil
+        daemonStateLock.unlock()
+
+        if removeForward, let oldPort, !oldIp.isEmpty {
+            lifecycleLock.lock()
+            let blocked = spawnBlocked
+            lifecycleLock.unlock()
+            if !blocked {
+                _ = run(
+                    ["-s", "\(oldIp):5555", "forward", "--remove", "tcp:\(oldPort)"],
+                    timeout: 2,
+                    useChannelLock: !nonBlockingForwardRemoval
+                )
+            }
+        }
+    }
+
+    func stopDaemon(nonBlockingForwardRemoval: Bool = false) {
+        daemonStateLock.lock()
+        let port = daemonForwardPort
+        let activeIp = daemonIp
+        daemonStateLock.unlock()
+
+        if let port, !activeIp.isEmpty {
+            lifecycleLock.lock()
+            let blocked = spawnBlocked
+            lifecycleLock.unlock()
+            if !blocked {
+                _ = Self.rawSocketExchange(port: port, payload: "QUIT\n", timeout: 0.8)
+            }
+        }
+        resetDaemonState(removeForward: true, nonBlockingForwardRemoval: nonBlockingForwardRemoval)
+    }
+
+    private func setupAdbForward() -> Int? {
+        daemonStateLock.lock()
+        let oldPort = daemonForwardPort
+        let oldIp = daemonIp
+        daemonForwardPort = nil
+        daemonStateLock.unlock()
+
+        if let oldPort, oldIp == ip, !ip.isEmpty {
+            _ = run(["-s", serial, "forward", "--remove", "tcp:\(oldPort)"], timeout: 2)
+        }
+
+        for _ in 0..<2 {
+            guard let localPort = Self.pickFreeLocalPort() else { continue }
+            let res = run(
+                ["-s", serial, "forward", "tcp:\(localPort)", "tcp:\(ConnectionMode.mtkDaemonPort)"],
+                timeout: 4
+            )
+            let lower = res.output.lowercased()
+            if res.exitCode != 0
+                || Self.hasAdbDisconnectMarker(res.output)
+                || lower.contains("error:")
+                || lower.contains("cannot bind")
+                || lower.contains("failed") {
+                continue
+            }
+            let effectivePort = testForwardPortOverride ?? localPort
+            daemonStateLock.lock()
+            daemonForwardPort = effectivePort
+            daemonIp = ip
+            daemonStateLock.unlock()
+            return effectivePort
+        }
+        return nil
+    }
+
+    private func daemonSocketRequest(_ payload: String, timeout: TimeInterval = 4.0) -> [String]? {
+        daemonStateLock.lock()
+        let activePort = (daemonIp == ip && !ip.isEmpty) ? daemonForwardPort : nil
+        daemonStateLock.unlock()
+        guard let activePort else { return nil }
+
+        lifecycleLock.lock()
+        let blocked = spawnBlocked
+        lifecycleLock.unlock()
+        if blocked { return nil }
+
+        let lines = Self.rawSocketExchange(port: activePort, payload: payload, timeout: timeout)
+        if lines == nil {
+            daemonStateLock.lock()
+            daemonReady = false
+            daemonStateLock.unlock()
+        }
+        return lines
+    }
+
+    private func parseDaemonPong(_ pongLine: String) {
+        daemonStateLock.lock()
+        defer { daemonStateLock.unlock() }
+        for token in pongLine.split(whereSeparator: \.isWhitespace) {
+            if token == "put=0" {
+                daemonPutSupported = false
+            } else if token == "put=1" {
+                daemonPutSupported = true
+            } else if token == "vol=0" {
+                daemonVolSupported = false
+            } else if token == "vol=1" {
+                daemonVolSupported = true
+            }
+        }
+    }
+
+    @discardableResult
+    func ensureDaemon(check: Bool = false) throws -> Bool {
+        guard isDaemonMode, !ip.isEmpty else { return false }
+
+        lifecycleLock.lock()
+        let blocked = spawnBlocked
+        lifecycleLock.unlock()
+        if blocked {
+            if check { throw PresetError("应用正在退出，Daemon 启动已取消") }
+            return false
+        }
+
+        return try transaction {
+            daemonStateLock.lock()
+            let wrongIp = !daemonIp.isEmpty && daemonIp != ip
+            daemonStateLock.unlock()
+            if wrongIp {
+                resetDaemonState(removeForward: true)
+            }
+
+            daemonStateLock.lock()
+            let cachedReady = daemonReady
+                && daemonForwardPort != nil
+                && daemonJarHealedIp == ip
+                && !daemonNeedsRestart
+            let retryAfter = daemonRetryAfter
+            let needsHeal = daemonJarHealedIp != ip
+            daemonStateLock.unlock()
+
+            if cachedReady {
+                if let pong = daemonSocketRequest("PING\n", timeout: 1.2),
+                   let head = pong.first,
+                   head.hasPrefix("OK MtkDirectTool v2") {
+                    parseDaemonPong(head)
+                    daemonStateLock.lock()
+                    daemonRetryAfter = .distantPast
+                    daemonStateLock.unlock()
+                    return true
+                }
+                daemonStateLock.lock()
+                daemonReady = false
+                daemonStateLock.unlock()
+            }
+
+            if Date() < retryAfter {
+                return false
+            }
+
+            if needsHeal {
+                if healJar("MtkDirectTool.jar") {
+                    daemonStateLock.lock()
+                    daemonJarHealedIp = ip
+                    daemonStateLock.unlock()
+                }
+            }
+
+            daemonStateLock.lock()
+            let hasForward = daemonForwardPort != nil && daemonIp == ip
+            daemonStateLock.unlock()
+
+            var freshForward = false
+            if !hasForward {
+                if setupAdbForward() == nil {
+                    daemonStateLock.lock()
+                    daemonRetryAfter = Date().addingTimeInterval(5.0)
+                    daemonStateLock.unlock()
+                    return false
+                }
+                freshForward = true
+            }
+
+            var pong = daemonSocketRequest("PING\n", timeout: 1.2)
+            if pong == nil && !freshForward {
+                if setupAdbForward() == nil {
+                    daemonStateLock.lock()
+                    daemonRetryAfter = Date().addingTimeInterval(5.0)
+                    daemonStateLock.unlock()
+                    return false
+                }
+                pong = daemonSocketRequest("PING\n", timeout: 1.2)
+            }
+
+            if let pong, let head = pong.first {
+                daemonStateLock.lock()
+                let needsRestart = daemonNeedsRestart
+                daemonStateLock.unlock()
+                if !needsRestart && head.hasPrefix("OK MtkDirectTool v2") {
+                    parseDaemonPong(head)
+                    daemonStateLock.lock()
+                    daemonReady = true
+                    daemonRetryAfter = .distantPast
+                    daemonStateLock.unlock()
+                    return true
+                }
+                _ = daemonSocketRequest("QUIT\n", timeout: 0.8)
+            }
+
+            daemonStateLock.lock()
+            daemonNeedsRestart = false
+            daemonStateLock.unlock()
+
+            let jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
+            let launchCmd = buildTvserviceCommand(jar: jar, args: ["MtkDirectTool", "daemon", String(ConnectionMode.mtkDaemonPort)])
+            let launchOut: String
+            if check {
+                launchOut = try checkedShell(launchCmd, target: serial)
+            } else {
+                launchOut = shell(launchCmd)
+            }
+            if ip.isEmpty || Self.hasAdbDisconnectMarker(launchOut) {
+                daemonStateLock.lock()
+                daemonRetryAfter = Date().addingTimeInterval(5.0)
+                daemonStateLock.unlock()
+                return false
+            }
+
+            for delay in [0.15, 0.2, 0.25, 0.35, 0.5, 0.5, 0.5] {
+                if ip.isEmpty || !isDaemonMode { return false }
+                Thread.sleep(forTimeInterval: delay)
+                if ip.isEmpty || !isDaemonMode { return false }
+                lifecycleLock.lock()
+                let isBlocked = spawnBlocked
+                lifecycleLock.unlock()
+                if isBlocked { return false }
+
+                if let readyPong = daemonSocketRequest("PING\n", timeout: 1.2),
+                   let head = readyPong.first,
+                   head.hasPrefix("OK MtkDirectTool v2") {
+                    parseDaemonPong(head)
+                    daemonStateLock.lock()
+                    daemonReady = true
+                    daemonRetryAfter = .distantPast
+                    daemonStateLock.unlock()
+                    return true
+                }
+            }
+
+            daemonStateLock.lock()
+            daemonRetryAfter = Date().addingTimeInterval(5.0)
+            daemonStateLock.unlock()
+            return false
+        }
+    }
+
+    func daemonQuery(settingsKeys: [String] = [],
+                     jniKeys: [String] = [],
+                     flags: [String] = [],
+                     targetIp: String? = nil,
+                     check: Bool = false) throws -> DaemonQueryResult? {
+        guard isDaemonMode, !ip.isEmpty else { return nil }
+        if let targetIp, !targetIp.isEmpty, targetIp != ip { return nil }
+
+        let safeSettings = settingsKeys
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && !$0.contains(where: \.isWhitespace) }
+        let safeJni = jniKeys
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && $0.allSatisfy { $0.isLetter || $0.isNumber || $0 == "_" } }
+        let safeFlags = flags
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && !$0.contains(where: \.isWhitespace) }
+
+        if safeSettings.isEmpty && safeJni.isEmpty && safeFlags.isEmpty {
+            return DaemonQueryResult(settings: [:], jni: [:], flags: [:], elapsedMs: 0)
+        }
+
+        var lines = ["QUERY"]
+        if !safeSettings.isEmpty {
+            lines.append("SETTINGS " + safeSettings.joined(separator: " "))
+        }
+        if !safeJni.isEmpty {
+            lines.append("JNI " + safeJni.joined(separator: " "))
+        }
+        if !safeFlags.isEmpty {
+            lines.append("FLAGS " + safeFlags.joined(separator: " "))
+        }
+        lines.append("END")
+        let payload = lines.joined(separator: "\n") + "\n"
+
+        let resp: [String]? = try transaction {
+            guard try ensureDaemon(check: check) else { return nil }
+            if let first = daemonSocketRequest(payload, timeout: 5.0) {
+                return first
+            }
+            guard try ensureDaemon(check: check) else { return nil }
+            return daemonSocketRequest(payload, timeout: 5.0)
+        }
+
+        guard let resp, resp.first == "OK" else { return nil }
+
+        var settings: [String: String] = [:]
+        var jni: [String: Int] = [:]
+        var flagMap: [String: String] = [:]
+        var elapsedMs: Int?
+
+        for line in resp.dropFirst() {
+            if line.hasPrefix("S ") {
+                let body = String(line.dropFirst(2))
+                if let eq = body.firstIndex(of: "=") {
+                    let k = String(body[..<eq])
+                    let v = String(body[body.index(after: eq)...])
+                    if !v.hasPrefix("__ERR__:") {
+                        settings[k] = v
+                    }
+                }
+            } else if line.hasPrefix("J ") {
+                let body = String(line.dropFirst(2))
+                if let eq = body.firstIndex(of: "=") {
+                    let k = String(body[..<eq])
+                    let v = String(body[body.index(after: eq)...])
+                    if !v.hasPrefix("__ERR__:"), let n = Int(v.trimmingCharacters(in: .whitespaces)) {
+                        jni[k] = n
+                    }
+                }
+            } else if line.hasPrefix("F ") {
+                let body = String(line.dropFirst(2))
+                if let eq = body.firstIndex(of: "=") {
+                    let k = String(body[..<eq])
+                    let v = String(body[body.index(after: eq)...])
+                    if !v.hasPrefix("__ERR__:") {
+                        flagMap[k] = v
+                    }
+                }
+            } else if line.hasPrefix("ELAPSED ") {
+                let raw = line.dropFirst(8).trimmingCharacters(in: .whitespaces)
+                elapsedMs = Int(raw)
+            }
+        }
+
+        return DaemonQueryResult(settings: settings, jni: jni, flags: flagMap, elapsedMs: elapsedMs)
+    }
+
+    static func formatBatchLine(_ op: DaemonBatchOp) -> String? {
+        switch op {
+        case .put(let key, let value):
+            let cleanKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleanKey.isEmpty,
+                  !cleanKey.contains(where: \.isWhitespace),
+                  !value.contains("\n"), !value.contains("\r") else {
+                return nil
+            }
+            // 不对 value 做 trim，保留前后空白或交给 Java/ADB 精确落盘
+            return "PUT \(cleanKey) \(value)"
+        case .jniSet(let key, let value, let upd):
+            guard isSafeToken(key) else { return nil }
+            return "JNI_SET \(key) \(value) \(upd)"
+        case .jniRamp(let key, let from, let to, let upd, let stepMs, let stepSize):
+            guard isSafeToken(key) else { return nil }
+            return "JNI_RAMP \(key) \(from) \(to) \(upd) \(stepMs) \(stepSize)"
+        case .colorGains(let r, let g, let b):
+            return "COLOR_GAINS \(r) \(g) \(b)"
+        case .hdrToneMapping(let value, let upd):
+            return "HDR_TM \(value) \(upd)"
+        case .soundOutput(let deviceId):
+            return "SOUND_OUT \(deviceId)"
+        case .setSource(let sourceId):
+            return "SET_SOURCE \(sourceId)"
+        case .led(let action, let args):
+            let allParts = [action] + args
+            guard allParts.allSatisfy({ !$0.contains("\n") && !$0.contains("\r") && !$0.contains(where: \.isWhitespace) }) else {
+                return nil
+            }
+            return (["LED"] + allParts).joined(separator: " ")
+        case .volSet(let value, let unmuteFirst, let showUi):
+            return "VOL_SET \(value) \(unmuteFirst ? 1 : 0) \(showUi ? 1 : 0)"
+        case .volMute(let muted, let showUi):
+            return "VOL_MUTE \(muted ? 1 : 0) \(showUi ? 1 : 0)"
+        case .key(let code):
+            guard isSafeToken(code) else { return nil }
+            return "KEY \(code)"
+        case .sleep(let ms):
+            return "SLEEP \(max(0, ms))"
+        case .refreshPq:
+            return "REFRESH_PQ"
+        }
+    }
+
+    static func estimateBatchTimeout(_ ops: [DaemonBatchOp]) -> TimeInterval {
+        var expectedMs = 0
+        for op in ops {
+            switch op {
+            case .sleep(let ms):
+                expectedMs += min(5000, max(0, ms))
+            case .jniRamp(_, let from, let to, _, let stepMs, let stepSize):
+                if stepMs > 0 {
+                    let delta = abs(to - from)
+                    let steps = max(1, (delta + max(1, stepSize) - 1) / max(1, stepSize))
+                    expectedMs += steps * stepMs
+                } else {
+                    expectedMs += 150
+                }
+            default:
+                expectedMs += 40
+            }
+        }
+        return max(8.0, Double(expectedMs) / 1000.0 + 5.0)
+    }
+
+    func daemonBatch(_ ops: [DaemonBatchOp], check: Bool = false) throws -> (ok: Bool, errIdx: Int?, steps: [DaemonBatchStep]) {
+        if ops.isEmpty { return (true, nil, []) }
+        guard isDaemonMode, !ip.isEmpty else { return (false, nil, []) }
+
+        var formattedLines = ["BATCH"]
+        for op in ops {
+            guard let line = Self.formatBatchLine(op) else {
+                return (false, nil, [])
+            }
+            formattedLines.append(line)
+        }
+        formattedLines.append("END")
+        let payload = formattedLines.joined(separator: "\n") + "\n"
+        let batchTimeout = Self.estimateBatchTimeout(ops)
+
+        let resp: [String]? = try transaction {
+            guard try ensureDaemon(check: check) else { return nil }
+            // 不对已发送写入载荷的超时/断连盲目重放，防止写操作重复触发
+            return daemonSocketRequest(payload, timeout: batchTimeout)
+        }
+        guard let resp, let head = resp.first else {
+            return (false, nil, [])
+        }
+
+        var steps: [DaemonBatchStep] = []
+        for line in resp.dropFirst() where line.hasPrefix("STEP ") {
+            let parts = line.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: false)
+            if parts.count >= 4, let idx = Int(parts[1]) {
+                let ok = parts[2] == "OK"
+                steps.append(DaemonBatchStep(index: idx, ok: ok, detail: String(parts[3])))
+            }
+        }
+
+        if head == "OK" {
+            let allStepsOk = steps.allSatisfy(\.ok)
+            return (allStepsOk, nil, steps)
+        }
+        if head.hasPrefix("ERR_AT ") {
+            let rest = String(head.dropFirst(7))
+            let idxToken = rest.split(separator: " ", maxSplits: 1).first.map(String.init) ?? "0"
+            let errIdx = Int(idxToken) ?? 0
+            return (false, errIdx, steps)
+        }
+        return (false, nil, steps)
+    }
+
+    static func coalesceBatchOps(_ ops: [DaemonBatchOp]) -> [DaemonBatchOp] {
+        var lastRefreshIdx: Int?
+        for (idx, op) in ops.enumerated() {
+            if case .refreshPq = op {
+                lastRefreshIdx = idx
+            }
+        }
+        guard let keepIdx = lastRefreshIdx else { return ops }
+        return ops.enumerated().compactMap { idx, op in
+            if case .refreshPq = op, idx != keepIdx { return nil }
+            return op
+        }
+    }
+
+    @discardableResult
+    func batchWrites<T>(prefetchSettings: [String] = [],
+                        prefetchJni: [String] = [],
+                        check: Bool = false,
+                        _ work: () throws -> T) throws -> T {
+        guard isDaemonMode else {
+            return try work()
+        }
+
+        daemonStateLock.lock()
+        let outermost = batchDepth == 0
+        batchDepth += 1
+        daemonStateLock.unlock()
+
+        if outermost && (!prefetchSettings.isEmpty || !prefetchJni.isEmpty) {
+            if let snapshot = try? daemonQuery(settingsKeys: prefetchSettings, jniKeys: prefetchJni, check: false) {
+                daemonStateLock.lock()
+                for (k, v) in snapshot.settings { batchReadCache[k] = v }
+                for (k, v) in snapshot.jni { batchJniCache[k] = v }
+                daemonStateLock.unlock()
+            }
+        }
+
+        defer {
+            daemonStateLock.lock()
+            batchDepth = max(0, batchDepth - 1)
+            if outermost {
+                batchOps.removeAll()
+                batchReadCache.removeAll()
+                batchJniCache.removeAll()
+            }
+            daemonStateLock.unlock()
+        }
+
+        let result = try work()
+        if outermost {
+            try flushBatch(check: check)
+        }
+        return result
+    }
+
+    func batchSleep(_ ms: Int) {
+        let delayMs = max(0, ms)
+        guard delayMs > 0 else { return }
+        daemonStateLock.lock()
+        let inBatch = connectionMode == .daemon && batchDepth > 0
+        if inBatch {
+            batchOps.append(.sleep(ms: delayMs))
+        }
+        daemonStateLock.unlock()
+        if !inBatch {
+            Thread.sleep(forTimeInterval: Double(delayMs) / 1000.0)
+        }
+    }
+
+    private func recordOrRun(_ op: DaemonBatchOp) -> Bool {
+        daemonStateLock.lock()
+        if connectionMode == .daemon && batchDepth > 0 {
+            batchOps.append(op)
+            daemonStateLock.unlock()
+            return true
+        }
+        daemonStateLock.unlock()
+        return false
+    }
+
+    func flushBatch(check: Bool = false) throws {
+        daemonStateLock.lock()
+        let pending = batchOps
+        batchOps.removeAll()
+        let putSupported = daemonPutSupported
+        daemonStateLock.unlock()
+
+        let coalesced = Self.coalesceBatchOps(pending)
+        guard !coalesced.isEmpty else { return }
+
+        if putSupported == false {
+            var putRun: [(String, String)] = []
+            var daemonSegment: [DaemonBatchOp] = []
+
+            func flushPutRun() throws {
+                guard !putRun.isEmpty else { return }
+                try adbPutBatchDirect(putRun, check: check)
+                putRun.removeAll()
+            }
+            func flushDaemonSegment() throws {
+                guard !daemonSegment.isEmpty else { return }
+                let segment = daemonSegment
+                daemonSegment.removeAll()
+                try executeDaemonSegmentWithFallback(segment, check: check)
+            }
+
+            for op in coalesced {
+                if case .put(let k, let v) = op {
+                    try flushDaemonSegment()
+                    putRun.append((k, v))
+                } else {
+                    try flushPutRun()
+                    daemonSegment.append(op)
+                }
+            }
+            try flushPutRun()
+            try flushDaemonSegment()
+            return
+        }
+
+        try executeDaemonSegmentWithFallback(coalesced, check: check)
+    }
+
+    private func executeDaemonSegmentWithFallback(_ ops: [DaemonBatchOp], check: Bool) throws {
+        let (ok, errIdx, steps) = try daemonBatch(ops, check: check)
+        if ok { return }
+
+        if let errIdx {
+            let clamped = max(0, min(ops.count, errIdx))
+            let stepMap = Dictionary(steps.map { ($0.index, $0.ok) }, uniquingKeysWith: { _, new in new })
+            var fallbackIndices: [Int] = []
+            for idx in 0..<clamped where stepMap[idx] != true {
+                fallbackIndices.append(idx)
+            }
+            if clamped < ops.count {
+                if case .put = ops[clamped] {
+                    daemonStateLock.lock()
+                    daemonPutSupported = false
+                    daemonStateLock.unlock()
+                }
+                fallbackIndices.append(contentsOf: clamped..<ops.count)
+            }
+            try executeMixedAdbFallback(fallbackIndices.map { ops[$0] }, check: check)
+            return
+        }
+
+        if !steps.isEmpty {
+            let stepMap = Dictionary(steps.map { ($0.index, $0.ok) }, uniquingKeysWith: { _, new in new })
+            var failedIndices: [Int] = []
+            for idx in 0..<ops.count where stepMap[idx] != true {
+                if case .put = ops[idx], stepMap[idx] == false {
+                    daemonStateLock.lock()
+                    daemonPutSupported = false
+                    daemonStateLock.unlock()
+                }
+                failedIndices.append(idx)
+            }
+            if !failedIndices.isEmpty {
+                try executeMixedAdbFallback(failedIndices.map { ops[$0] }, check: check)
+            }
+            return
+        }
+
+        try executeMixedAdbFallback(ops, check: check)
+    }
+
+    private func executeMixedAdbFallback(_ ops: [DaemonBatchOp], check: Bool) throws {
+        var putRun: [(String, String)] = []
+        func flushPuts() throws {
+            guard !putRun.isEmpty else { return }
+            try adbPutBatchDirect(putRun, check: check)
+            putRun.removeAll()
+        }
+
+        for op in ops {
+            if case .put(let k, let v) = op {
+                putRun.append((k, v))
+            } else {
+                try flushPuts()
+                try execOpViaAdb(op, check: check)
+            }
+        }
+        try flushPuts()
+    }
+
+    private func execOpViaAdb(_ op: DaemonBatchOp, check: Bool) throws {
+        switch op {
+        case .put(let key, let value):
+            try adbPutDirect(key, value, check: check)
+        case .jniSet(let key, let value, let upd):
+            let jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
+            let cmd = buildTvserviceCommand(jar: jar, args: ["MtkDirectTool", "set", key, String(value), String(upd)])
+            if check { _ = try checkedShell(cmd, target: serial) } else { _ = shell(cmd) }
+        case .jniRamp(let key, let from, let to, let upd, let stepMs, let stepSize):
+            adbJniRampDirect(key: key, from: from, to: to, settingsKeys: [], upd: upd, stepMs: stepMs, step: stepSize)
+        case .colorGains(let r, let g, let b):
+            let jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
+            let cmd = buildTvserviceCommand(jar: jar, args: ["MtkDirectTool", "setColorGains", String(r), String(g), String(b)])
+            if check { _ = try checkedShell(cmd, target: serial) } else { _ = shell(cmd) }
+        case .hdrToneMapping(let value, let upd):
+            let jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
+            let cmd = buildTvserviceCommand(jar: jar, args: ["MtkDirectTool", "setHdrToneMapping", String(value), String(upd)])
+            if check { _ = try checkedShell(cmd, target: serial) } else { _ = shell(cmd) }
+        case .soundOutput(let deviceId):
+            let jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
+            let cmd = buildTvserviceCommand(jar: jar, args: ["MtkDirectTool", "setSoundOutput", String(deviceId)])
+            if check { _ = try checkedShell(cmd, target: serial) } else { _ = shell(cmd) }
+        case .setSource(let sourceId):
+            if jarSetInputSource(sourceId, target: serial) {
+                return
+            }
+            try adbSetInputSource(sourceId, target: serial, check: check)
+        case .led(let action, let args):
+            let jar = "/data/data/mitv.service/cache/ColorfulLedTool.jar"
+            let cmd = buildTvserviceCommand(jar: jar, args: ["ColorfulLedTool", action] + args)
+            if check { _ = try checkedShell(cmd, target: serial) } else { _ = shell(cmd) }
+        case .volSet(let value, let unmuteFirst, let showUi):
+            _ = adbSetMediaVolumeDirect(value, unmuteFirst: unmuteFirst, showUI: showUi)
+        case .volMute(let muted, let showUi):
+            _ = adbSetMediaMutedDirect(muted, showUI: showUi)
+        case .key(let code):
+            let cmd = "input keyevent \(Self.shellQuoteIfNeeded(code))"
+            if check { _ = try checkedShell(cmd, target: serial) } else { _ = shell(cmd) }
+        case .sleep(let ms):
+            Thread.sleep(forTimeInterval: Double(max(0, ms)) / 1000.0)
+        case .refreshPq:
+            let cmd = "am broadcast -a com.xiaomi.mitv.action.PIC_MODE_CHANGED --ei picmode 7"
+            if check { _ = try checkedShell(cmd, target: serial) } else { _ = shell(cmd) }
+        }
+    }
+
+    // MARK: - Settings 读写
+
+    func settingsGet(_ key: String) -> String {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+
+        daemonStateLock.lock()
+        let inBatch = connectionMode == .daemon && batchDepth > 0
+        let cached = inBatch ? batchReadCache[trimmed] : nil
+        daemonStateLock.unlock()
+        if let cached { return cached }
+
+        if isDaemonMode, let q = try? daemonQuery(settingsKeys: [trimmed]),
+           let value = q.settings[trimmed] {
+            return value
+        }
+        return shell("settings get global \(Self.shellQuoteIfNeeded(trimmed))")
+    }
+
+    /// 一次 shell 调用批量读取多个 setting（Daemon 模式下优先走 QUERY 通道）。
     func settingsGetBatch(_ keys: [String]) -> [String: String] {
-        // 只允许安全字符，避免注入到 shell 命令里
         let safe = keys.filter { key in
             !key.isEmpty && key.allSatisfy { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "." }
         }
         guard !safe.isEmpty else { return [:] }
+
+        daemonStateLock.lock()
+        let inBatch = connectionMode == .daemon && batchDepth > 0
+        var cachedValues: [String: String] = [:]
+        var allFoundInCache = inBatch
+        if inBatch {
+            for k in safe {
+                if let val = batchReadCache[k] {
+                    cachedValues[k] = val
+                } else {
+                    allFoundInCache = false
+                    break
+                }
+            }
+        }
+        daemonStateLock.unlock()
+
+        if allFoundInCache {
+            var filtered: [String: String] = [:]
+            for k in safe {
+                if let val = cachedValues[k], !val.isEmpty, val != "null", val != "N/A" {
+                    filtered[k] = val
+                }
+            }
+            return filtered
+        }
+
+        if isDaemonMode, let q = try? daemonQuery(settingsKeys: safe) {
+            var filtered: [String: String] = [:]
+            for k in safe {
+                if let val = q.settings[k], !val.isEmpty, val != "null", val != "N/A" {
+                    filtered[k] = val
+                }
+            }
+            return filtered
+        }
 
         var all: [String: String] = [:]
         for line in shell("settings list global").split(separator: "\n") {
@@ -400,7 +1476,6 @@ final class AdbClient {
             all[key] = value
         }
 
-        // list 整体失败时退回逐键读取（老设备 / 权限受限的情况）
         if all.isEmpty {
             let cmd = "for k in \(safe.joined(separator: " ")); do echo $k=$(settings get global $k); done"
             for line in shell(cmd).split(separator: "\n") {
@@ -415,15 +1490,12 @@ final class AdbClient {
         var values: [String: String] = [:]
         for key in safe {
             guard let value = all[key] else { continue }
-            // 与原版一致：空值 / null / N/A 视为未读到，不覆盖已有值
             if value.isEmpty || value == "null" || value == "N/A" { continue }
             values[key] = value
         }
         return values
     }
 
-    /// 解析 `wm size` 的 Override size（移植自原版 _check_4k_state）。
-    /// 没有 Override 时返回 nil，表示用的是面板原生分辨率。
     func getOverrideSize() -> (width: Int, height: Int)? {
         for line in shell("wm size").split(separator: "\n") where line.contains("Override size") {
             guard let colon = line.lastIndex(of: ":") else { return nil }
@@ -438,7 +1510,6 @@ final class AdbClient {
         return nil
     }
 
-    /// 读取 `wm density` 的 Override 值（同样是 UI 缩放的判据之一）。
     func getOverrideDensity() -> Int? {
         for line in shell("wm density").split(separator: "\n") where line.contains("Override density") {
             guard let colon = line.lastIndex(of: ":") else { return nil }
@@ -447,60 +1518,97 @@ final class AdbClient {
         return nil
     }
 
-    func settingsPut(_ key: String, _ value: String) {
-        shell("settings put global \(key) \(value)")
+    private func adbPutDirect(_ key: String, _ value: String, check: Bool = false) throws {
+        let cmd = "settings put global \(Self.shellQuoteIfNeeded(key)) \(Self.shellQuoteIfNeeded(value))"
+        if check {
+            _ = try checkedShell(cmd, target: serial)
+        } else {
+            _ = shell(cmd)
+        }
     }
 
-    /// 一次 shell 写多个 settings，省掉每条一次 ADB 往返。
+    private func adbPutBatchDirect(_ pairs: [(String, String)], check: Bool = false) throws {
+        guard !pairs.isEmpty else { return }
+        let cmd = pairs.map { "settings put global \(Self.shellQuoteIfNeeded($0.0)) \(Self.shellQuoteIfNeeded($0.1))" }
+            .joined(separator: "; ")
+        if check {
+            _ = try checkedShell(cmd, target: serial)
+        } else {
+            _ = shell(cmd)
+        }
+    }
+
+    func settingsPut(_ key: String, _ value: String) {
+        if recordOrRun(.put(key: key, value: value)) { return }
+        if isDaemonMode {
+            daemonStateLock.lock()
+            let putSupported = daemonPutSupported
+            daemonStateLock.unlock()
+            if putSupported != false {
+                if let (ok, errIdx, steps) = try? daemonBatch([.put(key: key, value: value)]),
+                   ok, errIdx == nil, steps.allSatisfy(\.ok) {
+                    return
+                }
+                if let (_, errIdx, _) = try? daemonBatch([.put(key: key, value: value)]), errIdx != nil {
+                    daemonStateLock.lock()
+                    daemonPutSupported = false
+                    daemonStateLock.unlock()
+                }
+                _ = try? executeMixedAdbFallback([.put(key: key, value: value)], check: false)
+                return
+            }
+        }
+        try? adbPutDirect(key, value, check: false)
+    }
+
+    /// 一次写多个 settings。
     func settingsPutBatch(_ pairs: [(String, String)]) {
         guard !pairs.isEmpty else { return }
-        shell(pairs.map { "settings put global \($0.0) \($0.1)" }.joined(separator: "; "))
+        daemonStateLock.lock()
+        let inBatch = connectionMode == .daemon && batchDepth > 0
+        if inBatch {
+            for (k, v) in pairs {
+                batchOps.append(.put(key: k, value: v))
+            }
+        }
+        let putSupported = daemonPutSupported
+        daemonStateLock.unlock()
+        if inBatch { return }
+
+        if isDaemonMode && putSupported != false {
+            let ops = pairs.map { DaemonBatchOp.put(key: $0.0, value: $0.1) }
+            if let (ok, _, steps) = try? daemonBatch(ops), ok, steps.allSatisfy(\.ok) {
+                return
+            }
+        }
+        try? adbPutBatchDirect(pairs, check: false)
     }
 
     func keyevent(_ code: String) {
-        shell("input keyevent \(code)")
+        if recordOrRun(.key(code: code)) { return }
+        shell("input keyevent \(Self.shellQuoteIfNeeded(code))")
     }
 
     // MARK: - 音量 / 静音
 
-    /// `service call audio` 的 transaction code（AIDL 常量，和系统版本绑定）。
-    ///
-    /// 这台显示器（MiTV-MFFU1 / Android 14）上，`cmd media_session volume --set` 会被
-    /// AudioService 拒掉 —— 它把 callingPackage 写死成 `com.android.server.media`，
-    /// 而 AppOps 的包名/uid 校验过不了（该包不属于 shell uid 2000）。
-    /// `settings put system volume_music_speaker` 也不会触发 AudioService（没有观察者）。
-    /// 唯一能做「绝对设置」的就是直接调 binder：一次调用、没有 `input keyevent`
-    /// 逐级发送的 ~100ms/级延迟，也不会在显示器上闪一串音量条。
     enum AudioServiceTxn {
-        /// adjustStreamVolume(int streamType, int direction, int flags, String package)
         static let adjustStreamVolume = 10
-        /// setStreamVolume(int streamType, int index, int flags, String package)
         static let setStreamVolume = 12
-        /// isStreamMute(int streamType) -> boolean
         static let isStreamMute = 17
-        /// getStreamVolumeForMute(int streamType) -> int
         static let getStreamVolumeForMute = 22
     }
-    /// AudioManager.STREAM_MUSIC
     static let streamMusic = 3
-    /// AudioManager.ADJUST_MUTE / ADJUST_UNMUTE（hidden API 常量）
     static let adjustMute = -100
     static let adjustUnmute = 100
-    /// 调用方包名必须属于 shell uid，否则 AudioService 的 AppOps 校验会抛 SecurityException。
     static let binderShellPackage = "com.android.shell"
 
-    /// nil = 尚未验证 binder 通道；true/false = 验证结果。
-    /// 只在第一次写音量/静音时回读确认 transaction code 没被 ROM 改掉。
     private var mediaVolumeBinderVerified: Bool?
 
-    /// 读取媒体音量（0~100）。
-    ///
-    /// 优先走 binder 的 `getStreamVolumeForMute`：
-    ///   - `getStreamVolume` 在静音时会返回 0，会把静音前的音量弄丢；
-    ///   - `settings get system volume_music_speaker` 在刚写完的 ~1 秒内还是旧值
-    ///     （Settings 落盘/缓存有延迟），拿它做回读校验会被坑到。
-    /// txn 不可用时回退 settings。
     func mediaVolume() -> Int? {
+        if isDaemonMode, let q = try? daemonQuery(flags: ["volume"]),
+           let raw = q.flags["volume"], let value = Int(raw), (0...100).contains(value) {
+            return value
+        }
         let output = shell("service call audio \(AudioServiceTxn.getStreamVolumeForMute) i32 \(Self.streamMusic)")
         if let value = Self.parseServiceCallInt(output), (0...100).contains(value) {
             return value
@@ -510,27 +1618,45 @@ final class AdbClient {
         return Int(raw)
     }
 
-    /// 媒体流当前是否静音。
     func mediaMuted() -> Bool? {
+        if isDaemonMode, let q = try? daemonQuery(flags: ["muted"]),
+           let raw = q.flags["muted"] {
+            return raw == "1" || raw.lowercased() == "true"
+        }
         let output = shell("service call audio \(AudioServiceTxn.isStreamMute) i32 \(Self.streamMusic)")
         guard let value = Self.parseServiceCallInt(output) else { return nil }
         return value != 0
     }
 
-    /// 绝对设置媒体音量（0~100）。返回是否走了 binder 快速通道。
-    /// binder 不可用时退回 `input keyevent` 逐级调整（先读当前值再补差值）。
     @discardableResult
     func setMediaVolume(_ value: Int, unmuteFirst: Bool = false, showUI: Bool = false) -> Bool {
         let target = max(0, min(100, value))
+        if recordOrRun(.volSet(value: target, unmuteFirst: unmuteFirst, showUi: showUI)) {
+            return true
+        }
+        if isDaemonMode {
+            daemonStateLock.lock()
+            let volSupported = daemonVolSupported
+            daemonStateLock.unlock()
+            if volSupported != false,
+               let (ok, _, _) = try? daemonBatch([.volSet(value: target, unmuteFirst: unmuteFirst, showUi: showUI)]),
+               ok {
+                return true
+            }
+        }
+        return adbSetMediaVolumeDirect(target, unmuteFirst: unmuteFirst, showUI: showUI)
+    }
+
+    @discardableResult
+    private func adbSetMediaVolumeDirect(_ target: Int, unmuteFirst: Bool, showUI: Bool) -> Bool {
+        let clamped = max(0, min(100, target))
         let flags = showUI ? 1 : 0
-        if unmuteFirst { _ = setMediaMuted(false, showUI: false) }
+        if unmuteFirst { _ = adbSetMediaMutedDirect(false, showUI: false) }
         if mediaVolumeBinderVerified != false {
-            let output = shell("service call audio \(AudioServiceTxn.setStreamVolume) i32 \(Self.streamMusic) i32 \(target) i32 \(flags) s16 \(Self.binderShellPackage)")
+            let output = shell("service call audio \(AudioServiceTxn.setStreamVolume) i32 \(Self.streamMusic) i32 \(clamped) i32 \(flags) s16 \(Self.binderShellPackage)")
             if Self.serviceCallSucceeded(output) {
                 if mediaVolumeBinderVerified == nil {
-                    // 首次调用回读确认真的生效：ROM 若改了 transaction code，
-                    // service call 也可能"成功"地调到了别的方法。
-                    let applied = mediaVolume() == target
+                    let applied = mediaVolume() == clamped
                     mediaVolumeBinderVerified = applied
                     if applied { return true }
                 } else {
@@ -540,13 +1666,30 @@ final class AdbClient {
                 mediaVolumeBinderVerified = false
             }
         }
-        applyMediaVolumeByKeyEvent(target)
+        applyMediaVolumeByKeyEvent(clamped)
         return false
     }
 
-    /// 设置/解除媒体流静音。返回是否走了 binder 快速通道。
     @discardableResult
     func setMediaMuted(_ muted: Bool, showUI: Bool = false) -> Bool {
+        if recordOrRun(.volMute(muted: muted, showUi: showUI)) {
+            return true
+        }
+        if isDaemonMode {
+            daemonStateLock.lock()
+            let volSupported = daemonVolSupported
+            daemonStateLock.unlock()
+            if volSupported != false,
+               let (ok, _, _) = try? daemonBatch([.volMute(muted: muted, showUi: showUI)]),
+               ok {
+                return true
+            }
+        }
+        return adbSetMediaMutedDirect(muted, showUI: showUI)
+    }
+
+    @discardableResult
+    private func adbSetMediaMutedDirect(_ muted: Bool, showUI: Bool) -> Bool {
         let flags = showUI ? 1 : 0
         if mediaVolumeBinderVerified != false {
             let direction = muted ? Self.adjustMute : Self.adjustUnmute
@@ -563,12 +1706,10 @@ final class AdbClient {
                 mediaVolumeBinderVerified = false
             }
         }
-        // keyevent 的静音键是 toggle：调用方刚把目标状态算成当前状态的反面，正好对上。
         shell("input keyevent KEYCODE_VOLUME_MUTE")
         return false
     }
 
-    /// binder 不可用时的退路：先读当前值，再用 `input keyevent` 逐级补齐差值。
     private func applyMediaVolumeByKeyEvent(_ target: Int) {
         guard let current = mediaVolume() else { return }
         let delta = target - current
@@ -578,17 +1719,12 @@ final class AdbClient {
         shell("input keyevent \(batch)")
     }
 
-    /// `service call` 是否执行成功（没有 binder 异常）。抽出来方便单测。
     static func serviceCallSucceeded(_ output: String) -> Bool {
         guard output.contains("Result: Parcel(") else { return false }
         let lower = output.lowercased()
         return !lower.contains("error") && !lower.contains("exception")
     }
 
-    /// 从 `service call` 输出里取返回的 int —— Parcel dump 里最后一个 8 位十六进制词。
-    /// 形如 `Result: Parcel(\t00000000 00000018   '........')` → 24。
-    /// 第一个词是 binder 的异常码，所以至少要有两个词才算真的带返回值；
-    /// void 方法（只有一个异常码）返回 nil，避免被当成值 0。抽出来方便单测。
     static func parseServiceCallInt(_ output: String) -> Int? {
         let hexDigits = Set("0123456789abcdefABCDEF")
         var tokens: [String] = []
@@ -607,47 +1743,65 @@ final class AdbClient {
     }
 
     func refreshPq() {
+        if recordOrRun(.refreshPq) { return }
+        if isDaemonMode, let (ok, _, _) = try? daemonBatch([.refreshPq]), ok {
+            return
+        }
         shell("am broadcast -a com.xiaomi.mitv.action.PIC_MODE_CHANGED --ei picmode 7")
     }
 
     // MARK: - JNI / TvService
 
-    /// 构造 `service call TvService 3 s16 "sh -c eval..."` 命令（移植自 adb.py）。
     func buildTvserviceCommand(jar: String, args: [String]) -> String {
-        let encoded = args.map { "\\${IFS}\($0)" }.joined()
-        return "service call TvService 3 s16 \"sh -c eval\\${IFS}CLASSPATH=\(jar)\\${IFS}/system/bin/app_process\\${IFS}/data/data/mitv.service/cache\(encoded)\""
+        let encoded = args.map { "\\${IFS}\(Self.shellQuoteIfNeeded($0))" }.joined()
+        return "service call TvService 3 s16 \"sh -c eval\\${IFS}CLASSPATH=\(Self.shellQuoteIfNeeded(jar))\\${IFS}/system/bin/app_process\\${IFS}/data/data/mitv.service/cache\(encoded)\""
     }
 
-    /// 构造一条经 TvService 执行的外部命令（`sh -c eval` + `${IFS}` 分隔），移植自 adb.py。
-    ///
-    /// TvService 的 runSystemCommand 直接调 `Runtime.exec(String)`，按空白切分且
-    /// **不起 shell**。所以命令体里的空格必须写成字面量 `${IFS}`：`sh` 会把它展开回
-    /// 空白，再交给 `eval` 重新解析。
-    ///
-    /// 写成"真实空格 + 转义双引号"的老形式会静默失败 —— `sh -c` 只拿到被截断的第一个
-    /// 词（如 `"cp`），而 `service call` 依旧返回 Parcel，看着像成功。
     func buildTvserviceShellCommand(parts: [String]) -> String {
-        let encoded = parts.map { "\\${IFS}\($0)" }.joined()
+        let encoded = parts.map { "\\${IFS}\(Self.shellQuoteIfNeeded($0))" }.joined()
         return "service call TvService 3 s16 \"sh -c eval\(encoded)\""
     }
 
     func jniSet(key: String, value: String, upd: Int = 3) {
+        if let intVal = Int(value.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            if recordOrRun(.jniSet(key: key, value: intVal, upd: upd)) { return }
+            if isDaemonMode, let (ok, _, _) = try? daemonBatch([.jniSet(key: key, value: intVal, upd: upd)]), ok {
+                return
+            }
+        }
         let jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
         shell(buildTvserviceCommand(jar: jar, args: ["MtkDirectTool", "set", key, value, String(upd)]))
     }
 
-    /// 平滑渐变：在显示器端把 key 从 from 推到 to，跑完后再落 settings。
-    /// 显示器自带的亮度键就是这样一小步一小步走的；单次大步长会让面板过冲、看起来像闪。
-    /// `from` 由 App 侧的粘性预览链给出，刻意不回读设备 —— JNI 回读值偶发跳变会把起点带偏。
-    ///
-    /// 默认 `stepMs = 0`（不等、最快），步长 `step` 由调用方按 delta 算，
-    /// 把总步数压在十几步内，避免长按后旧的渐变拖很久、把后续点按都堵在后面。
-    ///
-    /// settings 必须等渐变结束再写：`picture_backlight` 的 ContentObserver 会直接改硬件，
-    /// 提前写会把画面一下拉到目标值（先闪到目标、再被渐变拉回起点，观感就是来回闪）。
-    /// 这里在设备侧用一个等待循环等渐变写完成标记，再执行 `settings put`。
     func jniRamp(key: String, from: Int, to: Int, settingsKeys: [String] = [],
                  upd: Int = 3, stepMs: Int = 0, step: Int = 1) {
+        daemonStateLock.lock()
+        let inBatch = connectionMode == .daemon && batchDepth > 0
+        if inBatch {
+            batchOps.append(.jniRamp(key: key, from: from, to: to, upd: upd, stepMs: stepMs, stepSize: step))
+            for sk in settingsKeys {
+                batchOps.append(.put(key: sk, value: String(to)))
+            }
+        }
+        daemonStateLock.unlock()
+        if inBatch { return }
+
+        if isDaemonMode {
+            var ops: [DaemonBatchOp] = [
+                .jniRamp(key: key, from: from, to: to, upd: upd, stepMs: stepMs, stepSize: step)
+            ]
+            for sk in settingsKeys {
+                ops.append(.put(key: sk, value: String(to)))
+            }
+            if let (ok, _, _) = try? daemonBatch(ops), ok {
+                return
+            }
+        }
+        adbJniRampDirect(key: key, from: from, to: to, settingsKeys: settingsKeys, upd: upd, stepMs: stepMs, step: step)
+    }
+
+    private func adbJniRampDirect(key: String, from: Int, to: Int, settingsKeys: [String],
+                                  upd: Int, stepMs: Int, step: Int) {
         let jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
         let dir = "/sdcard/Download/Mimonitor_Toolbox"
         let done = "\(dir)/.mtk_ramp_done"
@@ -657,27 +1811,90 @@ final class AdbClient {
         ])
         var parts = ["mkdir -p \(dir)", "rm -f \(done)", "\(ramp) >/dev/null"]
         parts.append("i=0; while [ $i -lt 80 ] && [ ! -f \(done) ]; do sleep 0.1; i=$((i+1)); done")
-        parts.append(contentsOf: settingsKeys.map { "settings put global \($0) \(to)" })
+        parts.append(contentsOf: settingsKeys.map {
+            "settings put global \(Self.shellQuoteIfNeeded($0)) \(to)"
+        })
         shell(parts.joined(separator: "; "))
     }
 
     func hdrToneMapping(_ value: String, upd: Int = 3) {
+        if let intVal = Int(value.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            if recordOrRun(.hdrToneMapping(value: intVal, upd: upd)) { return }
+            if isDaemonMode, let (ok, _, _) = try? daemonBatch([.hdrToneMapping(value: intVal, upd: upd)]), ok {
+                return
+            }
+        }
         let jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
         shell(buildTvserviceCommand(jar: jar, args: ["MtkDirectTool", "setHdrToneMapping", value, String(upd)]))
     }
 
     func setColorGains(red: String, green: String, blue: String) {
+        if let r = Int(red), let g = Int(green), let b = Int(blue) {
+            if recordOrRun(.colorGains(red: r, green: g, blue: b)) { return }
+            if isDaemonMode, let (ok, _, _) = try? daemonBatch([.colorGains(red: r, green: g, blue: b)]), ok {
+                return
+            }
+        }
         let jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
         shell(buildTvserviceCommand(jar: jar, args: ["MtkDirectTool", "setColorGains", red, green, blue]))
     }
 
     func setSoundOutput(_ deviceId: Int, target: String? = nil) throws {
-        let jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
         let resolvedTarget = (target?.isEmpty == false) ? target! : serial
+        if resolvedTarget == serial {
+            if recordOrRun(.soundOutput(deviceId: deviceId)) { return }
+            if isDaemonMode, let (ok, _, _) = try? daemonBatch([.soundOutput(deviceId: deviceId)], check: true), ok {
+                return
+            }
+        }
+        let jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
         try checkedShell(
             buildTvserviceCommand(jar: jar, args: ["MtkDirectTool", "setSoundOutput", String(deviceId)]),
             target: resolvedTarget
         )
+    }
+
+    /// 优先通过 MtkDirectTool.jar（Daemon / CLI）切换输入信号源，失败时回退原始 ADB。
+    func setInputSource(_ sourceId: Int, target: String? = nil, check: Bool = true) throws {
+        let resolvedTarget = (target?.isEmpty == false) ? target! : serial
+        if resolvedTarget == serial {
+            if recordOrRun(.setSource(sourceId: sourceId)) { return }
+            if isDaemonMode, let (ok, _, _) = try? daemonBatch([.setSource(sourceId: sourceId)], check: false), ok {
+                return
+            }
+        }
+        if jarSetInputSource(sourceId, target: resolvedTarget) {
+            return
+        }
+        try adbSetInputSource(sourceId, target: resolvedTarget, check: check)
+    }
+
+    @discardableResult
+    func jarSetInputSource(_ sourceId: Int, target: String? = nil) -> Bool {
+        let resolvedTarget = (target?.isEmpty == false) ? target! : serial
+        guard !ip.isEmpty, resolvedTarget == serial, healJar("MtkDirectTool.jar") else { return false }
+        let jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
+        let resultFile = "/sdcard/Download/Mimonitor_Toolbox/.mtk_source_result.txt"
+        let setCmd = buildTvserviceCommand(jar: jar, args: ["MtkDirectTool", "setSource", String(sourceId)])
+        let cmd = "mkdir -p /sdcard/Download/Mimonitor_Toolbox; rm -f \(resultFile); \(setCmd) >/dev/null; i=0; while [ $i -lt 30 ] && [ ! -f \(resultFile) ]; do sleep 0.1; i=$((i+1)); done; cat \(resultFile) 2>/dev/null"
+        let out = shell(cmd)
+        return out.contains("RESULT: SET_SOURCE")
+            && !Self.hasAdbDisconnectMarker(out)
+            && !out.contains("ERROR")
+            && !out.contains("Exception")
+    }
+
+    func adbSetInputSource(_ sourceId: Int, target: String? = nil, check: Bool = false) throws {
+        let resolvedTarget = (target?.isEmpty == false) ? target! : serial
+        let stopCmd = "am force-stop com.xiaomi.mitv.tvplayer"
+        let startCmd = "am start -a com.xiaomi.mitv.tvplayer.EXTSRC_PLAY -n com.xiaomi.mitv.tvplayer/.ExternalSourceActivity --ei input \(sourceId) -f 0x10000000"
+        if check {
+            _ = try checkedShell(stopCmd, target: resolvedTarget)
+            _ = try checkedShell(startCmd, target: resolvedTarget)
+        } else {
+            _ = shell(stopCmd)
+            _ = shell(startCmd)
+        }
     }
 
     private func jniBatchCommand(keys: [String]) -> String? {
@@ -703,23 +1920,75 @@ final class AdbClient {
     }
 
     func jniBatchGet(keys: [String]) -> [String: String] {
-        transaction {
-            guard let command = jniBatchCommand(keys: keys) else { return [:] }
+        let safeKeys = keys.filter { !$0.isEmpty && $0.allSatisfy { $0.isLetter || $0.isNumber || $0 == "_" } }
+        guard !safeKeys.isEmpty else { return [:] }
+
+        daemonStateLock.lock()
+        let inBatch = connectionMode == .daemon && batchDepth > 0
+        var cached: [String: String] = [:]
+        var allCached = inBatch
+        if inBatch {
+            for k in safeKeys {
+                if let v = batchJniCache[k] {
+                    cached[k] = String(v)
+                } else {
+                    allCached = false
+                    break
+                }
+            }
+        }
+        daemonStateLock.unlock()
+        if allCached { return cached }
+
+        if isDaemonMode, let q = try? daemonQuery(jniKeys: safeKeys) {
+            var values: [String: String] = [:]
+            for k in safeKeys {
+                if let v = q.jni[k] {
+                    values[k] = String(v)
+                }
+            }
+            if values.count == safeKeys.count {
+                return values
+            }
+        }
+
+        return transaction {
+            guard let command = jniBatchCommand(keys: safeKeys) else { return [:] }
             return parseJniBatch(shell(command))
         }
     }
 
     func jniBatchGetChecked(keys: [String], target: String) throws -> [String: String] {
-        try transaction {
-            guard let command = jniBatchCommand(keys: keys) else { return [:] }
+        let safeKeys = keys.filter { !$0.isEmpty && $0.allSatisfy { $0.isLetter || $0.isNumber || $0 == "_" } }
+        guard !safeKeys.isEmpty else { return [:] }
+
+        if isDaemonMode, target == serial,
+           let q = try? daemonQuery(jniKeys: safeKeys, check: true) {
+            var values: [String: String] = [:]
+            for k in safeKeys {
+                if let v = q.jni[k] {
+                    values[k] = String(v)
+                }
+            }
+            if values.count == safeKeys.count {
+                return values
+            }
+        }
+
+        return try transaction {
+            guard let command = jniBatchCommand(keys: safeKeys) else { return [:] }
             let values = parseJniBatch(try checkedShell(command, target: target))
-            let missing = keys.filter { Int(values[$0] ?? "") == nil }
+            let missing = safeKeys.filter { Int(values[$0] ?? "") == nil }
             guard missing.isEmpty else { throw PresetError("JNI 参数读取不完整，保留原数据：\(missing.joined(separator: "、"))") }
             return values
         }
     }
 
     func colorfulLed(action: String, args: [String] = []) {
+        if recordOrRun(.led(action: action, args: args)) { return }
+        if isDaemonMode, let (ok, _, _) = try? daemonBatch([.led(action: action, args: args)]), ok {
+            return
+        }
         let jar = "/data/data/mitv.service/cache/ColorfulLedTool.jar"
         shell(buildTvserviceCommand(jar: jar, args: ["ColorfulLedTool", action] + args))
     }
@@ -727,27 +1996,44 @@ final class AdbClient {
     // MARK: - Jar 部署
 
     func ensureJars() {
-        healJar("MtkDirectTool.jar")
-        healJar("ColorfulLedTool.jar")
+        _ = healJar("MtkDirectTool.jar")
+        _ = healJar("ColorfulLedTool.jar")
     }
 
-    private func healJar(_ filename: String) {
-        guard let local = AdbClient.runtimeResource(filename) else { return }
+    @discardableResult
+    private func healJar(_ filename: String) -> Bool {
+        guard !ip.isEmpty, let local = AdbClient.runtimeResource(filename) else { return false }
         let sdcardJar = "/sdcard/\(filename)"
         let cacheJar = "/data/data/mitv.service/cache/\(filename)"
-
-        let sizeLines = shell("stat -c %s \(sdcardJar) 2>/dev/null || echo 0").split(separator: "\n")
-        let sdSize = Int(sizeLines.last.map(String.init) ?? "0") ?? 0
 
         var localSize = 0
         if let attrs = try? FileManager.default.attributesOfItem(atPath: local),
            let n = attrs[.size] as? NSNumber {
             localSize = n.intValue
         }
+        guard localSize > 0 else { return false }
 
-        if sdSize < 1000 || (localSize > 0 && sdSize != localSize) {
-            run(["-s", serial, "push", local, sdcardJar], timeout: 30)
+        let sizeOutput = shell("echo $(stat -c %s \(sdcardJar) 2>/dev/null || echo 0) $(stat -c %s \(cacheJar) 2>/dev/null || echo 0)")
+        let tokens = sizeOutput.split(whereSeparator: \.isWhitespace).compactMap { Int($0) }
+        let sdSize = tokens.first ?? 0
+        let cacheSize = tokens.count >= 2 ? tokens[1] : 0
+
+        var pushed = false
+        if sdSize != localSize {
+            let pushRes = run(["-s", serial, "push", local, sdcardJar], timeout: 30)
+            let pushLower = pushRes.output.lowercased()
+            if pushRes.exitCode != 0 || Self.hasAdbDisconnectMarker(pushRes.output) || pushLower.contains("error:") {
+                return false
+            }
+            pushed = true
         }
-        shell(buildTvserviceShellCommand(parts: ["cp", sdcardJar, cacheJar]))
+
+        if pushed || cacheSize != localSize {
+            let cpOut = shell(buildTvserviceShellCommand(parts: ["cp", sdcardJar, cacheJar]))
+            if Self.hasAdbDisconnectMarker(cpOut) {
+                return false
+            }
+        }
+        return true
     }
 }

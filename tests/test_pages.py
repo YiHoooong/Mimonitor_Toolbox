@@ -1851,6 +1851,110 @@ class ConnectionModeUiTests(TrayTestBase):
                 adb_runtime._log_to_file_enabled = old_enabled
                 self._close(window)
 
+    def test_log_widget_uses_qplaintextedit_and_appends_lines(self):
+        from PyQt6.QtWidgets import QPlainTextEdit
+        from mimonitor_toolbox import main_window as main_window_mod
+
+        settings = {"verbose_log": True}
+        p1, p2 = self._settings_patches(settings)
+        with p1, p2:
+            window = self._app()
+            try:
+                self.assertIsInstance(window.log_widget, QPlainTextEdit)
+                main_window_mod._write_log_line(window, "[00:00:03] plain-text-check")
+                self.assertIn("plain-text-check", window.log_widget.toPlainText())
+            finally:
+                self._close(window)
+
+    def test_auto_task_options_deletes_dialog_on_accept_and_cancel(self):
+        from mimonitor_toolbox import pages
+
+        settings = {
+            "presets": [{"id": "p1", "name": "工作", "values": {}}],
+            "auto_tasks": [{"id": "t1", "start": "08:00", "end": "10:00", "preset_id": "p1"}],
+        }
+        p1, p2 = self._settings_patches(settings)
+        with p1, p2, mock.patch.object(pages, "load_settings", side_effect=lambda: dict(settings)):
+            window = self._app()
+            try:
+                cancel_dlg = mock.Mock()
+                cancel_dlg.exec.return_value = 0
+                with mock.patch.object(pages, "AutoTaskOptionsDialog", return_value=cancel_dlg):
+                    window._auto_task_options("t1")
+                cancel_dlg.deleteLater.assert_called_once()
+
+                accept_dlg = mock.Mock()
+                accept_dlg.exec.return_value = 1
+                accept_dlg.options.return_value = {"restore_after": True}
+                with mock.patch.object(pages, "AutoTaskOptionsDialog", return_value=accept_dlg):
+                    window._auto_task_options("t1")
+                accept_dlg.deleteLater.assert_called_once()
+                self.assertEqual(settings["auto_tasks"][0]["options"], {"restore_after": True})
+            finally:
+                self._close(window)
+
+    def test_auto_task_sync_defers_while_card_editing_and_resumes_when_done(self):
+        from mimonitor_toolbox import pages
+
+        settings = {
+            "presets": [{"id": "p1", "name": "工作", "values": {}}],
+            "auto_tasks": [{"id": "t1", "start": "08:00", "end": "10:00", "preset_id": "p1"}],
+        }
+        p1, p2 = self._settings_patches(settings)
+        with p1, p2, mock.patch.object(pages, "load_settings", side_effect=lambda: dict(settings)):
+            window = self._app()
+            try:
+                card = window._auto_task_cards[0]
+                card.set_editing(True)
+                window._auto_task_editing_changed("t1", True)
+                settings["auto_tasks"][0]["end"] = "11:00"
+                window._auto_task_sync()
+
+                self.assertTrue(window._auto_task_sync_deferred)
+                self.assertIs(window._auto_task_cards[0], card)
+
+                card.set_editing(False)
+                window._auto_task_editing_changed("t1", False)
+                self.assertFalse(window._auto_task_sync_deferred)
+                self.assertIsNot(window._auto_task_cards[0], card)
+                self.assertEqual(window._auto_task_cards[0].end_button.text(), "11:00")
+            finally:
+                self._close(window)
+
+    def test_preset_apply_does_not_schedule_redundant_3s_sync_timer(self):
+        from mimonitor_toolbox import pages
+
+        p1, p2 = self._settings_patches({})
+        with p1, p2:
+            window = self._app()
+            try:
+                with mock.patch.object(window, "apply_preset_by_id") as apply_mock, \
+                        mock.patch.object(pages.QTimer, "singleShot") as singleshot_mock:
+                    window._preset_apply("p1")
+                apply_mock.assert_called_once_with("p1")
+                for call in singleshot_mock.call_args_list:
+                    self.assertNotEqual(call.args[0], 3000)
+            finally:
+                self._close(window)
+
+    def test_hotkey_combos_replace_cycle_with_direct_input_sources(self):
+        p1, p2 = self._settings_patches({})
+        with p1, p2:
+            window = self._app()
+            try:
+                self.assertNotIn("input_source_cycle", window.hotkey_combos)
+                for action_id in (
+                    "input_source_hdmi1",
+                    "input_source_hdmi2",
+                    "input_source_dp",
+                    "input_source_usbc",
+                ):
+                    self.assertIn(action_id, window.hotkey_combos)
+                # 托盘右键目录仍保留信号源子菜单
+                self.assertIn("input_source", window._cycle_action_catalog())
+            finally:
+                self._close(window)
+
 
 if __name__ == "__main__":
     unittest.main()

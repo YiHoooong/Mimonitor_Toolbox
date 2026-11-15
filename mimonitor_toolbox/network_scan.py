@@ -21,6 +21,7 @@ PROBE_RETRY_DELAY_SECONDS = 1.5
 
 AF_INET = 2
 ERROR_BUFFER_OVERFLOW = 111
+ERROR_NO_DATA = 232
 GAA_FLAG_SKIP_ANYCAST = 0x0002
 GAA_FLAG_SKIP_MULTICAST = 0x0004
 GAA_FLAG_SKIP_DNS_SERVER = 0x0008
@@ -267,8 +268,12 @@ def _log(log: Optional[Callable[[str], None]], message: str) -> None:
         log(message)
 
 
-def _is_rfc1918(ip: ipaddress.IPv4Address) -> bool:
-    return any(ip in network for network in _RFC1918_NETWORKS)
+def _is_rfc1918(ip: Union[ipaddress.IPv4Address, str]) -> bool:
+    try:
+        addr = ip if isinstance(ip, ipaddress.IPv4Address) else ipaddress.IPv4Address(str(ip).strip())
+    except (ipaddress.AddressValueError, ValueError):
+        return False
+    return any(addr in network for network in _RFC1918_NETWORKS)
 
 
 def is_hyperv_switch_adapter(record: RawAdapterAddress) -> bool:
@@ -283,6 +288,37 @@ def is_hyperv_switch_adapter(record: RawAdapterAddress) -> bool:
     return (record.interface_name or "").strip().lower().startswith(HYPERV_FRIENDLY_PREFIX)
 
 
+def _normalize_device_rules(rules: Iterable[str]) -> tuple[str, ...]:
+    return tuple(str(item).strip().lower() for item in (rules or ()) if str(item).strip())
+
+
+def _match_normalized_device_rule(
+    record: RawAdapterAddress,
+    tokens: tuple[str, ...],
+) -> Optional[str]:
+    if not tokens:
+        return None
+    name_lower = str(record.interface_name or "").strip().lower()
+    haystack = " ".join(
+        (str(record.interface_name or ""),
+         str(getattr(record, "adapter_description", "") or ""))
+    ).lower()
+    index_str = str(record.interface_index)
+    for token in tokens:
+        if token.startswith("name:"):
+            if token[5:] == name_lower:
+                return token
+        elif token.startswith("contains:"):
+            if token[9:] and token[9:] in haystack:
+                return token
+        elif token.isdecimal():
+            if token == index_str:
+                return token
+        elif token == name_lower:
+            return token
+    return None
+
+
 def is_scan_adapter(
     record: RawAdapterAddress,
     force_devices: Iterable[str] = (),
@@ -293,15 +329,23 @@ def is_scan_adapter(
 
     `_network_signature` 之类只关心"哪些网卡参与"的地方复用它，保证和扫描同一口径。
     """
-    if adapter_is_blocked(record, block_devices):
+    block_tokens = _normalize_device_rules(block_devices)
+    blocked = _match_normalized_device_rule(record, block_tokens) is not None
+    if blocked:
         return False
-    if adapter_force_reason(record, force_devices, force_subnets):
-        return True
+    force_tokens = _normalize_device_rules(force_devices)
+    forced, _ = _adapter_force_match(record, force_tokens, force_subnets)
     # 扫描在"一个物理网卡都选不出来"时会回退使用虚拟网卡，所以这里也把虚拟网卡
     # 算进来 —— 否则外部交换机场景下"网络变化检测"会以为一直没有网络
     return (
-        not record.filter_interface
-        and record.if_type in (IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211)
+        _rejection_reason(
+            record,
+            forced,
+            bypass_physical=True,
+            blocked=False,
+            ignore_link_state=True,
+        )
+        is None
     )
 
 
@@ -314,26 +358,7 @@ def adapter_matches_device_rule(
     旧版界面保存的是无前缀的完整网卡名；不能根据当前枚举结果改变其语义，
     否则目标网卡暂时消失时，规则会误命中同名前缀的其他网卡。
     """
-    tokens = [str(item).strip().lower() for item in force_devices or () if str(item).strip()]
-    if not tokens:
-        return None
-    haystack = " ".join(
-        (str(record.interface_name or ""),
-         str(getattr(record, "adapter_description", "") or ""))
-    ).lower()
-    for token in tokens:
-        if token.startswith("name:"):
-            if token[5:] == str(record.interface_name or "").strip().lower():
-                return token
-        elif token.startswith("contains:"):
-            if token[9:] and token[9:] in haystack:
-                return token
-        elif token.isdecimal():
-            if token == str(record.interface_index):
-                return token
-        elif token == str(record.interface_name or "").strip().lower():
-            return token
-    return None
+    return _match_normalized_device_rule(record, _normalize_device_rules(force_devices))
 
 
 def adapter_is_blocked(
@@ -344,19 +369,28 @@ def adapter_is_blocked(
     return adapter_matches_device_rule(record, block_devices) is not None
 
 
+def _adapter_force_match(
+    record: RawAdapterAddress,
+    force_tokens: tuple[str, ...],
+    force_subnets: Iterable[ipaddress.IPv4Network] = (),
+) -> tuple[Optional[str], Optional[ipaddress.IPv4Network]]:
+    device_hit = _match_normalized_device_rule(record, force_tokens)
+    if device_hit:
+        return f"按网卡强制（{device_hit}）", None
+    for subnet in force_subnets or ():
+        if record.local_ip in subnet:
+            return f"按网段强制（{subnet}）", subnet
+    return None, None
+
+
 def adapter_force_reason(
     record: RawAdapterAddress,
     force_devices: Iterable[str] = (),
     force_subnets: Iterable[ipaddress.IPv4Network] = (),
 ) -> Optional[str]:
     """命中设置里的强制规则时返回原因，否则 None（用于日志）。"""
-    device_hit = adapter_matches_device_rule(record, force_devices)
-    if device_hit:
-        return f"按网卡强制（{device_hit}）"
-    for subnet in force_subnets or ():
-        if record.local_ip in subnet:
-            return f"按网段强制（{subnet}）"
-    return None
+    reason, _ = _adapter_force_match(record, _normalize_device_rules(force_devices), force_subnets)
+    return reason
 
 
 def parse_force_subnets(
@@ -381,28 +415,30 @@ def _rejection_reason(
     forced: Optional[str],
     bypass_physical: bool,
     blocked: bool = False,
+    ignore_link_state: bool = False,
 ) -> Optional[str]:
     if blocked:
         return "已在扫描设置里取消勾选"
-    if record.oper_status != IF_OPER_STATUS_UP:
-        return "网卡未启用"
-    if not record.media_connected:
-        return "网络未连接"
+    if not ignore_link_state:
+        if record.oper_status != IF_OPER_STATUS_UP:
+            return "网卡未启用"
+        if not record.media_connected:
+            return "网络未连接"
     if not forced:
         # 接口类型是"能不能扫"的硬条件，自动回退也不放开（隧道网卡不在局域网里）
         if record.if_type not in (IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211):
             return f"接口类型不支持({record.if_type})"
+        if record.filter_interface:
+            return "过滤器接口"
     if not (forced or bypass_physical):
         if not record.hardware_interface:
             return "非物理网卡（虚拟网卡可在设置里强制指定）"
-        if record.filter_interface:
-            return "过滤器接口"
         if record.endpoint_interface:
             return "终端接口"
     # 自动回退不算用户显式指定，仍然只认私网地址：别把公网网段扫了
     if not forced and not _is_rfc1918(record.local_ip):
         return "非 RFC1918 IPv4"
-    if not 1 <= record.prefix_length <= 30:
+    if not 1 <= record.prefix_length <= 31:
         return f"前缀长度不支持(/{record.prefix_length})"
     return None
 
@@ -410,17 +446,18 @@ def _rejection_reason(
 def _collect_networks(
     records: Iterable[RawAdapterAddress],
     log: Optional[Callable[[str], None]],
-    force_devices: Iterable[str],
+    force_tokens: tuple[str, ...],
     force_subnets: Iterable[ipaddress.IPv4Network],
     bypass_physical: bool,
-    block_devices: Iterable[str] = (),
+    block_tokens: tuple[str, ...] = (),
 ) -> dict[ipaddress.IPv4Network, ScanNetwork]:
     selected: dict[ipaddress.IPv4Network, ScanNetwork] = {}
     for record in records:
-        blocked = adapter_is_blocked(record, block_devices)
-        forced = None if blocked or bypass_physical else adapter_force_reason(
-            record, force_devices, force_subnets
-        )
+        blocked = _match_normalized_device_rule(record, block_tokens) is not None
+        if blocked or bypass_physical:
+            forced, forced_subnet = None, None
+        else:
+            forced, forced_subnet = _adapter_force_match(record, force_tokens, force_subnets)
         reason = _rejection_reason(record, forced, bypass_physical, blocked)
         if reason:
             _log(log, f"[扫描] 跳过网卡 {record.interface_name} {record.local_ip}: {reason}")
@@ -434,11 +471,17 @@ def _collect_networks(
         original = ipaddress.IPv4Network(
             (record.local_ip, record.prefix_length), strict=False
         )
-        effective = (
-            original
-            if record.prefix_length >= 22
-            else ipaddress.IPv4Network((record.local_ip, 24), strict=False)
-        )
+        if forced:
+            if forced_subnet is not None and 1 <= forced_subnet.prefixlen <= 31:
+                effective = forced_subnet
+            else:
+                effective = original
+        else:
+            effective = (
+                original
+                if record.prefix_length >= 22
+                else ipaddress.IPv4Network((record.local_ip, 24), strict=False)
+            )
         candidate = ScanNetwork(
             interface_index=record.interface_index,
             interface_name=record.interface_name,
@@ -483,16 +526,18 @@ def select_scan_networks(
     """
 
     record_list = list(records)
+    force_tokens = _normalize_device_rules(force_devices)
+    block_tokens = _normalize_device_rules(block_devices)
     subnets = parse_force_subnets(force_subnets, log=log)
     selected = _collect_networks(
-        record_list, log, force_devices, subnets, bypass_physical=False,
-        block_devices=block_devices,
+        record_list, log, force_tokens, subnets, bypass_physical=False,
+        block_tokens=block_tokens,
     )
     # 用户对"当前这些网卡"显式表过态（在扫描设置里勾了或取消了某块）时，不再自动
     # 回退：否则"取消勾选"会被回退机制绕过，去扫一块用户没要的虚拟网卡。
     has_explicit_device_rule = any(
-        adapter_is_blocked(item, block_devices)
-        or adapter_matches_device_rule(item, force_devices)
+        _match_normalized_device_rule(item, block_tokens) is not None
+        or _match_normalized_device_rule(item, force_tokens) is not None
         for item in record_list
     )
     if not selected and not has_explicit_device_rule:
@@ -504,7 +549,7 @@ def select_scan_networks(
             item for item in record_list
             if _rejection_reason(
                 item, None, bypass_physical=True,
-                blocked=adapter_is_blocked(item, block_devices),
+                blocked=_match_normalized_device_rule(item, block_tokens) is not None,
             ) is None
         ]
         if fallback:
@@ -515,8 +560,8 @@ def select_scan_networks(
                 f"（其中 Hyper-V 交换机 {hyperv_count} 块）",
             )
             selected = _collect_networks(
-                fallback, log, force_devices, subnets, bypass_physical=True,
-                block_devices=block_devices,
+                fallback, log, force_tokens, subnets, bypass_physical=True,
+                block_tokens=block_tokens,
             )
 
     networks = sorted(
@@ -580,6 +625,8 @@ def enumerate_windows_adapter_addresses() -> list[RawAdapterAddress]:
         )
         if result != ERROR_BUFFER_OVERFLOW:
             break
+    if result == ERROR_NO_DATA:
+        return []
     if result != 0 or buffer is None:
         raise WindowsAdapterError(f"GetAdaptersAddresses 失败，错误码 {result}")
 
@@ -658,7 +705,20 @@ def build_probe_targets(
 ) -> list[ProbeTarget]:
     """展开网段，排除本机地址并为重叠目标选择更优源网卡。"""
 
-    network_list = list(networks)
+    limit = max(0, min(int(max_total), MAX_TOTAL_PROBE_TARGETS))
+    if limit == 0:
+        _log(log, "[扫描] 待探测地址 0 个")
+        return []
+
+    network_list = sorted(
+        networks,
+        key=lambda item: (
+            item.metric,
+            -item.network.prefixlen,
+            item.interface_index,
+            int(item.local_ip),
+        ),
+    )
     local_ips = {item.local_ip for item in network_list}
     selected: dict[ipaddress.IPv4Address, tuple[tuple[int, int, int, int], ProbeTarget]] = {}
     for item in network_list:
@@ -668,6 +728,7 @@ def build_probe_targets(
             item.interface_index,
             int(item.local_ip),
         )
+        added_from_net = 0
         for target_ip in item.network.hosts():
             if target_ip in local_ips:
                 continue
@@ -675,13 +736,17 @@ def build_probe_targets(
             current = selected.get(target_ip)
             if current is None or priority < current[0]:
                 selected[target_ip] = (priority, target)
+            added_from_net += 1
+            if added_from_net >= limit:
+                break
 
-    targets = [entry[1] for entry in selected.values()]
+    entries = list(selected.values())
+    if len(entries) > limit:
+        _log(log, f"[扫描] 目标地址共 {len(entries)} 个，按安全上限截取前 {limit} 个")
+        entries.sort(key=lambda entry: (entry[0], int(entry[1].ip)))
+        entries = entries[:limit]
+    targets = [entry[1] for entry in entries]
     targets.sort(key=lambda item: int(item.ip))
-    limit = max(0, min(int(max_total), MAX_TOTAL_PROBE_TARGETS))
-    if len(targets) > limit:
-        _log(log, f"[扫描] 目标地址共 {len(targets)} 个，按安全上限截取前 {limit} 个")
-        targets = targets[:limit]
     _log(log, f"[扫描] 待探测地址 {len(targets)} 个")
     return targets
 
@@ -702,7 +767,6 @@ def probe_tcp_targets(
     target_list = list(targets)
     if not target_list:
         return []
-    worker_count = max(1, min(int(max_workers), MAX_PROBE_WORKERS, len(target_list)))
 
     def probe(target: ProbeTarget) -> Optional[ProbeResult]:
         if cancel_event.is_set():
@@ -723,6 +787,7 @@ def probe_tcp_targets(
     pending_targets = target_list
     for pass_index in range(2):
         retry_targets: list[ProbeTarget] = []
+        worker_count = max(1, min(int(max_workers), MAX_PROBE_WORKERS, len(pending_targets)))
         with ThreadPoolExecutor(
             max_workers=worker_count,
             thread_name_prefix="lan-probe",

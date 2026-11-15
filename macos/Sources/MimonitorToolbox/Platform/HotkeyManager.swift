@@ -35,7 +35,7 @@ enum HotkeyLists {
     ]
 }
 
-/// 9 个循环切换动作（对应原版 tools 页 actions_list）
+/// 热键可绑定的全局动作（对应原版 tools 页 actions_list）
 let hotkeyActions: [(id: String, label: String)] = [
     ("picture_mode_cycle", "画面模式 循环切换"),
     ("local_dimming_cycle", "精密控光 循环切换"),
@@ -45,7 +45,10 @@ let hotkeyActions: [(id: String, label: String)] = [
     ("response_time_cycle", "响应时间 循环切换"),
     ("memc_cycle", "运动补偿 循环切换"),
     ("freesync_toggle", "FreeSync 开关切换"),
-    ("input_source_cycle", "信号源 循环切换"),
+    ("input_source_hdmi1", "信号源 切至 HDMI 1"),
+    ("input_source_hdmi2", "信号源 切至 HDMI 2"),
+    ("input_source_dp", "信号源 切至 DP"),
+    ("input_source_usbc", "信号源 切至 USB-C"),
     ("sound_output_cycle", "声音输出 循环切换"),
     ("volume_mute_toggle", "静音 开关切换"),
 ]

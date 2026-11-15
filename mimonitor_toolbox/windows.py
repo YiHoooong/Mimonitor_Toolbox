@@ -23,6 +23,7 @@ MOD_WIN = 0x0008
 DXGI_ERROR_NOT_FOUND = 0x887A0002
 DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 = 12
 DISPLAY_DEVICE_ATTACHED_TO_DESKTOP = 0x00000001
+DISPLAY_DEVICE_ACTIVE = 0x00000001
 EDD_GET_DEVICE_INTERFACE_NAME = 0x00000001
 ENUM_CURRENT_SETTINGS = -1
 # 小米系显示器的 EDID PNP 厂商码（XMI3009 = 2026 款 G Pro 27U，XMI27B3 = 2025 款）。
@@ -142,6 +143,31 @@ def _make_guid(value):
     return _GUID.from_buffer_copy(uuid.UUID(value).bytes_le)
 
 
+_IID_FACTORY1 = _make_guid("770aae78-f26f-4dba-a829-253c83d1b387")
+_IID_OUTPUT6 = _make_guid("068346e8-aaec-4b84-add7-137f513f77a1")
+_REAL_WINDLL = getattr(ctypes, "WinDLL", None)
+_CACHED_DXGI_DLL = None
+
+
+def _get_dxgi_create_factory():
+    """获取 CreateDXGIFactory1，并仅在真实 ctypes.WinDLL 下缓存 DLL 句柄。"""
+    global _CACHED_DXGI_DLL
+    windll_cls = getattr(ctypes, "WinDLL", None)
+    if windll_cls is None:
+        return None
+    if windll_cls is _REAL_WINDLL:
+        if _CACHED_DXGI_DLL is None:
+            _CACHED_DXGI_DLL = windll_cls("dxgi")
+        dxgi = _CACHED_DXGI_DLL
+    else:
+        dxgi = windll_cls("dxgi")
+    create_factory = dxgi.CreateDXGIFactory1
+    if getattr(create_factory, "argtypes", None) is None:
+        create_factory.argtypes = [_GUID_POINTER, _VOID_POINTER_POINTER]
+        create_factory.restype = ctypes.c_long
+    return create_factory
+
+
 def _as_uint(hr):
     return hr & 0xFFFFFFFF
 
@@ -181,8 +207,9 @@ def list_windows_displays():
     if sys.platform != "win32" or not user32:
         return []
     enum_devices = user32.EnumDisplayDevicesW
-    enum_devices.argtypes = [wt.LPCWSTR, wt.DWORD, ctypes.POINTER(_DISPLAY_DEVICEW), wt.DWORD]
-    enum_devices.restype = wt.BOOL
+    if getattr(enum_devices, "argtypes", None) is None:
+        enum_devices.argtypes = [wt.LPCWSTR, wt.DWORD, ctypes.POINTER(_DISPLAY_DEVICEW), wt.DWORD]
+        enum_devices.restype = wt.BOOL
     displays = []
     slot_occurrence = {}
     adapter_index = 0
@@ -202,6 +229,8 @@ def list_windows_displays():
                                 EDD_GET_DEVICE_INTERFACE_NAME):
                 break
             monitor_index += 1
+            if not (monitor.StateFlags & DISPLAY_DEVICE_ACTIVE):
+                continue
             if monitor.DeviceID:
                 display_name = adapter.DeviceName.rsplit("\\", 1)[-1]
                 display_number = display_name.removeprefix("DISPLAY")
@@ -264,8 +293,12 @@ def resolve_hdr_target_display(displays, configured_id=None):
         return next((item for item in displays if item["device_id"] == configured_id), None)
     # 按厂商码而不是具体型号匹配：作者在 2025 款（XMI27B3）上验证，2026 款是
     # XMI3009 —— 写死型号会让新机型在多屏时识别不到，联动静默暂停。
-    matches = [item for item in displays
-               if HDR_TARGET_VENDOR_PREFIX in item["device_id"].upper()]
+    matches = []
+    for item in displays:
+        device_id = item.get("device_id", "")
+        code = (display_product_code(device_id) or str(device_id or "")).strip().upper()
+        if code.startswith(HDR_TARGET_VENDOR_PREFIX):
+            matches.append(item)
     if len(matches) == 1:
         return matches[0]
     return displays[0] if len(displays) == 1 else None
@@ -294,15 +327,12 @@ def query_windows_hdr_enabled(*, target_device_name=None):
     if sys.platform != "win32":
         return None
     try:
-        dxgi = ctypes.WinDLL("dxgi")
-        create_factory = dxgi.CreateDXGIFactory1
-        create_factory.argtypes = [_GUID_POINTER, _VOID_POINTER_POINTER]
-        create_factory.restype = ctypes.c_long
+        create_factory = _get_dxgi_create_factory()
+        if create_factory is None:
+            return None
 
-        iid_factory1 = _make_guid("770aae78-f26f-4dba-a829-253c83d1b387")
-        iid_output6 = _make_guid("068346e8-aaec-4b84-add7-137f513f77a1")
         factory_ptr = ctypes.c_void_p()
-        if create_factory(ctypes.byref(iid_factory1), ctypes.byref(factory_ptr)) != 0 or not factory_ptr.value:
+        if create_factory(ctypes.byref(_IID_FACTORY1), ctypes.byref(factory_ptr)) != 0 or not factory_ptr.value:
             return None
 
         attached_outputs = []
@@ -336,7 +366,7 @@ def query_windows_hdr_enabled(*, target_device_name=None):
                                 _QUERY_INTERFACE_PROTO,
                             )
                             output6_ptr = ctypes.c_void_p()
-                            if query_interface(output, ctypes.byref(iid_output6), ctypes.byref(output6_ptr)) == 0 and output6_ptr.value:
+                            if query_interface(output, ctypes.byref(_IID_OUTPUT6), ctypes.byref(output6_ptr)) == 0 and output6_ptr.value:
                                 output6 = output6_ptr.value
                                 try:
                                     desc = _DXGI_OUTPUT_DESC1()
@@ -347,6 +377,8 @@ def query_windows_hdr_enabled(*, target_device_name=None):
                                     )
                                     if get_desc1(output6, ctypes.byref(desc)) == 0 and desc.AttachedToDesktop:
                                         is_hdr = desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+                                        if target_device_name is not None and desc.DeviceName == target_device_name:
+                                            return is_hdr
                                         attached_outputs.append((desc.DeviceName, is_hdr))
                                 finally:
                                     _release_com(output6)
@@ -370,8 +402,9 @@ def _query_windows_display_devmode(device_name):
         return None
     try:
         enum_settings = user32.EnumDisplaySettingsW
-        enum_settings.argtypes = [wt.LPCWSTR, wt.DWORD, ctypes.POINTER(_DEVMODEW)]
-        enum_settings.restype = wt.BOOL
+        if getattr(enum_settings, "argtypes", None) is None:
+            enum_settings.argtypes = [wt.LPCWSTR, wt.DWORD, ctypes.POINTER(_DEVMODEW)]
+            enum_settings.restype = wt.BOOL
         dm = _DEVMODEW()
         dm.dmSize = ctypes.sizeof(_DEVMODEW)
         if not enum_settings(device_name, ENUM_CURRENT_SETTINGS & 0xFFFFFFFF, ctypes.byref(dm)):
@@ -424,26 +457,43 @@ def query_target_display_refresh_rate(*, configured_id=None, target_device_name=
 
 
 def get_autostart_path():
+    appdata = os.environ.get("APPDATA") or os.path.join(
+        os.path.expanduser("~"), "AppData", "Roaming"
+    )
     startup = os.path.join(
-        os.environ.get("APPDATA", ""),
+        appdata,
         r"Microsoft\Windows\Start Menu\Programs\Startup",
     )
     return os.path.join(startup, "RedmiToolbox.bat")
 
 
 def get_executable_path():
-    if getattr(sys, "frozen", False):
+    if getattr(sys, "frozen", False) or "__compiled__" in globals() or getattr(sys, "__compiled__", False):
         return sys.executable
     return os.path.abspath(sys.argv[0])
 
 
+def _autostart_launch_command(executable):
+    """构建开机启动脚本命令行，兼容编译后的 exe 与直接运行的 .py 脚本。"""
+    if executable.lower().endswith((".py", ".pyw")):
+        py_exe = sys.executable
+        pyw_candidate = os.path.join(os.path.dirname(py_exe), "pythonw.exe")
+        if os.path.isfile(pyw_candidate):
+            py_exe = pyw_candidate
+        return f'start /min "" "{py_exe}" "{executable}" --minimized'
+    return f'start /min "" "{executable}" --minimized'
+
+
 def install_autostart(executable=None):
     executable = executable or get_executable_path()
+    if not executable:
+        return False
     path = get_autostart_path()
+    launch_cmd = _autostart_launch_command(executable)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as stream:
-            stream.write(f'start /min "" "{executable}" --minimized\n')
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write(f"@echo off\r\nchcp 65001 >nul\r\n{launch_cmd}\r\n")
         return True
     except OSError:
         return False

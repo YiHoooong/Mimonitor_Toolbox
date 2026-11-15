@@ -1553,6 +1553,262 @@ class ColdStartTests(unittest.TestCase):
             app.App._keep_adb_alive(FakeApp())
         state.assert_called()
 
+    def test_excepthook_and_single_instance_socket_handle_invalid_utf8_and_multiple_pending(self):
+        import sys
+        import tempfile
+        from PyQt6.QtCore import QObject, pyqtSignal
+        from mimonitor_toolbox import app as app_mod
+
+        class FakeSocket(QObject):
+            readyRead = pyqtSignal()
+            disconnected = pyqtSignal()
+
+            def __init__(self, payload):
+                super().__init__()
+                self._buf = payload
+                self.closed = False
+                self.deleted = False
+
+            def bytesAvailable(self):
+                return len(self._buf)
+
+            def read(self, n):
+                chunk, self._buf = self._buf[:n], self._buf[n:]
+                return chunk
+
+            def close(self):
+                self.closed = True
+
+            def deleteLater(self):
+                self.deleted = True
+
+        class FakeServer:
+            def __init__(self, sockets):
+                self._sockets = list(sockets)
+
+            def hasPendingConnections(self):
+                return bool(self._sockets)
+
+            def nextPendingConnection(self):
+                return self._sockets.pop(0)
+
+        old_excepthook = sys.excepthook
+        old_thread_excepthook = threading.excepthook
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with mock.patch.object(app_mod, "get_app_data_dir", return_value=tmpdir):
+                    app_mod._install_excepthook()
+                    sys.excepthook(RuntimeError, RuntimeError("boom"), None)
+                log_file = os.path.join(tmpdir, "logs", "exceptions.log")
+                with open(log_file, "r", encoding="utf-8") as stream:
+                    self.assertIn("RuntimeError: boom", stream.read())
+        finally:
+            sys.excepthook = old_excepthook
+            threading.excepthook = old_thread_excepthook
+
+        bad_sock = FakeSocket(b"\xff\xfe" * 130)
+        good_sock = FakeSocket(b"show")
+        fake_window = mock.Mock()
+        app_mod._accept_single_instance_connections(FakeServer([bad_sock, good_sock]), fake_window)
+        fake_window.show_and_raise.assert_called_once()
+        self.assertTrue(bad_sock.closed and bad_sock.deleted)
+        self.assertTrue(good_sock.closed and good_sock.deleted)
+
+    def test_cleanup_before_exit_avoids_adb_command_lock_and_closes_tray_osd_and_log(self):
+        import io
+        from mimonitor_toolbox import adb as adb_runtime, main_window
+
+        timer = mock.Mock()
+        tray_menu = mock.Mock()
+        osd = mock.Mock()
+        fake_log = io.StringIO()
+        fake_host = SimpleNamespace(
+            _cleanup_done=False,
+            _windows_session_ending=False,
+            _invalidate_connection_intent=lambda: 1,
+            _cancel_resume_reconnect=lambda: None,
+            _cancel_scan=lambda _reason: None,
+            unregister_all_hotkeys=lambda: None,
+            _slider_debounce_timers={"b": timer},
+            _tray_menu=tray_menu,
+            osd=osd,
+            adb=SimpleNamespace(ip="192.168.1.10", serial="192.168.1.10:5555"),
+        )
+        old_log_file = adb_runtime._log_file
+        adb_runtime._log_file = fake_log
+        try:
+            with adb_runtime._adb_command_lock:
+                with mock.patch.object(main_window, "adb_run") as adb_run_mock, \
+                        mock.patch.object(main_window, "block_adb_spawns") as block_mock, \
+                        mock.patch.object(main_window, "cleanup_adb_processes") as cleanup_mock:
+                    app.App.cleanup_before_exit(fake_host)
+            adb_run_mock.assert_called_once_with(["disconnect", "192.168.1.10:5555"], timeout=2)
+            block_mock.assert_called_once()
+            cleanup_mock.assert_called_once_with(kill_server=True)
+            timer.stop.assert_called_once()
+            tray_menu.close.assert_called_once()
+            tray_menu.deleteLater.assert_called_once()
+            osd.shutdown.assert_called_once()
+            self.assertTrue(fake_log.closed)
+        finally:
+            adb_runtime._log_file = old_log_file
+            adb_runtime.unblock_adb_spawns()
+
+    def test_close_event_rechecks_forcing_exit_after_dialog_and_tray_ignores_double_click(self):
+        from PyQt6.QtWidgets import QSystemTrayIcon
+        from mimonitor_toolbox import main_window
+
+        fake_host = SimpleNamespace(
+            is_forcing_exit=False,
+            _cleanup_done=False,
+            cleanup_before_exit=mock.Mock(),
+            tray_icon=mock.Mock(),
+        )
+        fake_dialog = mock.Mock()
+
+        def flip_force_exit():
+            fake_host.is_forcing_exit = True
+            return 1
+
+        fake_dialog.exec.side_effect = flip_force_exit
+        fake_dialog.choice = "tray"
+        fake_dialog.chk_remember.isChecked.return_value = True
+        event = mock.Mock()
+
+        with mock.patch.object(main_window, "load_settings", return_value={"never_ask_close": False}), \
+                mock.patch.object(main_window, "CloseConfirmDialog", return_value=fake_dialog), \
+                mock.patch.object(main_window, "update_settings") as update_mock:
+            app.App.closeEvent(fake_host, event)
+
+        fake_dialog.deleteLater.assert_called_once()
+        update_mock.assert_not_called()
+        fake_host.cleanup_before_exit.assert_called_once()
+        event.accept.assert_called_once()
+
+        from PyQt6.QtCore import Qt
+
+        tray_host = SimpleNamespace(
+            _cleanup_done=False,
+            is_forcing_exit=False,
+            isVisible=lambda: False,
+            windowState=lambda: Qt.WindowState.WindowNoState,
+            show_and_raise=mock.Mock(),
+            hide=mock.Mock(),
+        )
+        app.App.on_tray_activated(tray_host, QSystemTrayIcon.ActivationReason.DoubleClick)
+        tray_host.show_and_raise.assert_not_called()
+        app.App.on_tray_activated(tray_host, QSystemTrayIcon.ActivationReason.Trigger)
+        tray_host.show_and_raise.assert_called_once()
+
+    def test_export_log_fallback_and_autostart_revert_on_error(self):
+        import tempfile
+        from PyQt6.QtWidgets import QCheckBox
+        from mimonitor_toolbox import adb as adb_runtime, main_window
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dest = os.path.join(tmpdir, "out.txt")
+            export_host = SimpleNamespace(
+                log_widget=SimpleNamespace(toPlainText=lambda: "fallback line\n"),
+                log=mock.Mock(),
+            )
+            old_path = adb_runtime._log_path
+            adb_runtime._log_path = os.path.join(tmpdir, "missing.log")
+            try:
+                with mock.patch.object(main_window.QFileDialog, "getSaveFileName", return_value=(dest, "")):
+                    app.App._export_log(export_host)
+            finally:
+                adb_runtime._log_path = old_path
+            with open(dest, "r", encoding="utf-8") as stream:
+                self.assertEqual(stream.read(), "fallback line\n")
+
+        chk = QCheckBox()
+        chk.setChecked(True)
+        auto_host = SimpleNamespace(
+            _install_autostart=lambda: False,
+            _remove_autostart=lambda: True,
+            chk_autostart=chk,
+            log=mock.Mock(),
+        )
+        with mock.patch.object(main_window, "update_settings") as update_mock:
+            app.App._toggle_autostart(auto_host, 2)
+        update_mock.assert_not_called()
+        self.assertFalse(chk.isChecked())
+
+    def test_on_status_disconnect_resets_state_and_hdr_last_state(self):
+        from PyQt6.QtWidgets import QCheckBox, QLabel, QPushButton
+        from mimonitor_toolbox import main_window
+
+        timer = mock.Mock()
+        btn = QPushButton()
+        btn.setChecked(True)
+        mute = QPushButton()
+        mute.setChecked(True)
+        chk_4k = QCheckBox()
+        chk_4k.setChecked(True)
+        slider_label = QLabel("85")
+        source_label = QLabel("HDMI 1")
+        sound_label = QLabel("扬声器")
+        pic_hint = QLabel("当前场景：HDR")
+        gain_card = mock.Mock()
+        hdr_tone_card = mock.Mock()
+        banner = mock.Mock()
+
+        host = SimpleNamespace(
+            adb=SimpleNamespace(ip="192.168.1.9"),
+            status_label=QLabel(),
+            adb_connected=True,
+            _page_loaded={"picturePage"},
+            _hdr_last_state=True,
+            _hdr_state_source="dxgi",
+            _slider_debounce_timers={"brightness": timer},
+            current_vals={"brightness": 85},
+            state_buttons={"pic": {"a": btn}},
+            sound_mute_btn=mute,
+            sliders={"brightness": (mock.Mock(), slider_label)},
+            source_label=source_label,
+            sound_output_label=sound_label,
+            picture_mode_hint_label=pic_hint,
+            color_gain_cards=[gain_card],
+            hdr_tone_mapping_card=hdr_tone_card,
+            chk_4k=chk_4k,
+            _preset_banner=banner,
+            _stop_source_polling=mock.Mock(),
+            _update_hdr_memory_status_label=mock.Mock(),
+            _update_game_mode_hint=mock.Mock(),
+            _sync_source_page_connection_state=mock.Mock(),
+            _update_preset_banner=mock.Mock(),
+            _reset_disconnected_ui_state=lambda: app.App._reset_disconnected_ui_state(host),
+            stackedWidget=SimpleNamespace(currentWidget=lambda: None),
+            _refresh_page_data=mock.Mock(),
+            _refresh_pages=mock.Mock(),
+            _on_page_changed=mock.Mock(),
+            _check_4k_state=mock.Mock(),
+            _check_guardian_status=mock.Mock(),
+            _poll_hdr_memory_state=mock.Mock(),
+            setWindowTitle=mock.Mock(),
+        )
+
+        with mock.patch.object(main_window.QTimer, "singleShot"):
+            app.App._on_status(host, "未连接")
+        timer.stop.assert_called_once()
+        self.assertEqual(host.current_vals, {})
+        self.assertFalse(btn.isChecked())
+        self.assertFalse(mute.isChecked())
+        self.assertFalse(chk_4k.isChecked())
+        self.assertEqual(slider_label.text(), "--")
+        self.assertEqual(source_label.text(), "未知")
+        self.assertEqual(pic_hint.text(), "当前场景：未连接")
+        gain_card.setVisible.assert_called_with(False)
+        hdr_tone_card.setVisible.assert_called_with(False)
+        banner.hide.assert_called_once()
+        self.assertIsNone(host._hdr_last_state)
+
+        host._hdr_last_state = False
+        with mock.patch.object(main_window.QTimer, "singleShot"):
+            app.App._on_status(host, "已连接: MiMonitor")
+        self.assertIsNone(host._hdr_last_state)
+        host._update_preset_banner.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

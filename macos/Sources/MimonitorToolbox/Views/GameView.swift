@@ -13,8 +13,6 @@ struct GameView: View {
                     .foregroundColor(state.gameModeHintIsWarning
                                      ? Color(red: 0.94, green: 0.72, blue: 0.35)
                                      : .secondary)
-                    .font(.callout)
-                    .foregroundColor(Color(red: 0.94, green: 0.72, blue: 0.35))
 
                 ButtonGroupSection(title: "准星", options: OptionLists.crosshair,
                                    selectedValue: state.intValue("front_sight_index", default: 0)) { v in

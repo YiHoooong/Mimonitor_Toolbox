@@ -261,3 +261,59 @@ enum Page: String, CaseIterable, Identifiable, Hashable {
         }
     }
 }
+
+// MARK: - 连接模式（混合加速 Daemon / 标准 ADB）
+
+enum ConnectionMode: String, CaseIterable, Identifiable, Equatable {
+    case adb
+    case daemon
+
+    static let defaultMode: ConnectionMode = .adb
+    static let userDefaultsKey = "connection_mode"
+    static let mtkDaemonPort = 27891
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .adb: return "标准 ADB（兼容模式）"
+        case .daemon: return "混合加速（Daemon 常驻）"
+        }
+    }
+
+    var shortLabel: String {
+        switch self {
+        case .adb: return "兼容模式"
+        case .daemon: return "混合加速"
+        }
+    }
+
+    var descriptionText: String {
+        switch self {
+        case .adb:
+            return "每次读写通过标准 adb shell 执行，无需在显示器后台驻留进程，兼容性最好。"
+        case .daemon:
+            return "在显示器上常驻轻量级 MtkDirectTool 守护进程并通过 adb forward 本机端口通信，批量读写与页面刷新可显著提速；不可用时自动回退到标准 ADB。"
+        }
+    }
+
+    static func normalize(_ raw: String?) -> ConnectionMode {
+        let trimmed = (raw ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        switch trimmed {
+        case "daemon", "hybrid", "fast":
+            return .daemon
+        default:
+            return .adb
+        }
+    }
+
+    static func load(from defaults: UserDefaults = .standard) -> ConnectionMode {
+        normalize(defaults.string(forKey: userDefaultsKey))
+    }
+
+    func save(to defaults: UserDefaults = .standard) {
+        defaults.set(rawValue, forKey: Self.userDefaultsKey)
+    }
+}

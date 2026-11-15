@@ -8,7 +8,7 @@ import android.util.Log;
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.File;
-import java.io.FileWriter;
+import java.io.FileOutputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
 import java.lang.reflect.Constructor;
@@ -23,6 +23,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 public class MtkDirectTool {
     private static final String TAG = "MtkDirectTool";
@@ -31,6 +32,8 @@ public class MtkDirectTool {
     private static final String RESULT_FILE = "/data/data/mitv.service/cache/.jni_result";
     private static final String BATCH_RESULT_FILE =
             "/sdcard/Download/Mimonitor_Toolbox/.mtk_batch_result.txt";
+    private static final String SOURCE_RESULT_FILE =
+            "/sdcard/Download/Mimonitor_Toolbox/.mtk_source_result.txt";
     private static final String TV_CLASSPATH =
             "/system/framework/mitvmiddlewareimpl.jar:/system_ext/priv-app/TvServices/TvServices.apk";
     private static final String NATIVE_LIB_PATH = "/vendor/lib64:/system/lib64:/system_ext/lib64";
@@ -71,11 +74,20 @@ public class MtkDirectTool {
     private static Method sHwParcelReadInt32Method;
     private static Method sHwParcelReadStrongBinderMethod;
     private static Method sHwParcelReleaseMethod;
+    private static Method sHwBinderGetServiceMethod;
     private static Method sIHwBinderTransactMethod;
+
+    private static Method sSmGetServiceMethod;
+    private static Method sIBinderTransactMethod;
+    private static Method sParcelObtainMethod;
+    private static Method sParcelWriteIfaceMethod;
+    private static Method sParcelWriteIntMethod;
+    private static Method sParcelReadExceptionMethod;
+    private static Method sParcelReadIntMethod;
+    private static Method sParcelRecycleMethod;
 
     private static Context sContext;
     private static ContentResolver sResolver;
-    private static boolean sContextInitTried = false;
     private static boolean sResolverGetBroken = false;
     private static boolean sResolverPutBroken = false;
     private static boolean sSendBroadcastBroken = false;
@@ -87,17 +99,37 @@ public class MtkDirectTool {
     }
 
     private static void writeFile(String path, String value) {
+        File file = new File(path);
+        File parent = file.getParentFile();
+        if (parent != null && !parent.exists()) {
+            parent.mkdirs();
+        }
+        File tmp = new File(parent, file.getName() + ".tmp." + Process.myPid());
+        String content = value == null ? "" : value;
         try {
-            File file = new File(path);
-            File parent = file.getParentFile();
-            if (parent != null && !parent.exists()) {
-                parent.mkdirs();
+            try (BufferedWriter bw = new BufferedWriter(
+                    new OutputStreamWriter(new FileOutputStream(tmp), StandardCharsets.UTF_8))) {
+                bw.write(content);
+                bw.flush();
             }
-            FileWriter fw = new FileWriter(file);
-            fw.write(value);
-            fw.close();
+            if (!tmp.renameTo(file)) {
+                if (file.exists()) {
+                    file.delete();
+                }
+                if (!tmp.renameTo(file)) {
+                    try (BufferedWriter bw = new BufferedWriter(
+                            new OutputStreamWriter(new FileOutputStream(file), StandardCharsets.UTF_8))) {
+                        bw.write(content);
+                        bw.flush();
+                    }
+                }
+            }
         } catch (Exception e) {
             Log.e(TAG, "Failed to write result file: " + e.getMessage());
+        } finally {
+            if (tmp.exists()) {
+                tmp.delete();
+            }
         }
     }
 
@@ -179,10 +211,9 @@ public class MtkDirectTool {
     }
 
     private static synchronized void ensureContext() {
-        if (sContextInitTried) {
+        if (sContext != null && sResolver != null) {
             return;
         }
-        sContextInitTried = true;
         try {
             Class<?> looperClass = Class.forName("android.os.Looper");
             Object mainLooper = looperClass.getMethod("getMainLooper").invoke(null);
@@ -199,11 +230,15 @@ public class MtkDirectTool {
                 if (ctx instanceof Context) {
                     sContext = (Context) ctx;
                     sResolver = sContext.getContentResolver();
+                    sResolverGetBroken = false;
+                    sResolverPutBroken = false;
                     try {
                         Settings.Global.getString(sResolver, "picture_mode");
-                    } catch (Throwable probeErr) {
+                    } catch (SecurityException probeSec) {
                         sResolverGetBroken = true;
                         sResolverPutBroken = true;
+                    } catch (Throwable probeErr) {
+                        Log.w(TAG, "Settings probe warning: " + probeErr.getMessage());
                     }
                 }
             }
@@ -228,6 +263,9 @@ public class MtkDirectTool {
             String doneFile, int stepSize) throws Exception {
         ensureTvNative();
         int clampedStepSize = Math.max(1, stepSize);
+        int boundedStepMs = clamp(stepMs, 0, 1000);
+        long sleepBudgetMs = 15000L;
+        long sleptMs = 0L;
         if (doneFile != null && doneFile.length() > 0) {
             try {
                 new File(doneFile).delete();
@@ -248,8 +286,10 @@ public class MtkDirectTool {
                 next = target;
             }
             v = next;
-            if (stepMs > 0) {
-                Thread.sleep(stepMs);
+            if (boundedStepMs > 0 && sleptMs < sleepBudgetMs) {
+                long sleepNow = Math.min((long) boundedStepMs, sleepBudgetMs - sleptMs);
+                Thread.sleep(sleepNow);
+                sleptMs += sleepNow;
             }
         }
         if (doneFile != null && doneFile.length() > 0) {
@@ -318,83 +358,70 @@ public class MtkDirectTool {
         log("RESULT: BATCH_GET keys=" + count);
     }
 
-    private static boolean transactTvService(int code, int arg) {
-        Object data = null;
-        Object reply = null;
-        try {
-            Class<?> smClass = Class.forName("android.os.ServiceManager");
-            Object tvBinder = smClass.getMethod("getService", String.class).invoke(null, "TvService");
-            if (tvBinder == null) {
-                log("WARN: TvService binder is null for tx " + code);
-                return false;
-            }
-            Class<?> iBinderClass = Class.forName("android.os.IBinder");
-            Class<?> parcelClass = Class.forName("android.os.Parcel");
-            Method obtain = parcelClass.getMethod("obtain");
-            data = obtain.invoke(null);
-            reply = obtain.invoke(null);
-            parcelClass.getMethod("writeInterfaceToken", String.class).invoke(data, "mitv.internal.ITvService");
-            parcelClass.getMethod("writeInt", int.class).invoke(data, arg);
-            boolean ok = (Boolean) iBinderClass
-                    .getMethod("transact", int.class, parcelClass, parcelClass, int.class)
-                    .invoke(tvBinder, code, data, reply, 0);
-            parcelClass.getMethod("readException").invoke(reply);
-            return ok;
-        } catch (Throwable t) {
-            log("WARN: TvService tx " + code + " failed: " + t.getMessage());
-            return false;
-        } finally {
+    private static synchronized void ensureTvServiceReflection() throws Exception {
+        if (sSmGetServiceMethod != null && sIBinderTransactMethod != null && sParcelRecycleMethod != null) {
+            return;
+        }
+        Class<?> smClass = Class.forName("android.os.ServiceManager");
+        sSmGetServiceMethod = smClass.getMethod("getService", String.class);
+        Class<?> iBinderClass = Class.forName("android.os.IBinder");
+        Class<?> parcelClass = Class.forName("android.os.Parcel");
+        sParcelObtainMethod = parcelClass.getMethod("obtain");
+        sParcelWriteIfaceMethod = parcelClass.getMethod("writeInterfaceToken", String.class);
+        sParcelWriteIntMethod = parcelClass.getMethod("writeInt", int.class);
+        sIBinderTransactMethod = iBinderClass.getMethod(
+                "transact", int.class, parcelClass, parcelClass, int.class);
+        sParcelReadExceptionMethod = parcelClass.getMethod("readException");
+        sParcelReadIntMethod = parcelClass.getMethod("readInt");
+        sParcelRecycleMethod = parcelClass.getMethod("recycle");
+    }
+
+    private static void recycleParcelQuietly(Object parcel) {
+        if (parcel != null && sParcelRecycleMethod != null) {
             try {
-                if (reply != null) {
-                    reply.getClass().getMethod("recycle").invoke(reply);
-                }
-            } catch (Throwable ignored) {
-            }
-            try {
-                if (data != null) {
-                    data.getClass().getMethod("recycle").invoke(data);
-                }
+                sParcelRecycleMethod.invoke(parcel);
             } catch (Throwable ignored) {
             }
         }
     }
 
-    private static int queryTvServiceInt(int code) {
+    private static int transactTvServiceParcel(int code, Integer writeArg, boolean readInt) {
         Object data = null;
         Object reply = null;
         try {
-            Class<?> smClass = Class.forName("android.os.ServiceManager");
-            Object tvBinder = smClass.getMethod("getService", String.class).invoke(null, "TvService");
+            ensureTvServiceReflection();
+            Object tvBinder = sSmGetServiceMethod.invoke(null, "TvService");
             if (tvBinder == null) {
+                log("WARN: TvService binder is null for tx " + code);
                 return -1;
             }
-            Class<?> iBinderClass = Class.forName("android.os.IBinder");
-            Class<?> parcelClass = Class.forName("android.os.Parcel");
-            Method obtain = parcelClass.getMethod("obtain");
-            data = obtain.invoke(null);
-            reply = obtain.invoke(null);
-            parcelClass.getMethod("writeInterfaceToken", String.class).invoke(data, "mitv.internal.ITvService");
-            iBinderClass.getMethod("transact", int.class, parcelClass, parcelClass, int.class)
-                    .invoke(tvBinder, code, data, reply, 0);
-            parcelClass.getMethod("readException").invoke(reply);
-            return (Integer) parcelClass.getMethod("readInt").invoke(reply);
+            data = sParcelObtainMethod.invoke(null);
+            reply = sParcelObtainMethod.invoke(null);
+            sParcelWriteIfaceMethod.invoke(data, "mitv.internal.ITvService");
+            if (writeArg != null) {
+                sParcelWriteIntMethod.invoke(data, writeArg.intValue());
+            }
+            boolean ok = (Boolean) sIBinderTransactMethod.invoke(tvBinder, code, data, reply, 0);
+            sParcelReadExceptionMethod.invoke(reply);
+            if (readInt) {
+                return (Integer) sParcelReadIntMethod.invoke(reply);
+            }
+            return ok ? 1 : 0;
         } catch (Throwable t) {
-            log("WARN: TvService query tx " + code + " failed: " + t.getMessage());
+            log("WARN: TvService tx " + code + " failed: " + t.getMessage());
             return -1;
         } finally {
-            try {
-                if (reply != null) {
-                    reply.getClass().getMethod("recycle").invoke(reply);
-                }
-            } catch (Throwable ignored) {
-            }
-            try {
-                if (data != null) {
-                    data.getClass().getMethod("recycle").invoke(data);
-                }
-            } catch (Throwable ignored) {
-            }
+            recycleParcelQuietly(reply);
+            recycleParcelQuietly(data);
         }
+    }
+
+    private static boolean transactTvService(int code, int arg) {
+        return transactTvServiceParcel(code, Integer.valueOf(arg), false) == 1;
+    }
+
+    private static int queryTvServiceInt(int code) {
+        return transactTvServiceParcel(code, null, true);
     }
 
     private static boolean disconnectSpdif(Class<?> iAudioServiceClass, Object audioService) {
@@ -576,28 +603,40 @@ public class MtkDirectTool {
     }
 
     private static int getMediaVolume() throws Exception {
-        try {
-            ensureAudioHandles(false);
-        } catch (Exception e) {
-            ensureAudioHandles(true);
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                ensureAudioHandles(attempt > 0);
+                try {
+                    Method m = sIAudioServiceClass.getMethod("getStreamVolumeForMute", int.class);
+                    return (Integer) m.invoke(sAudioService, 3);
+                } catch (NoSuchMethodException e) {
+                    Method m = sIAudioServiceClass.getMethod("getStreamVolume", int.class);
+                    return (Integer) m.invoke(sAudioService, 3);
+                }
+            } catch (Exception e) {
+                sAudioService = null;
+                if (attempt == 1) {
+                    throw e;
+                }
+            }
         }
-        try {
-            Method m = sIAudioServiceClass.getMethod("getStreamVolumeForMute", int.class);
-            return (Integer) m.invoke(sAudioService, 3);
-        } catch (NoSuchMethodException e) {
-            Method m = sIAudioServiceClass.getMethod("getStreamVolume", int.class);
-            return (Integer) m.invoke(sAudioService, 3);
-        }
+        throw new IllegalStateException("getMediaVolume unreachable");
     }
 
     private static boolean getMediaMuted() throws Exception {
-        try {
-            ensureAudioHandles(false);
-        } catch (Exception e) {
-            ensureAudioHandles(true);
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                ensureAudioHandles(attempt > 0);
+                Method m = sIAudioServiceClass.getMethod("isStreamMute", int.class);
+                return (Boolean) m.invoke(sAudioService, 3);
+            } catch (Exception e) {
+                sAudioService = null;
+                if (attempt == 1) {
+                    throw e;
+                }
+            }
         }
-        Method m = sIAudioServiceClass.getMethod("isStreamMute", int.class);
-        return (Boolean) m.invoke(sAudioService, 3);
+        throw new IllegalStateException("getMediaMuted unreachable");
     }
 
     private static String audioCallerPackage() {
@@ -617,51 +656,58 @@ public class MtkDirectTool {
     private static boolean setMediaVolume(int target, boolean unmuteFirst, boolean showUi) {
         int clamped = clamp(target, 0, 100);
         int flags = showUi ? 1 : 0;
-        try {
-            ensureAudioHandles(false);
-            if (unmuteFirst) {
-                setMediaMuted(false, false);
-            }
-            Method setVol = sIAudioServiceClass.getMethod(
-                    "setStreamVolume", int.class, int.class, int.class, String.class);
-            String pkg = audioCallerPackage();
+        for (int attempt = 0; attempt < 2; attempt++) {
             try {
-                setVol.invoke(sAudioService, 3, clamped, flags, pkg);
-            } catch (Exception e) {
-                setVol.invoke(sAudioService, 3, clamped, flags, "com.android.shell");
+                ensureAudioHandles(attempt > 0);
+                if (unmuteFirst) {
+                    setMediaMuted(false, false);
+                }
+                Method setVol = sIAudioServiceClass.getMethod(
+                        "setStreamVolume", int.class, int.class, int.class, String.class);
+                String pkg = audioCallerPackage();
+                try {
+                    setVol.invoke(sAudioService, 3, clamped, flags, pkg);
+                } catch (Exception e) {
+                    setVol.invoke(sAudioService, 3, clamped, flags, "com.android.shell");
+                }
+                return getMediaVolume() == clamped;
+            } catch (Throwable t) {
+                sAudioService = null;
             }
-            return getMediaVolume() == clamped;
-        } catch (Throwable t) {
-            return false;
         }
+        return false;
     }
 
     private static boolean setMediaMuted(boolean muted, boolean showUi) {
         int flags = showUi ? 1 : 0;
         int direction = muted ? -100 : 100;
-        try {
-            ensureAudioHandles(false);
-            Method adjVol = sIAudioServiceClass.getMethod(
-                    "adjustStreamVolume", int.class, int.class, int.class, String.class);
-            String pkg = audioCallerPackage();
+        for (int attempt = 0; attempt < 2; attempt++) {
             try {
-                adjVol.invoke(sAudioService, 3, direction, flags, pkg);
-            } catch (Exception e) {
-                adjVol.invoke(sAudioService, 3, direction, flags, "com.android.shell");
+                ensureAudioHandles(attempt > 0);
+                Method adjVol = sIAudioServiceClass.getMethod(
+                        "adjustStreamVolume", int.class, int.class, int.class, String.class);
+                String pkg = audioCallerPackage();
+                try {
+                    adjVol.invoke(sAudioService, 3, direction, flags, pkg);
+                } catch (Exception e) {
+                    adjVol.invoke(sAudioService, 3, direction, flags, "com.android.shell");
+                }
+                return getMediaMuted() == muted;
+            } catch (Throwable t) {
+                sAudioService = null;
             }
-            return getMediaMuted() == muted;
-        } catch (Throwable t) {
-            return false;
         }
+        return false;
     }
 
     private static synchronized void ensureLedReflection() throws Exception {
-        if (sHwBinderClass != null && sIHwBinderTransactMethod != null) {
+        if (sHwBinderClass != null && sIHwBinderTransactMethod != null && sHwBinderGetServiceMethod != null) {
             return;
         }
         sHwBinderClass = Class.forName("android.os.HwBinder");
         sHwParcelClass = Class.forName("android.os.HwParcel");
         sIHwBinderClass = Class.forName("android.os.IHwBinder");
+        sHwBinderGetServiceMethod = sHwBinderClass.getMethod("getService", String.class, String.class);
         sHwParcelWriteIfaceMethod = sHwParcelClass.getMethod("writeInterfaceToken", String.class);
         sHwParcelWriteInt32Method = sHwParcelClass.getMethod("writeInt32", int.class);
         sHwParcelVerifySuccessMethod = sHwParcelClass.getMethod("verifySuccess");
@@ -673,21 +719,29 @@ public class MtkDirectTool {
                 "transact", int.class, sHwParcelClass, sHwParcelClass, int.class);
     }
 
+    private static void releaseHwParcelQuietly(Object parcel) {
+        if (parcel != null && sHwParcelReleaseMethod != null) {
+            try {
+                sHwParcelReleaseMethod.invoke(parcel);
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
     private static Object getLedConfigBinder(boolean forceRefresh) throws Exception {
         ensureLedReflection();
         if (!forceRefresh && sLedConfigBinder != null) {
             return sLedConfigBinder;
         }
         sLedConfigBinder = null;
-        Object bsp = sHwBinderClass.getMethod("getService", String.class, String.class)
-                .invoke(null, BSP_IFACE, "default");
+        Object bsp = sHwBinderGetServiceMethod.invoke(null, BSP_IFACE, "default");
         if (bsp == null) {
             throw new IllegalStateException("HwBinder.getService(" + BSP_IFACE + ") returned null");
         }
         Object req = sHwParcelClass.getConstructor().newInstance();
         Object reply = sHwParcelClass.getConstructor().newInstance();
-        sHwParcelWriteIfaceMethod.invoke(req, BSP_IFACE);
         try {
+            sHwParcelWriteIfaceMethod.invoke(req, BSP_IFACE);
             sIHwBinderTransactMethod.invoke(bsp, 6, req, reply, 0);
             sHwParcelVerifySuccessMethod.invoke(reply);
             sHwParcelReleaseTempMethod.invoke(req);
@@ -699,10 +753,8 @@ public class MtkDirectTool {
             sLedConfigBinder = config;
             return config;
         } finally {
-            try {
-                sHwParcelReleaseMethod.invoke(reply);
-            } catch (Throwable ignored) {
-            }
+            releaseHwParcelQuietly(reply);
+            releaseHwParcelQuietly(req);
         }
     }
 
@@ -712,10 +764,10 @@ public class MtkDirectTool {
             Object config = getLedConfigBinder(attempt > 0);
             Object req = sHwParcelClass.getConstructor().newInstance();
             Object reply = sHwParcelClass.getConstructor().newInstance();
-            sHwParcelWriteIfaceMethod.invoke(req, CONFIG_IFACE);
-            sHwParcelWriteInt32Method.invoke(req, mode);
-            sHwParcelWriteInt32Method.invoke(req, color);
             try {
+                sHwParcelWriteIfaceMethod.invoke(req, CONFIG_IFACE);
+                sHwParcelWriteInt32Method.invoke(req, mode);
+                sHwParcelWriteInt32Method.invoke(req, color);
                 sIHwBinderTransactMethod.invoke(config, 2, req, reply, 0);
                 sHwParcelVerifySuccessMethod.invoke(reply);
                 sHwParcelReleaseTempMethod.invoke(req);
@@ -724,10 +776,8 @@ public class MtkDirectTool {
                 sLedConfigBinder = null;
                 lastErr = e;
             } finally {
-                try {
-                    sHwParcelReleaseMethod.invoke(reply);
-                } catch (Throwable ignored) {
-                }
+                releaseHwParcelQuietly(reply);
+                releaseHwParcelQuietly(req);
             }
         }
         throw lastErr;
@@ -752,7 +802,7 @@ public class MtkDirectTool {
         return base[colorValue] + illumination;
     }
 
-    private static int runColorfulLed(String[] args, int offset) throws Exception {
+    private static int[] resolveLedModeAndColor(String[] args, int offset) {
         if (offset >= args.length) {
             throw new IllegalArgumentException("led requires action");
         }
@@ -782,24 +832,54 @@ public class MtkDirectTool {
         } else {
             throw new IllegalArgumentException("Unknown led command: " + cmd);
         }
-        return setColorfulLedRaw(mode, color);
+        return new int[]{mode, color};
+    }
+
+    private static int runColorfulLed(String[] args, int offset) throws Exception {
+        int[] pair = resolveLedModeAndColor(args, offset);
+        return setColorfulLedRaw(pair[0], pair[1]);
     }
 
     private static List<String> execCommandAndReadLines(String... cmd) throws Exception {
-        java.lang.Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
-        List<String> lines = new ArrayList<>();
-        try (BufferedReader br = new BufferedReader(
-                new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = br.readLine()) != null) {
-                lines.add(line);
+        final java.lang.Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
+        final List<String> lines = new ArrayList<>();
+        final Throwable[] readErr = new Throwable[1];
+        Thread reader = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try (BufferedReader br = new BufferedReader(
+                        new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        lines.add(line);
+                    }
+                } catch (Throwable t) {
+                    readErr[0] = t;
+                }
             }
+        }, "mtk-cmd-reader");
+        reader.setDaemon(true);
+        try {
+            try {
+                p.getOutputStream().close();
+            } catch (Throwable ignored) {
+            }
+            reader.start();
+            boolean finished = p.waitFor(5, TimeUnit.SECONDS);
+            if (!finished) {
+                p.destroyForcibly();
+                p.waitFor(1, TimeUnit.SECONDS);
+                throw new IllegalStateException("Command timed out: " + String.join(" ", cmd));
+            }
+            reader.join(500);
+            int exit = p.exitValue();
+            if (exit != 0) {
+                throw new IllegalStateException("Command failed (" + exit + "): " + String.join(" ", lines));
+            }
+            return lines;
+        } finally {
+            p.destroyForcibly();
         }
-        int exit = p.waitFor();
-        if (exit != 0) {
-            throw new IllegalStateException("Command failed (" + exit + "): " + String.join(" ", lines));
-        }
-        return lines;
     }
 
     private static String execCommandAndReadFirstLine(String... cmd) throws Exception {
@@ -816,6 +896,26 @@ public class MtkDirectTool {
             out.append(trimmed);
         }
         return out.toString();
+    }
+
+    private static void setInputSource(int sourceId) throws Exception {
+        if (sourceId <= 0) {
+            throw new IllegalArgumentException("Invalid sourceId: " + sourceId);
+        }
+        execCommandAndReadLines("am", "force-stop", "com.xiaomi.mitv.tvplayer");
+        execCommandAndReadLines(
+                "am",
+                "start",
+                "-a",
+                "com.xiaomi.mitv.tvplayer.EXTSRC_PLAY",
+                "-n",
+                "com.xiaomi.mitv.tvplayer/.ExternalSourceActivity",
+                "--ei",
+                "input",
+                String.valueOf(sourceId),
+                "-f",
+                "0x10000000"
+        );
     }
 
     private static String getGlobalSettingViaCli(String key) throws Exception {
@@ -839,8 +939,10 @@ public class MtkDirectTool {
                     result.put(k, v == null ? "null" : sanitizeSingleLine(v));
                 }
                 return result;
-            } catch (Throwable t) {
+            } catch (SecurityException se) {
                 sResolverGetBroken = true;
+                result.clear();
+            } catch (Throwable t) {
                 result.clear();
             }
         }
@@ -878,8 +980,9 @@ public class MtkDirectTool {
             try {
                 String v = Settings.Global.getString(sResolver, key);
                 return v == null ? "null" : sanitizeSingleLine(v);
-            } catch (Throwable t) {
+            } catch (SecurityException se) {
                 sResolverGetBroken = true;
+            } catch (Throwable ignored) {
             }
         }
         return getGlobalSettingViaCli(key);
@@ -904,9 +1007,8 @@ public class MtkDirectTool {
             }
             throw new SecurityException(msg, se);
         } catch (Throwable t) {
-            sResolverPutBroken = true;
             throw new SecurityException(
-                    "PUT_DENIED:" + key + ":" + t.getClass().getSimpleName() + ":" + sanitizeSingleLine(t.getMessage()),
+                    "PUT_FAILED:" + key + ":" + t.getClass().getSimpleName() + ":" + sanitizeSingleLine(t.getMessage()),
                     t);
         }
     }
@@ -941,8 +1043,9 @@ public class MtkDirectTool {
                 try {
                     sContext.sendBroadcast(intent);
                     return;
-                } catch (Throwable sendErr) {
+                } catch (SecurityException sendSec) {
                     sSendBroadcastBroken = true;
+                } catch (Throwable ignored) {
                 }
             }
         }
@@ -963,10 +1066,12 @@ public class MtkDirectTool {
         List<String> jniKeys = new ArrayList<>();
         List<String> flags = new ArrayList<>();
 
+        boolean sawEnd = false;
         String line;
         while ((line = in.readLine()) != null) {
             String trimmed = line.trim();
             if ("END".equals(trimmed)) {
+                sawEnd = true;
                 break;
             }
             String[] parts = splitWhitespace(trimmed);
@@ -987,6 +1092,12 @@ public class MtkDirectTool {
                     flags.add(parts[i]);
                 }
             }
+        }
+        if (!sawEnd) {
+            out.write("ERR TRUNCATED_QUERY\n");
+            out.write("END\n");
+            out.flush();
+            return;
         }
 
         long startMs = System.currentTimeMillis();
@@ -1043,17 +1154,51 @@ public class MtkDirectTool {
         out.flush();
     }
 
+    private static boolean isPutLine(String raw) {
+        return "PUT".equals(raw)
+                || (raw.length() > 3 && raw.startsWith("PUT") && Character.isWhitespace(raw.charAt(3)));
+    }
+
+    private static String[] parsePutOp(String raw) {
+        int len = raw.length();
+        if (len <= 3 || !Character.isWhitespace(raw.charAt(3))) {
+            return null;
+        }
+        int pos = 4;
+        while (pos < len && Character.isWhitespace(raw.charAt(pos))) {
+            pos++;
+        }
+        if (pos >= len) {
+            return null;
+        }
+        int keyEnd = pos;
+        while (keyEnd < len && !Character.isWhitespace(raw.charAt(keyEnd))) {
+            keyEnd++;
+        }
+        String key = raw.substring(pos, keyEnd);
+        String val = keyEnd + 1 <= len ? raw.substring(keyEnd + 1) : "";
+        return new String[]{key, val};
+    }
+
     private static void handleBatch(BufferedReader in, BufferedWriter out) throws Exception {
         List<String> ops = new ArrayList<>();
+        boolean sawEnd = false;
         String line;
         while ((line = in.readLine()) != null) {
             String trimmed = line.trim();
             if ("END".equals(trimmed)) {
+                sawEnd = true;
                 break;
             }
             if (trimmed.length() > 0) {
-                ops.add(trimmed);
+                ops.add(line);
             }
+        }
+        if (!sawEnd) {
+            out.write("ERR TRUNCATED_BATCH\n");
+            out.write("END\n");
+            out.flush();
+            return;
         }
 
         long startMs = System.currentTimeMillis();
@@ -1061,17 +1206,16 @@ public class MtkDirectTool {
 
         for (int idx = 0; idx < ops.size(); idx++) {
             String raw = ops.get(idx);
-            String[] headParts = raw.split("\\s+", 3);
-            String op = headParts[0];
 
             try {
-                if ("PUT".equals(op)) {
-                    if (headParts.length < 2) {
+                if (isPutLine(raw)) {
+                    String[] parsedPut = parsePutOp(raw);
+                    if (parsedPut == null) {
                         stepLines.add("STEP " + idx + " ERR PUT:missing_key");
                         continue;
                     }
-                    String key = headParts[1];
-                    String val = headParts.length >= 3 ? headParts[2] : "";
+                    String key = parsedPut[0];
+                    String val = parsedPut[1];
                     try {
                         putGlobalSetting(key, val);
                         stepLines.add("STEP " + idx + " OK PUT " + key);
@@ -1086,6 +1230,7 @@ public class MtkDirectTool {
                     }
                 } else {
                     String[] parts = splitWhitespace(raw);
+                    String op = parts.length > 0 ? parts[0] : "";
                     if ("JNI_SET".equals(op) && parts.length >= 3) {
                         int val = Integer.parseInt(parts[2]);
                         int upd = parts.length >= 4 ? Integer.parseInt(parts[3]) : 3;
@@ -1140,6 +1285,10 @@ public class MtkDirectTool {
                     } else if ("REFRESH_PQ".equals(op)) {
                         refreshPq();
                         stepLines.add("STEP " + idx + " OK REFRESH_PQ");
+                    } else if ("SET_SOURCE".equals(op) && parts.length >= 2) {
+                        int sourceId = Integer.parseInt(parts[1]);
+                        setInputSource(sourceId);
+                        stepLines.add("STEP " + idx + " OK SET_SOURCE " + sourceId);
                     } else {
                         stepLines.add("STEP " + idx + " ERR UNKNOWN_OP:" + op);
                     }
@@ -1271,6 +1420,7 @@ public class MtkDirectTool {
 
         String cmd = args[0];
         String key = args.length >= 2 ? args[1] : null;
+        int exitCode = 0;
         try {
             if ("daemon".equals(cmd)) {
                 int port = args.length >= 2 ? parseIntOr(args[1], DEFAULT_DAEMON_PORT) : DEFAULT_DAEMON_PORT;
@@ -1283,6 +1433,7 @@ public class MtkDirectTool {
                 if (args.length < 2) {
                     log("ERROR: led requires <off|ambient|cycle|lighting|solid|raw> ...");
                     writeResult("ERROR");
+                    System.exit(1);
                     return;
                 }
                 int ret = runColorfulLed(args, 1);
@@ -1296,6 +1447,7 @@ public class MtkDirectTool {
                 if (args.length < 2) {
                     log("ERROR: setSoundOutput requires deviceId");
                     writeResult("ERROR");
+                    System.exit(1);
                     return;
                 }
                 int deviceId = Integer.parseInt(args[1]);
@@ -1304,6 +1456,8 @@ public class MtkDirectTool {
                 } catch (IllegalArgumentException iae) {
                     log("ERROR: Unsupported sound output deviceId: " + deviceId);
                     writeResult("ERROR: Unsupported deviceId " + deviceId);
+                    System.exit(1);
+                    return;
                 }
                 System.exit(0);
                 return;
@@ -1320,6 +1474,7 @@ public class MtkDirectTool {
                 if (args.length < 4) {
                     log("ERROR: setColorGains requires red green blue");
                     writeResult("ERROR");
+                    System.exit(1);
                     return;
                 }
                 int red = Integer.parseInt(args[1]);
@@ -1338,6 +1493,7 @@ public class MtkDirectTool {
                 if (key == null) {
                     log("ERROR: key is required for get");
                     writeResult("ERROR");
+                    System.exit(1);
                     return;
                 }
                 int val = getJniValue(key);
@@ -1348,14 +1504,36 @@ public class MtkDirectTool {
                 if (args.length < 2) {
                     log("ERROR: batchGet requires at least one key");
                     writeBatchResult("ERROR\n");
+                    System.exit(1);
                     return;
                 }
                 batchGet(args, 1);
+
+            } else if ("setSource".equals(cmd)) {
+                if (args.length < 2) {
+                    log("ERROR: setSource requires sourceId");
+                    writeResult("ERROR");
+                    System.exit(1);
+                    return;
+                }
+                try {
+                    int sourceId = Integer.parseInt(args[1]);
+                    setInputSource(sourceId);
+                    String res = "RESULT: SET_SOURCE sourceId=" + sourceId;
+                    log(res);
+                    writeResult("OK");
+                    writeFile(SOURCE_RESULT_FILE, res + "\n");
+                } catch (Exception e) {
+                    writeResult("ERROR: " + e.getMessage());
+                    writeFile(SOURCE_RESULT_FILE, "ERROR: " + e.getMessage() + "\n");
+                    throw e;
+                }
 
             } else if ("setHdrToneMapping".equals(cmd)) {
                 if (args.length < 2) {
                     log("ERROR: setHdrToneMapping requires value [isUpdate]");
                     writeResult("ERROR");
+                    System.exit(1);
                     return;
                 }
                 int hdrValue = Integer.parseInt(args[1]);
@@ -1369,6 +1547,7 @@ public class MtkDirectTool {
                 if (key == null) {
                     log("ERROR: key is required for set");
                     writeResult("ERROR");
+                    System.exit(1);
                     return;
                 }
                 int value = args.length >= 3 ? Integer.parseInt(args[2]) : 0;
@@ -1385,6 +1564,7 @@ public class MtkDirectTool {
                 if (key == null || args.length < 4) {
                     log("ERROR: ramp requires <key> <from> <to> [isUpdate] [stepMs] [doneFile] [step]");
                     writeResult("ERROR");
+                    System.exit(1);
                     return;
                 }
                 int from = Integer.parseInt(args[2]);
@@ -1403,6 +1583,7 @@ public class MtkDirectTool {
                 if (key == null) {
                     log("ERROR: key is required for getMinMax");
                     writeResult("ERROR");
+                    System.exit(1);
                     return;
                 }
                 int minVal = (Integer) sGetMinMaxNative.invoke(null, 0, key);
@@ -1443,13 +1624,15 @@ public class MtkDirectTool {
             } else {
                 log("ERROR: Unknown command " + cmd);
                 writeResult("ERROR: Unknown command " + cmd);
+                exitCode = 1;
             }
         } catch (Exception e) {
             log("FATAL ERROR: " + e.getMessage());
             writeResult("FATAL: " + e.getMessage());
             e.printStackTrace();
+            exitCode = 1;
         }
 
-        System.exit(0);
+        System.exit(exitCode);
     }
 }

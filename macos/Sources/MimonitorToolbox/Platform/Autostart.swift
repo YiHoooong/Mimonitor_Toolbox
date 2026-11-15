@@ -15,9 +15,13 @@ enum Autostart {
         FileManager.default.fileExists(atPath: plistURL().path)
     }
 
-    static func setEnabled(_ enabled: Bool, executablePath: String) {
+    static func setEnabled(_ enabled: Bool, executablePath: String) throws {
         let url = plistURL()
         if enabled {
+            guard !executablePath.isEmpty else {
+                throw NSError(domain: "com.mimonitor.toolbox.autostart", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "无法定位当前可执行文件路径"])
+            }
             let plist: [String: Any] = [
                 "Label": label,
                 "ProgramArguments": [executablePath, "--minimized"],
@@ -25,12 +29,11 @@ enum Autostart {
                 "ProcessType": "Interactive",
             ]
             let dir = url.deletingLastPathComponent()
-            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            if let data = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0) {
-                try? data.write(to: url)
-            }
-        } else {
-            try? FileManager.default.removeItem(at: url)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            try data.write(to: url, options: .atomic)
+        } else if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
         }
     }
 }

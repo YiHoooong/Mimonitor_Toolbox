@@ -2,14 +2,18 @@
 
 import glob
 import json
+import logging
 import os
 import shutil
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 
 _settings_lock = threading.RLock()
+_logger = logging.getLogger(__name__)
+_verbose_log_cache = None
 
 def get_app_data_dir():
     if sys.platform == "win32":
@@ -48,6 +52,19 @@ def _as_list_of_dicts(raw):
     if not isinstance(raw, list):
         return []
     return [item for item in raw if isinstance(item, dict)]
+
+
+def _as_list_of_strings(raw, default=(), allow_ints=False):
+    """列表型配置字段的兜底：非 list 时返回 default，过滤非字符串项。"""
+    if not isinstance(raw, list):
+        return list(default)
+    result = []
+    for item in raw:
+        if isinstance(item, str):
+            result.append(item)
+        elif allow_ints and isinstance(item, int) and not isinstance(item, bool):
+            result.append(str(item))
+    return result
 
 
 # 「无预设」不是真预设，用一个不会和 new_id 生成的 id 撞车的保留值。
@@ -89,13 +106,38 @@ def format_page_display_name(page_name):
     return PAGE_DISPLAY_NAMES.get(page_name, page_name)
 
 
+def invalidate_verbose_log_cache():
+    """清空 verbose_log 缓存（供写入配置或测试覆写后调用）。"""
+    global _verbose_log_cache
+    with _settings_lock:
+        _verbose_log_cache = None
+
+
+def _is_verbose_log_enabled():
+    global _verbose_log_cache
+    if load_settings is not _original_load_settings:
+        return bool(load_settings().get("verbose_log", False))
+    path = get_settings_path()
+    try:
+        st = os.stat(path)
+        sig = (path, st.st_mtime_ns, st.st_size)
+    except OSError:
+        sig = (path, None, None)
+    with _settings_lock:
+        if _verbose_log_cache is not None and _verbose_log_cache[:3] == sig:
+            return _verbose_log_cache[3]
+        enabled = bool(_load_settings_unlocked().get("verbose_log", False))
+        _verbose_log_cache = (*sig, enabled)
+        return enabled
+
+
 def emit_detail_log(host, message):
     """写入详细日志：支持 log_detail 时按开关仅显示于详细模式（文件始终保留）。"""
     detail_fn = getattr(host, "log_detail", None)
     if callable(detail_fn):
         detail_fn(message)
         return
-    if bool(load_settings().get("verbose_log", False)):
+    if _is_verbose_log_enabled():
         log_fn = getattr(host, "log", None)
         if callable(log_fn):
             log_fn(message)
@@ -122,7 +164,26 @@ def normalize_tray_preset_ids(raw_ids, presets=None):
     return normalized
 
 
-def _load_settings_unlocked():
+def _backup_corrupt_settings(path):
+    try:
+        if os.path.exists(path):
+            shutil.copy2(path, f"{path}.corrupt.bak")
+    except OSError:
+        pass
+
+
+def _read_settings_json(path):
+    for attempt in range(3):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except PermissionError:
+            if attempt >= 2:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+
+
+def _load_settings_unlocked(strict=False):
     defaults = {
         "close_behavior": "tray",
         "never_ask_close": False,
@@ -166,11 +227,19 @@ def _load_settings_unlocked():
     data = {}
     if os.path.exists(path):
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            pass
+            data = _read_settings_json(path)
+        except OSError as exc:
+            _logger.warning("读取配置文件失败 (%s): %s", path, exc)
+            if strict:
+                raise
+            data = {}
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+            _logger.warning("配置文件损坏，已备份并回退默认值 (%s): %s", path, exc)
+            _backup_corrupt_settings(path)
+            data = {}
     if not isinstance(data, dict):
+        _logger.warning("配置文件根节点非对象，已备份并回退默认值 (%s)", path)
+        _backup_corrupt_settings(path)
         data = {}
     merged = defaults.copy()
     merged.update(data)
@@ -181,6 +250,16 @@ def _load_settings_unlocked():
         "sdr": memory.get("sdr"),
         "hdr": memory.get("hdr"),
     }
+    merged["scan_force_devices"] = _as_list_of_strings(
+        merged.get("scan_force_devices"), allow_ints=True
+    )
+    merged["scan_block_devices"] = _as_list_of_strings(
+        merged.get("scan_block_devices"), allow_ints=True
+    )
+    merged["scan_force_subnets"] = _as_list_of_strings(merged.get("scan_force_subnets"))
+    merged["tray_items"] = _as_list_of_strings(
+        merged.get("tray_items"), default=defaults["tray_items"]
+    )
     merged["presets"] = _as_list_of_dicts(merged.get("presets"))
     merged["tray_presets"] = normalize_tray_preset_ids(merged.get("tray_presets"), merged["presets"])
     merged["auto_tasks"] = _as_list_of_dicts(merged.get("auto_tasks"))
@@ -198,18 +277,33 @@ def load_settings():
     with _settings_lock:
         return _load_settings_unlocked()
 
+
+_original_load_settings = load_settings
+
+
 def _write_settings_unlocked(settings):
     path = get_settings_path()
+    target_dir = os.path.dirname(path) or "."
+    os.makedirs(target_dir, exist_ok=True)
     temp_path = None
     try:
-        fd, temp_path = tempfile.mkstemp(prefix="config.", suffix=".tmp", dir=os.path.dirname(path))
+        fd, temp_path = tempfile.mkstemp(prefix="config.", suffix=".tmp", dir=target_dir)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(settings, f, indent=4, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(temp_path, path)
+        for attempt in range(4):
+            try:
+                os.replace(temp_path, path)
+                break
+            except PermissionError:
+                if attempt >= 3:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+        invalidate_verbose_log_cache()
         return True
-    except Exception:
+    except Exception as exc:
+        _logger.warning("写入配置文件失败 (%s): %s", path, exc)
         return False
     finally:
         if temp_path and os.path.exists(temp_path):
@@ -221,7 +315,11 @@ def _write_settings_unlocked(settings):
 
 def update_settings(changes):
     with _settings_lock:
-        settings = _load_settings_unlocked()
+        try:
+            settings = _load_settings_unlocked(strict=True)
+        except OSError as exc:
+            _logger.warning("无法读取现有配置，跳过写入以免覆盖 (%s): %s", get_settings_path(), exc)
+            return False
         settings.update(changes)
         return _write_settings_unlocked(settings)
 def is_frozen_build():
@@ -249,15 +347,18 @@ def bundled_resource_path(*parts):
     return None
 
 
-def cleanup_stale_extract_dirs(temp_dir=None):
+def cleanup_stale_extract_dirs(temp_dir=None, min_age_seconds=300.0):
     """清理 %TEMP% 下的 onefile_/_MEI 解压残留目录。
 
     PyInstaller 与 Nuitka onefile 被强杀或崩溃时不会清理各自的解压目录，
     长期累积会占用上 GB 磁盘。运行中的实例必然加载着解压目录内的
     python DLL（Windows 对已加载 DLL 拒绝写打开），以此判断存活并跳过；
     不含 python DLL 的目录不属于标准解压布局，同样跳过。
+    额外增加 min_age_seconds 保护，避免并发启动的新实例尚未加载 DLL 时被误删。
     """
     base = temp_dir or os.environ.get("TEMP") or tempfile.gettempdir()
+    now = time.time()
+    min_age = max(0.0, float(min_age_seconds))
     for prefix in ("onefile_", "_MEI"):
         try:
             candidates = glob.glob(os.path.join(base, prefix + "*"))
@@ -276,8 +377,16 @@ def cleanup_stale_extract_dirs(temp_dir=None):
             )
             if marker is None:
                 continue
+            marker_path = os.path.join(path, marker)
+            if min_age > 0:
+                try:
+                    newest_mtime = max(os.stat(path).st_mtime, os.stat(marker_path).st_mtime)
+                except OSError:
+                    continue
+                if now - newest_mtime < min_age:
+                    continue
             try:
-                with open(os.path.join(path, marker), "r+b"):
+                with open(marker_path, "r+b"):
                     pass
             except OSError:
                 continue  # DLL 被运行中的实例加载锁定

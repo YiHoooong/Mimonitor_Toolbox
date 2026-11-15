@@ -17,8 +17,10 @@ from .core import (
     MEMC_CONDITION_JNI_KEYS,
     MEMC_OPTIONS,
     MEMC_SETTINGS_KEY,
+    MONITOR_MENU_KEYS,
     PICTURE_MODE_GROUPS,
     PICTURE_SCENE_NAMES,
+    SCREEN_LIGHT_KEYS,
     SOUND_OUTPUT_OPTIONS,
     SOUND_OUTPUT_SETTINGS_KEY,
     SOUND_OUTPUT_VALID_VALUES,
@@ -38,7 +40,6 @@ from .core import (
     parse_hdmi_edid_int,
     parse_sound_output_value,
     read_hdmi_edid_and_freesync,
-    MONITOR_MENU_KEYS,
     update_settings,
     write_memc_value,
     write_screen_light_values,
@@ -69,6 +70,43 @@ _preset_overlay_filter = None
 _GAME_FEATURE_DEPENDENCIES = {
     "mt_game_dynamic_ft": ("front_sight_index", 1, "准星 1"),
     "mt_game_scope_night": ("mt_game_scope", 1, "狙击镜 1.1x"),
+}
+
+_PRESET_ITEM_KEYS_BY_ID = {
+    "freesync": ("freesync",),
+    "mode_320": ("mode_320",),
+    "picture_mode": ("picture_mode",),
+    "light_sensor": ("tv_picture_light_sensor", "g_video__light_sensor_switch"),
+    "backlight": ("picture_backlight", "xiaomi_picture_backlight", "g_disp__disp_back_light"),
+    "black_level": ("picture_brightness",),
+    "contrast": ("picture_contrast",),
+    "saturation": ("picture_saturation",),
+    "hue": ("picture_hue",),
+    "sharpness": ("picture_sharpness",),
+    "color_temp": ("picture_color_temperature",),
+    "color_gains": ("picture_red_gain", "picture_green_gain", "picture_blue_gain"),
+    "local_dimming": ("picture_local_dimming", "tv_picture_video_local_dimming"),
+    "hdr_tone_mapping": ("settings_display_hdr_color_tone", "picture_hdr_tone_mapping"),
+    "dynamic_definition": ("picture_dynamic_definition",),
+    "memc": (MEMC_SETTINGS_KEY,),
+    "response_time": ("picture_response_time",),
+    "gamut": ("tv_picture_advanced_video_color_space", "tv_picture_video_color_space"),
+    "sound_output": (SOUND_OUTPUT_SETTINGS_KEY,),
+    "front_sight_index": ("front_sight_index",),
+    "mt_game_dynamic_ft": ("mt_game_dynamic_ft",),
+    "mt_game_scope": ("mt_game_scope",),
+    "mt_game_scope_night": ("mt_game_scope_night",),
+    "monitor_menu_fps_counter": ("monitor_menu_fps_counter",),
+    "monitor_menu_stopwatch": ("monitor_menu_stopwatch",),
+    "monitor_menu_timer": ("monitor_menu_timer",),
+    "volume_music_speaker": ("volume_music_speaker",),
+    "media_muted": ("media_muted",),
+    "screen_light": tuple(SCREEN_LIGHT_KEYS),
+}
+
+_PRESET_LABEL_KEYS = {
+    item.label: _PRESET_ITEM_KEYS_BY_ID.get(item.id, ())
+    for item in PICTURE_ITEMS
 }
 
 
@@ -106,6 +144,7 @@ class DisplayFeaturesMixin:
         self._adjust_hotkey_timers = {}
         self._adjust_hotkey_resolving = set()
         self._local_dimming_toggle_resolving = False
+        self._media_mute_resolving = False
         self._hdr_last_state = None
         self._hdr_state_source = None
         self._hdr_windows_state = None
@@ -149,12 +188,16 @@ class DisplayFeaturesMixin:
             return 0.0
         return self.hotkey_countdown_seconds()
 
-    def _toggle_hotkey_countdown(self, state):
+    @staticmethod
+    def _is_checked_state(state):
         try:
             state_val = int(state)
         except Exception:
             state_val = getattr(state, "value", 0)
-        enabled = state_val == Qt.CheckState.Checked.value
+        return state_val == Qt.CheckState.Checked.value
+
+    def _toggle_hotkey_countdown(self, state):
+        enabled = self._is_checked_state(state)
         update_settings({"hotkey_countdown_enabled": enabled})
         self._sync_countdown_enabled_ui(enabled)
         self.log(f"快捷键松手后生效（倒计时）: {'开启' if enabled else '关闭（按下立即下发）'}")
@@ -259,17 +302,24 @@ class DisplayFeaturesMixin:
             return None
         if entry["kind"] == "options":
             key = self._cycle_action_catalog()[entry_id][0]
+            cfg = None
         else:
-            key = ADJUSTABLE_HOTKEY_PARAMS[entry_id].get("setting")
+            cfg = ADJUSTABLE_HOTKEY_PARAMS[entry_id]
+            key = cfg.get("setting")
         raw = getattr(self, "current_vals", {}).get(key)
         if raw in (None, "", "null", "N/A"):
             return None
         if entry_id == "sound_output":
             return normalize_sound_output_value(raw)
         try:
-            return int(raw)
+            val = int(raw)
         except (TypeError, ValueError):
             return None
+        if cfg is not None:
+            if cfg.get("ui_offset"):
+                val += int(cfg["ui_offset"])
+            val = max(cfg.get("min", 0), min(cfg.get("max", 100), val))
+        return val
 
     def tray_apply_option(self, entry_id, value):
         """托盘菜单里选中某个取值。"""
@@ -290,7 +340,7 @@ class DisplayFeaturesMixin:
         if not cfg:
             return
         target = max(cfg.get("min", 0), min(cfg.get("max", 100), int(value)))
-        self._stage_adjustable_display_value(entry_id, cfg, target, show_hud=False)
+        self._stage_adjustable_display_value(entry_id, cfg, target, show_hud=False, min_delay=0.3)
 
     def trigger_hotkey_action(self, action):
         if not getattr(self, "adb_connected", False):
@@ -304,6 +354,17 @@ class DisplayFeaturesMixin:
             return
 
         catalog = self._cycle_action_catalog()
+        direct_sources = {
+            "input_source_hdmi1": (23, "HDMI 1"),
+            "input_source_hdmi2": (24, "HDMI 2"),
+            "input_source_dp": (29, "DP"),
+            "input_source_usbc": (30, "USBC"),
+        }
+        if action in direct_sources:
+            target_val, target_name = direct_sources[action]
+            self._stage_direct_source_hotkey(target_val, target_name)
+            return
+
         actions_map = {
             "picture_mode_cycle": catalog["picture_mode"],
             "local_dimming_cycle": catalog["local_dimming"],
@@ -312,7 +373,6 @@ class DisplayFeaturesMixin:
             "response_time_cycle": catalog["response_time"],
             "memc_cycle": catalog["memc"],
             "freesync_toggle": catalog["freesync"],
-            "input_source_cycle": catalog["input_source"],
             "sound_output_cycle": catalog["sound_output"],
         }
 
@@ -321,20 +381,67 @@ class DisplayFeaturesMixin:
 
         self._stage_cycle_hotkey_action(action, *actions_map[action])
 
+    @staticmethod
+    def _normalize_cycle_value(sk, raw):
+        if raw in (None, "", "null", "N/A"):
+            return None
+        if sk == SOUND_OUTPUT_SETTINGS_KEY:
+            norm = normalize_sound_output_value(raw)
+            return norm if norm is not None else raw
+        try:
+            return int(str(raw).strip())
+        except (TypeError, ValueError):
+            return raw
+
     def _stage_cycle_hotkey_action(self, action, sk, state_tuples, label_name, exec_fn):
         pending = self._cycle_hotkey_pending.get(action)
-        curr_val = pending.get("value") if pending else getattr(self, "current_vals", {}).get(sk, state_tuples[0][0])
-        original_value = pending.get("original") if pending else curr_val
+        current_vals = getattr(self, "current_vals", {})
+        if pending:
+            curr_val = pending.get("value")
+            original_value = pending.get("original")
+        else:
+            has_orig = sk in current_vals
+            original_value = current_vals.get(sk) if has_orig else None
+            curr_val = original_value if has_orig else state_tuples[0][0]
 
+        norm_curr = self._normalize_cycle_value(sk, curr_val)
         curr_idx = -1
         for idx, (val, _name) in enumerate(state_tuples):
-            if val == curr_val:
+            if val == norm_curr or (
+                sk == "picture_mode" and norm_curr in PICTURE_MODE_GROUPS.get(val, ())
+            ):
                 curr_idx = idx
                 break
 
         next_idx = (curr_idx + 1) % len(state_tuples)
         next_val, next_name = state_tuples[next_idx]
 
+        self._schedule_staged_cycle_hotkey(
+            action, sk, label_name, next_val, next_name, original_value, exec_fn
+        )
+
+    def _stage_direct_source_hotkey(self, target_val, target_name):
+        sk = "mitv.tvplayer.hdmi.last.source"
+        action_key = "input_source_direct"
+        pending = self._cycle_hotkey_pending.get(action_key)
+        current_vals = getattr(self, "current_vals", {})
+        if pending:
+            original_value = pending.get("original")
+        else:
+            original_value = current_vals.get(sk) if sk in current_vals else None
+        self._schedule_staged_cycle_hotkey(
+            action_key,
+            sk,
+            "信号源",
+            target_val,
+            target_name,
+            original_value,
+            lambda val, name: self._set(sk, val, f"信号源: {name}"),
+        )
+
+    def _schedule_staged_cycle_hotkey(
+        self, action, sk, label_name, next_val, next_name, original_value, exec_fn
+    ):
         self._cycle_hotkey_pending[action] = {
             "sk": sk,
             "label": label_name,
@@ -374,20 +481,82 @@ class DisplayFeaturesMixin:
             return
         self.values_signal.emit({sk: value})
 
+    def _restore_control_state(self, key, previous, *, emit_signal=False, jni=False, extra_keys=()):
+        """在操作失败或未连接中止时回滚单个控制项缓存与 UI 状态。"""
+        current_vals = getattr(self, "current_vals", None)
+        if previous is None:
+            if isinstance(current_vals, dict):
+                current_vals.pop(key, None)
+                for ek in extra_keys:
+                    current_vals.pop(ek, None)
+            if key == "picture_mode":
+                highlight_mode = getattr(self, "_highlight_mode", None)
+                if callable(highlight_mode):
+                    highlight_mode(None)
+            else:
+                highlight = getattr(self, "_optimistic_highlight", None)
+                if callable(highlight):
+                    highlight(key, None)
+            if key == SOUND_OUTPUT_SETTINGS_KEY:
+                sound_label = getattr(self, "sound_output_label", None)
+                if sound_label is not None:
+                    sound_label.setText("--")
+            elif key == "media_muted":
+                mute_btn = getattr(self, "sound_mute_btn", None)
+                highlight_btn = getattr(self, "_highlight_btn", None)
+                if mute_btn is not None and callable(highlight_btn):
+                    highlight_btn(mute_btn, False)
+            return
+
+        if isinstance(current_vals, dict):
+            current_vals[key] = previous
+            for ek in extra_keys:
+                current_vals[ek] = previous
+        if emit_signal:
+            payload = {key: previous, **{ek: previous for ek in extra_keys}}
+            sig = getattr(self, "jni_values_signal" if jni else "values_signal", None)
+            if sig is not None:
+                sig.emit(payload)
+        if key == "picture_mode":
+            highlight_mode = getattr(self, "_highlight_mode", None)
+            if callable(highlight_mode):
+                highlight_mode(previous)
+        else:
+            highlight = getattr(self, "_optimistic_highlight", None)
+            if callable(highlight):
+                highlight(key, previous)
+        if key == "tv_picture_light_sensor":
+            sync_switch = getattr(self, "_sync_light_sensor_switch", None)
+            if callable(sync_switch):
+                sync_switch(str(previous).strip() == "1")
+        elif key == SOUND_OUTPUT_SETTINGS_KEY:
+            sound_label = getattr(self, "sound_output_label", None)
+            if sound_label is not None:
+                sound_label.setText(format_sound_output_label(previous))
+
     def _commit_cycle_hotkey_action(self, action):
         if getattr(self, "osd", None):
             self.osd.end_countdown()
         pending = self._cycle_hotkey_pending.pop(action, None)
-        if not pending or not getattr(self, "adb_connected", False):
+        if not pending:
             return
         sk = pending["sk"]
+        original = pending.get("original")
+        if not getattr(self, "adb_connected", False):
+            self._restore_control_state(
+                sk, original, emit_signal=(sk != "picture_mode"), jni=(sk == "freesync")
+            )
+            return
         next_val = pending["value"]
         next_name = pending["name"]
-        self._control_rollback_values[sk] = pending.get("original")
+        self._control_rollback_values[sk] = original
         try:
             pending["exec"](next_val, next_name)
         except Exception as e:
             self._control_rollback_values.pop(sk, None)
+            self._restore_control_state(
+                sk, original, emit_signal=(sk != "picture_mode"), jni=(sk == "freesync")
+            )
             self.log(f"快捷键执行失败: {e}")
 
     def _take_control_previous(self, key):
@@ -454,12 +623,30 @@ class DisplayFeaturesMixin:
             self.osd.show_hud("精密控光", value_name)
         self._set_local_dimming_toggle_value(target, message)
 
-    def _set_local_dimming_toggle_value(self, value, message):
-        if not self.check_connection():
+    def _apply_local_dimming(
+        self,
+        value,
+        action_label,
+        message,
+        *,
+        require_connection=True,
+        optimistic_signal=False,
+        note_change=True,
+        on_failure=None,
+    ):
+        """写入精密控光的统一实现（快捷键开关与 HDR/SDR 记忆共用）。"""
+        if require_connection and not self.check_connection():
             return
         value = max(0, min(3, int(value)))
         self._mark_adb_busy(2.5)
-        previous = self.current_vals.get("picture_local_dimming")
+        previous = self._take_control_previous("picture_local_dimming")
+        if optimistic_signal:
+            self.current_vals["picture_local_dimming"] = value
+            self.current_vals["tv_picture_video_local_dimming"] = value
+            self.values_signal.emit({
+                "picture_local_dimming": value,
+                "tv_picture_video_local_dimming": value,
+            })
 
         def operation():
             with _batch_tx(self.adb):
@@ -469,18 +656,39 @@ class DisplayFeaturesMixin:
                 self.adb.refresh_pq(check=True)
 
         def success():
-            self._note_picture_change()
+            if note_change:
+                self._note_picture_change()
             self.log(message)
-            self.current_vals["picture_local_dimming"] = value
-            self.current_vals["tv_picture_video_local_dimming"] = value
-            self._optimistic_highlight("picture_local_dimming", value)
+            if not optimistic_signal:
+                self.current_vals["picture_local_dimming"] = value
+                self.current_vals["tv_picture_video_local_dimming"] = value
+                self._optimistic_highlight("picture_local_dimming", value)
 
         def failure():
-            self._local_dimming_toggle_suspended = False
-            if previous is not None:
-                self._optimistic_highlight("picture_local_dimming", previous)
+            if callable(on_failure):
+                on_failure()
+            self._restore_control_state(
+                "picture_local_dimming",
+                previous,
+                emit_signal=optimistic_signal,
+                extra_keys=("tv_picture_video_local_dimming",),
+            )
 
-        self._run_adb_action("精密控光", operation, success, failure)
+        self._run_adb_action(action_label, operation, success, failure)
+
+    def _set_local_dimming_toggle_value(self, value, message):
+        def reset_toggle():
+            self._local_dimming_toggle_suspended = False
+
+        self._apply_local_dimming(
+            value,
+            "精密控光",
+            message,
+            require_connection=True,
+            optimistic_signal=False,
+            note_change=True,
+            on_failure=reset_toggle,
+        )
 
     def _sync_light_sensor_switch(self, on):
         """同步「自动调整亮度」开关控件状态，不触发写入。"""
@@ -514,6 +722,10 @@ class DisplayFeaturesMixin:
         - 不跟 `refresh_pq()`，光感由 ContentObserver 立即生效，菜单路径里没有这一步。
         """
         if not self.check_connection():
+            prev = getattr(self, "current_vals", {}).get("tv_picture_light_sensor")
+            self._sync_light_sensor_switch(
+                str(prev).strip() == "1" if prev is not None else not bool(on)
+            )
             return
         on = bool(on)
         self._mark_adb_busy(2.5)
@@ -537,9 +749,10 @@ class DisplayFeaturesMixin:
             self._sync_light_sensor_switch(on)
 
         def failure():
-            if previous is not None:
-                self.current_vals["tv_picture_light_sensor"] = previous
-                self._sync_light_sensor_switch(str(previous).strip() == "1")
+            self._restore_control_state("tv_picture_light_sensor", previous)
+            if previous is None:
+                self.current_vals.pop("g_video__light_sensor_switch", None)
+                self._sync_light_sensor_switch(not on)
 
         self._run_adb_action("自动调整亮度", operation, success, failure)
 
@@ -631,6 +844,9 @@ class DisplayFeaturesMixin:
         self._mark_adb_busy(seconds)
         self._suppress_display_change_refresh(seconds)
         self._local_dimming_memory_suppress_until = preset_busy_deadline
+        sync_timer = getattr(self, "_preset_sync_timer", None)
+        if sync_timer is not None and callable(getattr(sync_timer, "stop", None)):
+            sync_timer.stop()
         self._show_preset_switching_overlay()
         outcome = {}
 
@@ -651,18 +867,22 @@ class DisplayFeaturesMixin:
                 emit_detail_log(self, f"  · 跳过 {name}（{reason}）")
             for name, error in result.failed:
                 self.log(f"  · 失败 {name}：{error}")
-            self.current_vals.update(values)
-            if SOUND_OUTPUT_SETTINGS_KEY in values:
-                sound_val = normalize_sound_output_value(values[SOUND_OUTPUT_SETTINGS_KEY])
+            failed_keys = set()
+            for name, _error in result.failed:
+                failed_keys.update(_PRESET_LABEL_KEYS.get(name, ()))
+            applied_values = {k: v for k, v in values.items() if k not in failed_keys}
+            self.current_vals.update(applied_values)
+            if SOUND_OUTPUT_SETTINGS_KEY in applied_values:
+                sound_val = normalize_sound_output_value(applied_values[SOUND_OUTPUT_SETTINGS_KEY])
                 if sound_val is not None:
                     self.current_vals[SOUND_OUTPUT_SETTINGS_KEY] = sound_val
                     sound_label = getattr(self, "sound_output_label", None)
                     if sound_label is not None:
                         sound_label.setText(format_sound_output_label(sound_val))
             audio_updates = {
-                key: values[key]
+                key: applied_values[key]
                 for key in ("volume_music_speaker", "media_muted")
-                if key in values
+                if key in applied_values
             }
             if audio_updates:
                 values_signal = getattr(self, "values_signal", None)
@@ -976,7 +1196,6 @@ class DisplayFeaturesMixin:
 
             if active is None:
                 finished = self._auto_task_active_id
-                self._auto_task_active_id = None
                 self._auto_task_waiting_id = None
                 self._auto_task_deferred_id = None
                 if finished:
@@ -997,8 +1216,7 @@ class DisplayFeaturesMixin:
 
             self._auto_task_waiting_id = None
             self._auto_task_deferred_id = None
-            self._auto_task_active_id = active_id
-            self._start_auto_task(active)
+            self._start_auto_task(active, previous_task_id=self._auto_task_active_id)
         finally:
             self._auto_task_checking = False
 
@@ -1015,7 +1233,7 @@ class DisplayFeaturesMixin:
         return is_hdr_tone_mapping_picture_mode(
             getattr(self, "current_vals", {}).get("picture_mode"))
 
-    def _start_auto_task(self, task):
+    def _start_auto_task(self, task, previous_task_id=None):
         preset_id = task.get("preset_id")
         window = f"（{task.get('start')}-{task.get('end')}）"
         if preset_id == BASELINE_PRESET_ID:
@@ -1040,22 +1258,36 @@ class DisplayFeaturesMixin:
             target_active = preset_id
         self.log(f"{label}{window}")
         task_id = task.get("id")
+        prev_task = self._find_task(previous_task_id) if previous_task_id else None
+        carried_snapshot = (
+            prev_task.get("snapshot")
+            if isinstance(prev_task, dict) and isinstance(prev_task.get("snapshot"), dict)
+            else None
+        )
+        pending_snapshot = {}
 
         def remember(snapshot):
-            # 快照存进任务自身，不共用 preset_snapshot —— 时段内用户可能手动套用了
-            # 别的预设，共用槽位会让时段结束时的还原回到错误的状态。
-            tasks = load_settings().get("auto_tasks") or []
-            for item in tasks:
-                if isinstance(item, dict) and item.get("id") == task_id:
-                    item["snapshot"] = {"values": snapshot,
-                                        "at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                                        "active_preset_id": self.active_preset_id()}
-            update_settings({"auto_tasks": tasks})
+            # 快照先暂存，待应用成功后才落盘并覆盖前一个任务的槽位
+            pending_snapshot["value"] = {
+                "values": snapshot,
+                "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "active_preset_id": self.active_preset_id(),
+            }
 
         def finished(result):
             if result is None:
                 return
-            update_settings({"active_preset_id": target_active})
+            snapshot_to_store = carried_snapshot or pending_snapshot.get("value")
+            tasks = load_settings().get("auto_tasks") or []
+            for item in tasks:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("id") == task_id and snapshot_to_store is not None:
+                    item["snapshot"] = snapshot_to_store
+                elif previous_task_id and item.get("id") == previous_task_id:
+                    item["snapshot"] = None
+            update_settings({"auto_tasks": tasks, "active_preset_id": target_active})
+            self._auto_task_active_id = task_id
             if hasattr(self, "_refresh_preset_views"):
                 self._refresh_preset_views()
 
@@ -1064,9 +1296,14 @@ class DisplayFeaturesMixin:
             if target_options is not None and not all(normalize_preset_options(target_options).values())
             else {}
         )
-        self._apply_picture_values(values, label, before_apply=remember,
-                                   on_finished=finished, quiet=True,
-                                   **extra)
+        self._apply_picture_values(
+            values,
+            label,
+            before_apply=None if carried_snapshot is not None else remember,
+            on_finished=finished,
+            quiet=True,
+            **extra,
+        )
 
     def _clear_task_snapshot(self, task_id):
         tasks = load_settings().get("auto_tasks") or []
@@ -1076,21 +1313,25 @@ class DisplayFeaturesMixin:
         update_settings({"auto_tasks": tasks})
 
     def _end_auto_task(self, task_id):
+        if not getattr(self, "adb_connected", False):
+            return
         task = self._find_task(task_id)
         snapshot = task.get("snapshot") if isinstance(task, dict) else None
         values = snapshot.get("values") if isinstance(snapshot, dict) else None
         if not values:
             self.log("自动任务时段结束，但没有记录到可还原的快照")
             self._clear_task_snapshot(task_id)
+            self._auto_task_active_id = None
             return
         self.log("自动任务时段结束，正在还原之前的设置")
-        self._clear_task_snapshot(task_id)
         prior_active = snapshot.get("active_preset_id")
 
         def finished(result):
             if result is None:
                 return
-            # 还原快照的同时还原"当前预设"，否则记忆挂起会残留到时段之外。
+            # 仅在还原成功后清空任务快照与活动态，并还原"当前预设"
+            self._clear_task_snapshot(task_id)
+            self._auto_task_active_id = None
             update_settings({"active_preset_id": prior_active})
             self._refresh_preset_views()
 
@@ -1157,7 +1398,7 @@ class DisplayFeaturesMixin:
         except Exception as e:
             self.log(f"可调快捷键执行失败: {e}")
 
-    def _stage_adjustable_display_value(self, param, cfg, value, show_hud=True):
+    def _stage_adjustable_display_value(self, param, cfg, value, show_hud=True, min_delay=0.0):
         """暂存一次数值调整并去抖提交。
 
         show_hud=False 用于托盘滑块——菜单里已经内联显示数值，再弹悬浮窗是重复。
@@ -1166,21 +1407,32 @@ class DisplayFeaturesMixin:
         raw_value = value - int(cfg.get("ui_offset", 0))
 
         if cfg.get("screen_light"):
-            self.current_vals[setting] = raw_value
-            self.values_signal.emit({setting: raw_value})
+            stage_vals = {setting: raw_value}
         elif cfg.get("color_gain"):
-            self._ensure_color_gain_values()
-            self.current_vals[setting] = value
-            self.values_signal.emit({setting: value})
+            stage_vals = {setting: value}
         else:
             settings_keys = cfg.get("settings", [setting])
-            for k in settings_keys:
-                self.current_vals[k] = value
-            self.values_signal.emit({setting: value})
+            stage_vals = {k: value for k in settings_keys}
 
-        self._adjust_hotkey_pending[param] = {"cfg": cfg, "value": value}
+        existing = self._adjust_hotkey_pending.get(param)
+        if existing and "originals" in existing:
+            originals = existing["originals"]
+        else:
+            originals = {
+                k: (self.current_vals.get(k) if k in self.current_vals else None)
+                for k in stage_vals
+            }
 
-        delay = self.effective_hotkey_delay()
+        self.current_vals.update(stage_vals)
+        self.values_signal.emit({setting: stage_vals[setting]})
+
+        self._adjust_hotkey_pending[param] = {
+            "cfg": cfg,
+            "value": value,
+            "originals": originals,
+        }
+
+        delay = max(float(min_delay or 0.0), float(self.effective_hotkey_delay()))
         if show_hud and getattr(self, "osd", None):
             label = cfg.get("label", param)
             self.osd.show_hud(label, str(value), countdown=delay or None)
@@ -1198,15 +1450,35 @@ class DisplayFeaturesMixin:
         timer.setInterval(int(delay * 1000))
         timer.start()
 
+    def _revert_staged_adjustment(self, originals):
+        restored_emit = {}
+        for k, orig in originals.items():
+            if orig is None:
+                self.current_vals.pop(k, None)
+            else:
+                self.current_vals[k] = orig
+                restored_emit[k] = orig
+        if restored_emit:
+            self.values_signal.emit(restored_emit)
+
     def _commit_pending_adjustment(self, param):
         if getattr(self, "osd", None):
             self.osd.end_countdown()
         pending = self._adjust_hotkey_pending.pop(param, None)
-        if not pending or not getattr(self, "adb_connected", False):
+        if not pending:
             return
+        originals = pending.get("originals") or {}
+        if not getattr(self, "adb_connected", False):
+            self._revert_staged_adjustment(originals)
+            return
+        for k, orig in originals.items():
+            self._control_rollback_values[k] = orig
         try:
             self._set_adjustable_display_value(param, pending["cfg"], pending["value"])
         except Exception as e:
+            for k in originals:
+                self._control_rollback_values.pop(k, None)
+            self._revert_staged_adjustment(originals)
             self.log(f"可调快捷键提交失败: {e}")
 
     def _get_adjustable_display_value(self, cfg):
@@ -1229,18 +1501,13 @@ class DisplayFeaturesMixin:
 
     def _set_adjustable_display_value(self, param, cfg, value):
         setting = cfg["setting"]
-        raw_value = value - int(cfg.get("ui_offset", 0))
 
         if cfg.get("screen_light"):
             self._set_screen_light_illumination(value)
-            self.current_vals[setting] = raw_value
-            self.values_signal.emit({setting: raw_value})
             return
 
         if cfg.get("color_gain"):
-            self._ensure_color_gain_values()
             self._set_color_gain(cfg["label"], setting, cfg.get("jni"), value)
-            self.values_signal.emit({setting: value})
             return
 
         if cfg.get("media_volume"):
@@ -1248,6 +1515,11 @@ class DisplayFeaturesMixin:
             return
 
         settings_keys = cfg.get("settings", [setting])
+        originals = {k: self._take_control_previous(k) for k in settings_keys}
+        if not self.check_connection():
+            self._revert_staged_adjustment(originals)
+            return
+
         for k in settings_keys:
             self.current_vals[k] = value
         self.values_signal.emit({setting: value})
@@ -1265,21 +1537,15 @@ class DisplayFeaturesMixin:
             self.log(f"{cfg['label']}: {value}")
             self._note_picture_change()
 
+        def failure():
+            self._revert_staged_adjustment(originals)
+
         self._run_adb_action(
             cfg["label"],
             do,
             success,
-            lambda: self._force_refresh_page("picturePage"),
+            failure,
         )
-
-    def _ensure_color_gain_values(self):
-        for key in ("picture_red_gain", "picture_green_gain", "picture_blue_gain"):
-            if key in self.current_vals:
-                continue
-            try:
-                self.current_vals[key] = int(self.query_setting_or_jni(key))
-            except Exception:
-                self.current_vals[key] = 1024
 
     def query_setting_or_jni(self, sk, check=False):
         def as_int(value, fallback=0):
@@ -1329,11 +1595,7 @@ class DisplayFeaturesMixin:
         return load_settings().get("close_behavior", "tray") == "exit"
 
     def _toggle_hdr_local_dimming_memory(self, state):
-        try:
-            state_val = int(state)
-        except Exception:
-            state_val = getattr(state, "value", 0)
-        enabled = state_val == Qt.CheckState.Checked.value
+        enabled = self._is_checked_state(state)
         update_settings({"hdr_sdr_local_dimming_enabled": enabled})
         if enabled:
             self._ensure_local_dimming_memory_defaults()
@@ -1377,11 +1639,7 @@ class DisplayFeaturesMixin:
         self.log(f"FreeSync 模式记忆: 记录开启前模式 {self._picture_mode_display_name(mode)}")
 
     def _toggle_freesync_mode_memory(self, state):
-        try:
-            state_val = int(state)
-        except Exception:
-            state_val = getattr(state, "value", 0)
-        enabled = state_val == Qt.CheckState.Checked.value
+        enabled = self._is_checked_state(state)
         update_settings({"freesync_mode_memory_enabled": enabled})
         self.log(f"FreeSync Pro 模式记忆: {'开启' if enabled else '关闭'}")
         self._update_freesync_memory_status_label()
@@ -1441,11 +1699,7 @@ class DisplayFeaturesMixin:
         label.setText(f"准星模式联动：已开启（{memory_text}，离开游戏模式时自动隐藏）")
 
     def _toggle_crosshair_game_mode_only(self, state):
-        try:
-            state_val = int(state)
-        except Exception:
-            state_val = getattr(state, "value", 0)
-        enabled = state_val == Qt.CheckState.Checked.value
+        enabled = self._is_checked_state(state)
         update_settings({"crosshair_game_mode_only": enabled})
         self.log(f"准星仅在游戏模式下生效: {'开启' if enabled else '关闭'}")
         self._update_crosshair_mode_status_label()
@@ -1454,11 +1708,7 @@ class DisplayFeaturesMixin:
             self._reconcile_crosshair_mode_state()
 
     def _toggle_show_volume_osd(self, state):
-        try:
-            state_val = int(state)
-        except Exception:
-            state_val = getattr(state, "value", 0)
-        enabled = state_val == Qt.CheckState.Checked.value
+        enabled = self._is_checked_state(state)
         update_settings({"show_volume_osd": enabled})
         self.log(f"调节显示器音量时显示音量条: {'开启' if enabled else '关闭'}")
 
@@ -1615,6 +1865,18 @@ class DisplayFeaturesMixin:
         target_interval = visible_interval if self.isVisible() and not self.isMinimized() else background_interval
         if hasattr(self, "hdr_memory_timer") and self.hdr_memory_timer.interval() != target_interval:
             self.hdr_memory_timer.setInterval(target_interval)
+
+        if not getattr(self, "adb_connected", False):
+            # 未连接时不写 _hdr_last_state / _display_last_mode，确保连上后能可靠应用记忆
+            self._hdr_last_state = None
+            self._hdr_state_source = None
+            self._display_last_mode = None
+            self._hdr_windows_state = self._query_windows_hdr_state()
+            if self._hdr_windows_state is None:
+                self._update_hdr_memory_status_label("Windows HDR 状态未知")
+            else:
+                self._update_hdr_memory_status_label("等待连接显示器")
+            return
 
         win_state = self._query_windows_hdr_state()
         if win_state is None:
@@ -1835,55 +2097,14 @@ class DisplayFeaturesMixin:
         self._set_local_dimming_for_memory(value, f"{state_name} 精密控光记忆: {value_name}")
 
     def _set_local_dimming_for_memory(self, value, message):
-        value = max(0, min(3, int(value)))
-        self._mark_adb_busy(2.5)
-        previous = self.current_vals.get("picture_local_dimming")
-        self.current_vals["picture_local_dimming"] = value
-        self.current_vals["tv_picture_video_local_dimming"] = value
-        self.values_signal.emit({
-            "picture_local_dimming": value,
-            "tv_picture_video_local_dimming": value,
-        })
-
-        def operation():
-            with _batch_tx(self.adb):
-                self.adb.jni_set("g_video__vid_local_dimming", value, check=True)
-                self.adb.put("picture_local_dimming", str(value), check=True)
-                self.adb.put("tv_picture_video_local_dimming", str(value), check=True)
-                self.adb.refresh_pq(check=True)
-
-        def success():
-            self.log(message)
-
-        def failure():
-            if previous is not None:
-                self.current_vals["picture_local_dimming"] = previous
-                self.current_vals["tv_picture_video_local_dimming"] = previous
-                self.values_signal.emit({
-                    "picture_local_dimming": previous,
-                    "tv_picture_video_local_dimming": previous,
-                })
-
-        self._run_adb_action("HDR/SDR 精密控光", operation, success, failure)
-
-    def _read_current_local_dimming_for_memory(self):
-        if self._adb_channel_busy():
-            self._schedule_hdr_memory_apply()
-            return
-        self._mark_adb_busy(1.5)
-
-        def do():
-            try:
-                value = int(self.query_setting_or_jni("picture_local_dimming"))
-            except Exception:
-                return
-            value = max(0, min(3, value))
-            self.values_signal.emit({
-                "picture_local_dimming": value,
-                "tv_picture_video_local_dimming": value,
-            })
-
-        async_run(do)
+        self._apply_local_dimming(
+            value,
+            "HDR/SDR 精密控光",
+            message,
+            require_connection=False,
+            optimistic_signal=True,
+            note_change=False,
+        )
 
     def _get_local_dimming_memory(self):
         memory = load_settings().get("local_dimming_memory", {})
@@ -2091,9 +2312,7 @@ class DisplayFeaturesMixin:
             QTimer.singleShot(1200, lambda seq=seq, val=val: self._refresh_picture_page_after_mode_switch(seq, val))
 
         def failure():
-            if previous is not None:
-                self.current_vals["picture_mode"] = previous
-                self._highlight_mode(previous)
+            self._restore_control_state("picture_mode", previous)
 
         self._run_adb_action("画面模式", operation, success, failure)
 
@@ -2156,8 +2375,12 @@ class DisplayFeaturesMixin:
         def operation():
             with _batch_tx(self.adb):
                 if k == "mitv.tvplayer.hdmi.last.source":
-                    self.adb.shell("am force-stop com.xiaomi.mitv.tvplayer", check=True)
-                    self.adb.shell(f"am start -a com.xiaomi.mitv.tvplayer.EXTSRC_PLAY -n com.xiaomi.mitv.tvplayer/.ExternalSourceActivity --ei input {v} -f 0x10000000", check=True)
+                    set_source_fn = getattr(self.adb, "set_input_source", None)
+                    if callable(set_source_fn):
+                        set_source_fn(int(v), check=True)
+                    else:
+                        self.adb.shell("am force-stop com.xiaomi.mitv.tvplayer", check=True)
+                        self.adb.shell(f"am start -a com.xiaomi.mitv.tvplayer.EXTSRC_PLAY -n com.xiaomi.mitv.tvplayer/.ExternalSourceActivity --ei input {v} -f 0x10000000", check=True)
                 else:
                     self.adb.put(k, str(v), check=True)
                 self.adb.refresh_pq(check=True)
@@ -2172,10 +2395,12 @@ class DisplayFeaturesMixin:
                 self.source_var_text = self._source_names.get(v, f"未知 ({v})")
                 self.source_label.setText(self.source_var_text)
                 self._start_source_polling()
+                refresh_pages = getattr(self, "_refresh_pages", None)
+                if callable(refresh_pages):
+                    refresh_pages(("picturePage", "gamePage"), delay_ms=800, force=True)
 
         def failure():
-            if previous is not None:
-                self._optimistic_highlight(k, previous)
+            self._restore_control_state(k, previous)
 
         self._run_adb_action(m.split(":", 1)[0], operation, success, failure)
 
@@ -2186,18 +2411,20 @@ class DisplayFeaturesMixin:
 
     def set_sound_output(self, value, name=None):
         """切换声音输出设备，同步更新持久化键值、界面状态与当前激活预设。"""
+        state_key = SOUND_OUTPUT_SETTINGS_KEY
+        previous = self._take_control_previous(state_key)
         if not self.check_connection():
+            self._restore_control_state(state_key, previous)
             return
         device_id = parse_sound_output_value(value)
         if device_id is None or device_id not in SOUND_OUTPUT_VALID_VALUES:
+            self._restore_control_state(state_key, previous)
             self.log(f"不支持的声音输出设备: {value}")
             return
 
         display_val = normalize_sound_output_value(device_id)
         label_name = name or format_sound_output_label(display_val)
         self._mark_adb_busy(2.5)
-        state_key = SOUND_OUTPUT_SETTINGS_KEY
-        previous = self._take_control_previous(state_key)
 
         def operation():
             with _batch_tx(self.adb):
@@ -2218,12 +2445,7 @@ class DisplayFeaturesMixin:
                 start_poll()
 
         def failure():
-            if previous is not None:
-                self.current_vals[state_key] = previous
-                self._optimistic_highlight(state_key, previous)
-                sound_label = getattr(self, "sound_output_label", None)
-                if sound_label is not None:
-                    sound_label.setText(format_sound_output_label(previous))
+            self._restore_control_state(state_key, previous)
 
         self._run_adb_action("声音输出", operation, success, failure)
 
@@ -2274,6 +2496,9 @@ class DisplayFeaturesMixin:
         if not self.check_connection():
             return
         if muted is None and "media_muted" not in self.current_vals:
+            if getattr(self, "_media_mute_resolving", False):
+                return
+            self._media_mute_resolving = True
             state = {}
 
             def resolve_op():
@@ -2281,12 +2506,16 @@ class DisplayFeaturesMixin:
                     state["muted"] = bool(self.adb.media_muted(check=True))
 
             def resolve_ok():
+                self._media_mute_resolving = False
                 cur = 1 if state.get("muted") else 0
                 self.current_vals["media_muted"] = cur
                 self.values_signal.emit({"media_muted": cur})
                 self.toggle_media_mute(muted=not bool(cur), show_hud=show_hud)
 
-            self._run_adb_action("读取静音状态", resolve_op, resolve_ok)
+            def resolve_fail():
+                self._media_mute_resolving = False
+
+            self._run_adb_action("读取静音状态", resolve_op, resolve_ok, resolve_fail)
             return
 
         target_muted = (not bool(self.current_vals.get("media_muted", 0))) if muted is None else bool(muted)
@@ -2308,9 +2537,9 @@ class DisplayFeaturesMixin:
             self.log(f"静音: {'开' if target_muted else '关'}")
 
         def failure():
-            if prev_mute_raw is not None:
-                self.current_vals["media_muted"] = prev_mute_raw
-                self.values_signal.emit({"media_muted": prev_mute_raw})
+            self._restore_control_state(
+                "media_muted", prev_mute_raw, emit_signal=(prev_mute_raw is not None)
+            )
 
         self._run_adb_action("静音", operation, success, failure)
 
@@ -2334,13 +2563,26 @@ class DisplayFeaturesMixin:
         w.deleteLater()
         return bool(accepted)
 
-    def _set_game_feature(self, key, value, message, retrigger_game_mode=False):
+    def _active_game_picture_mode(self):
+        current_vals = getattr(self, "current_vals", {})
+        for key in ("picture_mode", "picture_preset_scenario"):
+            raw = current_vals.get(key)
+            if is_game_picture_mode(raw):
+                return int(raw)
+        return 10
+
+    def _set_game_feature(self, key, value, message, retrigger_game_mode=False, on_success=None):
         if not self.check_connection():
             return
         previous = self.current_vals.get(key, 0)
         previous_values = {key: previous}
         game_mode_active = DisplayFeaturesMixin._is_game_mode_active(self)
         switch_to_game = value != 0 and not game_mode_active
+        restore_game_mode = (
+            DisplayFeaturesMixin._active_game_picture_mode(self)
+            if (retrigger_game_mode and game_mode_active)
+            else 10
+        )
         feature_name = message.split(":", 1)[0]
         if switch_to_game:
             if not DisplayFeaturesMixin._confirm_switch_to_game_mode(self, feature_name):
@@ -2381,7 +2623,7 @@ class DisplayFeaturesMixin:
                         self.adb.batch_sleep(500)
                     else:
                         time.sleep(0.5)
-                    self.adb.put("picture_mode", "10", check=True)
+                    self.adb.put("picture_mode", str(restore_game_mode), check=True)
                 else:
                     self.adb.refresh_pq(check=True)
 
@@ -2389,6 +2631,8 @@ class DisplayFeaturesMixin:
             self.current_vals.update(updates)
             for setting, setting_value in updates.items():
                 self._optimistic_highlight(setting, setting_value)
+            if callable(on_success):
+                on_success()
             if hasattr(self, "_note_picture_change"):
                 self._note_picture_change()
             self.log(message)
@@ -2432,9 +2676,8 @@ class DisplayFeaturesMixin:
                 self._remember_local_dimming_value(v)
 
         def failure():
-            if previous is not None:
-                self.current_vals[sk] = previous
-                self._optimistic_highlight(sk, previous)
+            extra = (osd_sk,) if osd_sk else ()
+            self._restore_control_state(sk, previous, extra_keys=extra)
 
         self._run_adb_action(m.split(":", 1)[0], operation, success, failure)
 
@@ -2599,14 +2842,8 @@ class DisplayFeaturesMixin:
                 write_memc_value(self.adb, report.mode, val)
 
         def success():
-            if outcome.get("mode") is not None:
-                self.current_vals["picture_mode"] = outcome["mode"]
             if outcome.get("case") == "A":
-                if previous is not None:
-                    self.current_vals[MEMC_SETTINGS_KEY] = previous
-                else:
-                    self.current_vals.pop(MEMC_SETTINGS_KEY, None)
-                self._optimistic_highlight(MEMC_SETTINGS_KEY, previous)
+                self._restore_control_state(MEMC_SETTINGS_KEY, previous)
                 self.log(f"运动补偿: 当前模式不支持开启（已拦截切换为 {name}）")
                 self._present_memc_condition_dialog(outcome["report"], val)
                 return
@@ -2619,11 +2856,7 @@ class DisplayFeaturesMixin:
                 self._present_memc_condition_dialog(outcome["report"], val)
 
         def failure():
-            if previous is not None:
-                self.current_vals[MEMC_SETTINGS_KEY] = previous
-            else:
-                self.current_vals.pop(MEMC_SETTINGS_KEY, None)
-            self._optimistic_highlight(MEMC_SETTINGS_KEY, previous)
+            self._restore_control_state(MEMC_SETTINGS_KEY, previous)
 
         self._run_adb_action("运动补偿", operation, success, failure)
 
@@ -2654,9 +2887,7 @@ class DisplayFeaturesMixin:
             self._optimistic_highlight(state_key, ui_value)
 
         def failure():
-            if previous is not None:
-                self.current_vals[state_key] = previous
-                self._optimistic_highlight(state_key, previous)
+            self._restore_control_state(state_key, previous)
 
         self._run_adb_action("HDR 色调映射", operation, success, failure)
 
@@ -2678,87 +2909,133 @@ class DisplayFeaturesMixin:
             self._optimistic_highlight("picture_color_temperature", sv)
 
         def failure():
-            if previous is not None:
-                self._optimistic_highlight("picture_color_temperature", previous)
+            self._restore_control_state("picture_color_temperature", previous)
 
         self._run_adb_action("色温", operation, success, failure)
 
     def _set_color_gain(self, title, settings_key, jni_key, value):
+        gain_keys = ("picture_red_gain", "picture_green_gain", "picture_blue_gain")
+        previous_temp = self._take_control_previous("picture_color_temperature")
+        previous_values = {key: self._take_control_previous(key) for key in gain_keys}
         if not self.check_connection():
+            for key, prev in previous_values.items():
+                if prev is None:
+                    self.current_vals.pop(key, None)
+                else:
+                    self.current_vals[key] = prev
+            self._restore_control_state("picture_color_temperature", previous_temp)
+            restored = {k: v for k, v in previous_values.items() if v is not None}
+            if restored and getattr(self, "values_signal", None) is not None:
+                self.values_signal.emit(restored)
             return
+
         self._mark_adb_busy(3.0)
-        previous_temp = self.current_vals.get("picture_color_temperature")
-        previous_values = {
-            key: self.current_vals.get(key, 1024)
-            for key in ("picture_red_gain", "picture_green_gain", "picture_blue_gain")
-        }
-        if str(self.current_vals.get("picture_color_temperature")) != str(CUSTOM_COLOR_TEMP_VALUE):
+        was_custom = str(previous_temp) == str(CUSTOM_COLOR_TEMP_VALUE)
+        target_gain = max(524, min(1524, int(value)))
+
+        if not was_custom:
             self.current_vals["picture_color_temperature"] = CUSTOM_COLOR_TEMP_VALUE
             self._optimistic_highlight("picture_color_temperature", CUSTOM_COLOR_TEMP_VALUE)
 
-        gain_controls = [
-            ("picture_red_gain", "red_gain", "g_video__clr_gain_r"),
-            ("picture_green_gain", "green_gain", "g_video__clr_gain_g"),
-            ("picture_blue_gain", "blue_gain", "g_video__clr_gain_b"),
-        ]
-        values = {}
-        for setting, slider_name, _jni_key in gain_controls:
-            if setting == settings_key:
-                gain = value
-            elif setting in self.current_vals:
-                gain = self.current_vals.get(setting, 1024)
-            elif slider_name in self.sliders:
-                gain = self.sliders[slider_name][0].value()
-            else:
-                gain = self.current_vals.get(setting, 1024)
-            try:
-                gain = int(gain)
-            except Exception:
-                gain = 1024
-            values[setting] = max(524, min(1524, gain))
-        self.current_vals.update(values)
+        known_gains = {settings_key: target_gain}
+        for key in gain_keys:
+            if key == settings_key:
+                continue
+            if key in self.current_vals:
+                try:
+                    known_gains[key] = max(524, min(1524, int(self.current_vals[key])))
+                except Exception:
+                    pass
+        missing_keys_to_resolve = [key for key in gain_keys if key not in known_gains]
+
+        sliders = getattr(self, "sliders", {})
+        slider_fallbacks = {}
+        for key, slider_name in (
+            ("picture_red_gain", "red_gain"),
+            ("picture_green_gain", "green_gain"),
+            ("picture_blue_gain", "blue_gain"),
+        ):
+            if slider_name in sliders:
+                try:
+                    slider_fallbacks[key] = sliders[slider_name][0].value()
+                except Exception:
+                    pass
+
+        self.current_vals[settings_key] = target_gain
+        if getattr(self, "values_signal", None) is not None:
+            self.values_signal.emit({settings_key: target_gain})
+
+        outcome = {}
 
         def operation():
+            resolved = {}
+            for key in missing_keys_to_resolve:
+                try:
+                    queried = int(self.query_setting_or_jni(key, check=False))
+                except Exception:
+                    queried = 0
+                if 524 <= queried <= 1524:
+                    gain_val = queried
+                else:
+                    fb = slider_fallbacks.get(key, 1024)
+                    try:
+                        gain_val = max(524, min(1524, int(fb)))
+                    except Exception:
+                        gain_val = 1024
+                resolved[key] = gain_val
+            outcome["resolved"] = resolved
+            final_gains = {**resolved, **known_gains}
             with _batch_tx(self.adb):
-                self.adb.jni_set("g_video__clr_temp", XIAOMI_TO_MTK_COLOR_TEMP[CUSTOM_COLOR_TEMP_VALUE], check=True)
-                self.adb.put("picture_color_temperature", str(CUSTOM_COLOR_TEMP_VALUE), check=True)
+                if not was_custom:
+                    self.adb.jni_set("g_video__clr_temp", XIAOMI_TO_MTK_COLOR_TEMP[CUSTOM_COLOR_TEMP_VALUE], check=True)
+                    self.adb.put("picture_color_temperature", str(CUSTOM_COLOR_TEMP_VALUE), check=True)
                 self.adb.jni_set_color_gains(
-                    values["picture_red_gain"],
-                    values["picture_green_gain"],
-                    values["picture_blue_gain"],
+                    final_gains["picture_red_gain"],
+                    final_gains["picture_green_gain"],
+                    final_gains["picture_blue_gain"],
                     check=True,
                 )
-                for setting, _slider_name, _gain_jni_key in gain_controls:
-                    self.adb.put(setting, str(values[setting]), check=True)
+                self.adb.put(settings_key, str(target_gain), check=True)
                 self.adb.refresh_pq(check=True)
 
         def success():
+            resolved = outcome.get("resolved") or {}
+            if resolved:
+                self.current_vals.update(resolved)
+                if getattr(self, "values_signal", None) is not None:
+                    self.values_signal.emit(resolved)
             self._note_picture_change()
-            self.log(f"{title}: {value}")
+            self.log(f"{title}: {target_gain}")
 
         def failure():
-            self.current_vals.update(previous_values)
-            if previous_temp is not None:
-                self.current_vals["picture_color_temperature"] = previous_temp
-            restored = dict(previous_values)
+            for key, prev in previous_values.items():
+                if prev is None:
+                    self.current_vals.pop(key, None)
+                else:
+                    self.current_vals[key] = prev
+            self._restore_control_state("picture_color_temperature", previous_temp)
+            restored = {key: val for key, val in previous_values.items() if val is not None}
             if previous_temp is not None:
                 restored["picture_color_temperature"] = previous_temp
-            self.values_signal.emit(restored)
+            if restored and getattr(self, "values_signal", None) is not None:
+                self.values_signal.emit(restored)
 
         self._run_adb_action(title, operation, success, failure)
 
     def _fs(self, v):
-        # 用户在游戏模式下的主动选择同步进记忆：关掉即清记忆（避免下次回到
-        # 游戏模式又被自动还原回来），选了样式则更新记忆值。
-        if v == 0:
-            self._clear_crosshair_memory()
-        else:
-            self._save_crosshair_memory(v)
+        # 用户在游戏模式下的主动选择同步进记忆：仅在确认并写入成功后落盘。
+        def _commit_memory():
+            if v == 0:
+                self._clear_crosshair_memory()
+            else:
+                self._save_crosshair_memory(v)
+
         self._set_game_feature(
             "front_sight_index",
             v,
             f"准星: {'关' if v == 0 else v}",
             retrigger_game_mode=True,
+            on_success=_commit_memory,
         )
 
     def _get_input_source(self, check=False):
@@ -2810,25 +3087,26 @@ class DisplayFeaturesMixin:
             self._refresh_pages(("picturePage", "gamePage"), delay_ms=1500, force=True)
 
         def failure():
-            if previous is not None:
-                self._optimistic_highlight("mode_320", previous)
+            self._restore_control_state("mode_320", previous)
 
         self._run_adb_action("320Hz", operation, success, failure)
 
     def _fsync(self, on):
-        if not self.check_connection(): return
+        previous = self._take_control_previous("freesync")
+        if not self.check_connection():
+            self._restore_control_state("freesync", previous, emit_signal=True, jni=True)
+            return
         self._mark_adb_busy(2.5)
         self._suppress_display_change_refresh(3.0)
-        previous = self._take_control_previous("freesync")
 
         # FreeSync Pro 模式记忆：开启前记录画面模式，关闭时切回（开启后显示器会自动切到游戏模式）
         restore_mode = None
         if self._freesync_mode_memory_enabled() and not self.memories_suspended_by_preset():
             if on:
                 # 仅在从关到开时记录，避免重复开启把记忆覆盖成游戏模式
-                if self.current_vals.get("freesync") != 1:
+                if previous != 1:
                     self._remember_freesync_previous_mode()
-            elif self.current_vals.get("freesync") == 1:
+            elif previous == 1:
                 restore_mode = self._get_freesync_memory_mode()
 
         def operation():
@@ -2855,10 +3133,11 @@ class DisplayFeaturesMixin:
                         hdmi_edid_for(is_320, on),
                         check=True,
                     )
-                # 关闭 FreeSync 且开启模式记忆：先切回开启前的画面模式，再刷新数据（切换早于刷新）
+                self.adb.refresh_pq(check=True)
+                # 关闭 FreeSync 且开启模式记忆：先刷新使 FreeSync 关闭生效，再切回开启前的画面模式并刷新
                 if not on and restore_mode is not None:
                     self.adb.put("picture_mode", str(restore_mode), check=True)
-                self.adb.refresh_pq(check=True)
+                    self.adb.refresh_pq(check=True)
 
         def success():
             self.log(f"FreeSync: {'开' if on else '关'}")
@@ -2874,8 +3153,7 @@ class DisplayFeaturesMixin:
             self._refresh_pages(("picturePage", "gamePage"), delay_ms=1500, force=True)
 
         def failure():
-            if previous is not None:
-                self._optimistic_highlight("freesync", previous)
+            self._restore_control_state("freesync", previous, emit_signal=True, jni=True)
 
         self._run_adb_action("FreeSync", operation, success, failure)
 
@@ -2886,10 +3164,13 @@ class DisplayFeaturesMixin:
             return default
 
     def _commit_screen_light(self, message, updates):
+        previous = {key: self._take_control_previous(key) for key in updates}
         if not self.check_connection():
+            self._revert_staged_adjustment(previous)
+            for key, prev in previous.items():
+                self._optimistic_highlight(key, prev)
             return
         self._mark_adb_busy(2.0)
-        previous = {key: self.current_vals.get(key) for key in updates}
         self.current_vals.update(updates)
         for key, val in updates.items():
             self._optimistic_highlight(key, val)
@@ -2908,10 +3189,9 @@ class DisplayFeaturesMixin:
             self.log(message)
 
         def failure():
-            restored = {key: val for key, val in previous.items() if val is not None}
-            if restored:
-                self.current_vals.update(restored)
-                self.values_signal.emit(restored)
+            self._revert_staged_adjustment(previous)
+            for key, prev in previous.items():
+                self._optimistic_highlight(key, prev)
 
         self._run_adb_action("屏幕灯", operation, success, failure)
 

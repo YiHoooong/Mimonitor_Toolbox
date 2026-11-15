@@ -26,7 +26,6 @@ from qfluentwidgets import (
 
 from . import adb as adb_runtime
 from .adb import (
-    _adb_command_lock,
     adb_run,
     adb_text_has_disconnected_marker,
     block_adb_spawns,
@@ -77,18 +76,25 @@ from .windows import (
 )
 
 
+_log_file_lock = threading.RLock()
+
+
 def _write_log_line(app_obj, text, ui_visible=True):
     """输出一行日志到控件（可选）与本地日志文件（开启时始终写入）。"""
     if ui_visible:
-        app_obj.log_widget.append(text)
+        if hasattr(app_obj.log_widget, "appendPlainText"):
+            app_obj.log_widget.appendPlainText(text)
+        else:
+            app_obj.log_widget.append(text)
         scroll_bar = app_obj.log_widget.verticalScrollBar()
         scroll_bar.setValue(scroll_bar.maximum())
-    if adb_runtime._log_file and adb_runtime._log_to_file_enabled:
-        try:
-            adb_runtime._log_file.write(text + "\n")
-            adb_runtime._log_file.flush()
-        except Exception:
-            pass
+    with _log_file_lock:
+        if adb_runtime._log_file and adb_runtime._log_to_file_enabled:
+            try:
+                adb_runtime._log_file.write(text + "\n")
+                adb_runtime._log_file.flush()
+            except Exception:
+                pass
 
 
 class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
@@ -365,20 +371,37 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
         return menu
 
     def popup_tray_menu(self):
-        # 每次弹出都重建（打勾要反映最新值），旧的显式释放避免累积
+        if getattr(self, "_cleanup_done", False) or getattr(self, "is_forcing_exit", False):
+            return
+        if getattr(self, "_tray_menu_open", False):
+            active = getattr(self, "_tray_menu", None)
+            if active is not None:
+                active.close()
+            return
+        # 每次弹出都重建（打勾要反映最新值），旧的显式关闭并释放避免累积
         previous = getattr(self, "_tray_menu", None)
         if previous is not None:
+            previous.close()
             previous.deleteLater()
-        self._tray_menu = self.build_tray_menu()
-        # ani=False 在库里其实没被使用，必须传 aniType=NONE 才真的不播放动画；
-        # 子菜单同理，见 TrayOptionMenu / TraySliderCard
-        self._tray_menu.exec(QCursor.pos(), aniType=MenuAnimationType.NONE)
+        menu = self.build_tray_menu()
+        self._tray_menu = menu
+        self._tray_menu_open = True
+        try:
+            # ani=False 在库里其实没被使用，必须传 aniType=NONE 才真的不播放动画；
+            # 子菜单同理，见 TrayOptionMenu / TraySliderCard
+            menu.exec(QCursor.pos(), aniType=MenuAnimationType.NONE)
+        finally:
+            self._tray_menu_open = False
 
     def _check_adb_when_restored(self):
+        if getattr(self, "_cleanup_done", False) or getattr(self, "is_forcing_exit", False):
+            return
         if getattr(self, "adb_connected", False) and getattr(self.adb, "ip", ""):
             self._keep_adb_alive()
 
     def _restore_main_window(self):
+        if getattr(self, "_cleanup_done", False) or getattr(self, "is_forcing_exit", False):
+            return
         state = self.windowState()
         self.setWindowState((state & ~Qt.WindowState.WindowMinimized) | Qt.WindowState.WindowActive)
         self.showNormal()
@@ -404,6 +427,8 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
                 pass
 
     def show_and_raise(self):
+        if getattr(self, "_cleanup_done", False) or getattr(self, "is_forcing_exit", False):
+            return
         self._restore_main_window()
         QTimer.singleShot(0, self._restore_main_window)
         QTimer.singleShot(120, self._restore_main_window)
@@ -414,7 +439,7 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
         if reason == QSystemTrayIcon.ActivationReason.Context:
             self.popup_tray_menu()
             return
-        if reason == QSystemTrayIcon.ActivationReason.Trigger or reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
             is_minimized = bool(self.windowState() & Qt.WindowState.WindowMinimized)
             if self.isVisible() and not is_minimized:
                 self.hide()
@@ -586,8 +611,6 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
         self._cancel_resume_reconnect()
         self._cancel_scan("程序退出")
         session_ending = getattr(self, "_windows_session_ending", False)
-        if session_ending:
-            block_adb_spawns()
         try:
             self.unregister_all_hotkeys()
         except Exception:
@@ -598,6 +621,8 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
                 self.adb_keepalive_timer.stop()
             if hasattr(self, "adb_server_monitor_timer"):
                 self.adb_server_monitor_timer.stop()
+            for timer in getattr(self, "_slider_debounce_timers", {}).values():
+                timer.stop()
         except Exception:
             pass
         try:
@@ -608,6 +633,22 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
             banner = getattr(self, "_preset_banner", None)
             if banner is not None:
                 banner.hide()
+        except Exception:
+            pass
+        try:
+            tray_menu = getattr(self, "_tray_menu", None)
+            if tray_menu is not None:
+                tray_menu.close()
+                tray_menu.deleteLater()
+                self._tray_menu = None
+            osd = getattr(self, "osd", None)
+            if osd is not None:
+                if hasattr(osd, "shutdown"):
+                    osd.shutdown()
+                else:
+                    osd.close()
+                    osd.deleteLater()
+                self.osd = None
         except Exception:
             pass
         try:
@@ -622,26 +663,32 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
         except Exception:
             pass
         if session_ending:
+            block_adb_spawns()
             cleanup_adb_processes(kill_server=False)
         else:
-            with _adb_command_lock:
-                try:
-                    if self.adb.ip:
-                        adb_run(["disconnect", self.adb.serial], timeout=3)
-                except Exception:
-                    pass
-                block_adb_spawns()
-                cleanup_adb_processes(kill_server=True)
-        try:
-            if adb_runtime._log_file:
-                adb_runtime._log_file.flush()
-                adb_runtime._log_file.close()
-        except Exception:
-            pass
+            try:
+                if getattr(self, "adb", None) and getattr(self.adb, "ip", ""):
+                    adb_run(["disconnect", self.adb.serial], timeout=2)
+            except Exception:
+                pass
+            block_adb_spawns()
+            cleanup_adb_processes(kill_server=True)
+        with _log_file_lock:
+            try:
+                if adb_runtime._log_file:
+                    adb_runtime._log_file.flush()
+                    adb_runtime._log_file.close()
+            except Exception:
+                pass
+            finally:
+                adb_runtime._log_file = None
+                adb_runtime._log_to_file_enabled = False
 
     def force_exit(self):
         self.is_forcing_exit = True
-        self.tray_icon.hide()
+        tray = getattr(self, "tray_icon", None)
+        if tray is not None:
+            tray.hide()
         self.cleanup_before_exit()
         QApplication.quit()
 
@@ -656,14 +703,16 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
             return
         self._preset_notice_shown_this_session = True
         dialog = PresetEditMergedNoticeDialog(self)
-        accepted = dialog.exec()
-        never_show = dialog.never_show_checked()
-        dialog.deleteLater()
+        try:
+            accepted = dialog.exec()
+            never_show = dialog.never_show_checked()
+        finally:
+            dialog.deleteLater()
         if accepted and never_show:
             update_settings({"never_show_preset_edit_merged_notice": True})
 
     def closeEvent(self, event):
-        if getattr(self, "is_forcing_exit", False):
+        if getattr(self, "is_forcing_exit", False) or getattr(self, "_cleanup_done", False):
             self.cleanup_before_exit()
             event.accept()
             return
@@ -681,11 +730,17 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
                 QApplication.quit()
         else:
             dialog = CloseConfirmDialog(self)
-            if dialog.exec():
-                choice = dialog.choice
-                remember = dialog.chk_remember.isChecked()
+            try:
+                accepted = dialog.exec()
+                choice = dialog.choice if accepted else None
+                remember = dialog.chk_remember.isChecked() if accepted else False
+            finally:
                 dialog.deleteLater()
-                
+            if getattr(self, "is_forcing_exit", False) or getattr(self, "_cleanup_done", False):
+                self.cleanup_before_exit()
+                event.accept()
+                return
+            if accepted:
                 update_settings({
                     "close_behavior": choice,
                     "never_ask_close": remember,
@@ -706,7 +761,6 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
                     event.accept()
                     QApplication.quit()
             else:
-                dialog.deleteLater()
                 event.ignore()
 
     def is_verbose_log_enabled(self):
@@ -732,35 +786,40 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
         )
 
     def _toggle_log_file(self, state):
-        adb_runtime._log_to_file_enabled = (state == 2)
-        if adb_runtime._log_to_file_enabled and not adb_runtime._log_file:
-            try:
-                os.makedirs(os.path.dirname(adb_runtime._log_path), exist_ok=True)
-                adb_runtime._log_file = open(adb_runtime._log_path, "a", encoding="utf-8")
-                adb_runtime._log_file.write(f"{'='*60}\n")
-                adb_runtime._log_file.write(f"红米 G Pro 27U Toolbox 日志 - {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                adb_runtime._log_file.write(f"{'='*60}\n")
-                adb_runtime._log_file.flush()
-            except OSError as e:
-                # 目录不可写（如安装到 Program Files）等情况：回退开关，不让异常冒泡到 Qt 槽
-                adb_runtime._log_to_file_enabled = False
-                adb_runtime._log_file = None
-                self.log_file_toggle.blockSignals(True)
-                self.log_file_toggle.setChecked(False)
-                self.log_file_toggle.blockSignals(False)
-                self.log(f"无法创建日志文件（目录不可写: {os.path.dirname(adb_runtime._log_path)}）: {e}")
-                return
+        enabled = (state == 2)
+        with _log_file_lock:
+            adb_runtime._log_to_file_enabled = enabled
+            if adb_runtime._log_to_file_enabled and not adb_runtime._log_file:
+                try:
+                    os.makedirs(os.path.dirname(adb_runtime._log_path), exist_ok=True)
+                    adb_runtime._log_file = open(adb_runtime._log_path, "a", encoding="utf-8")
+                    adb_runtime._log_file.write(f"{'='*60}\n")
+                    adb_runtime._log_file.write(f"红米 G Pro 27U Toolbox 日志 - {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    adb_runtime._log_file.write(f"{'='*60}\n")
+                    adb_runtime._log_file.flush()
+                except OSError as e:
+                    # 目录不可写（如安装到 Program Files）等情况：回退开关，不让异常冒泡到 Qt 槽
+                    adb_runtime._log_to_file_enabled = False
+                    adb_runtime._log_file = None
+                    self.log_file_toggle.blockSignals(True)
+                    self.log_file_toggle.setChecked(False)
+                    self.log_file_toggle.blockSignals(False)
+                    self.log(f"无法创建日志文件（目录不可写: {os.path.dirname(adb_runtime._log_path)}）: {e}")
+                    return
         self.log(f"本地日志记录: {'开启' if adb_runtime._log_to_file_enabled else '关闭'}")
 
     def _toggle_autostart(self, state):
         enabled = (state == 2)
-        update_settings({"autostart": enabled})
-        if enabled:
-            self._install_autostart()
-            self.log("已设置开机自启动")
-        else:
-            self._remove_autostart()
-            self.log("已取消开机自启动")
+        ok = self._install_autostart() if enabled else self._remove_autostart()
+        if ok:
+            update_settings({"autostart": enabled})
+            self.log("已设置开机自启动" if enabled else "已取消开机自启动")
+            return
+        chk = getattr(self, "chk_autostart", None)
+        if chk is not None:
+            chk.blockSignals(True)
+            chk.setChecked(not enabled)
+            chk.blockSignals(False)
 
     def _get_autostart_path(self):
         return get_autostart_path()
@@ -769,12 +828,16 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
         return get_executable_path()
 
     def _install_autostart(self):
-        if not install_autostart(self._get_exe_path()):
+        ok = bool(install_autostart(self._get_exe_path()))
+        if not ok:
             self.log("设置自启动失败")
+        return ok
 
     def _remove_autostart(self):
-        if not remove_autostart():
+        ok = bool(remove_autostart())
+        if not ok:
             self.log("取消自启动失败")
+        return ok
 
     def _toggle_4k_ui(self, state):
         enable = (state == 2)
@@ -785,8 +848,12 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
             f"{action} 4K UI 需要重启显示器才能生效。\n\n点击确定后将{target}，并重启显示器。\n\n是否继续？",
             self,
         )
-        accepted = w.exec()
-        w.deleteLater()
+        try:
+            accepted = w.exec()
+        finally:
+            w.deleteLater()
+        if getattr(self, "_cleanup_done", False):
+            return
         if not accepted:
             self.chk_4k.blockSignals(True)
             self.chk_4k.setChecked(not enable)
@@ -847,9 +914,17 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
             self, "导出日志", f"mitv_log_{time.strftime('%Y%m%d_%H%M%S')}.txt", "文本文件 (*.txt)")
         if path:
             try:
-                if adb_runtime._log_file: adb_runtime._log_file.flush()
-                import shutil
-                shutil.copy2(adb_runtime._log_path, path)
+                log_path = adb_runtime._log_path
+                if log_path and os.path.isfile(log_path):
+                    with _log_file_lock:
+                        if adb_runtime._log_file:
+                            adb_runtime._log_file.flush()
+                    import shutil
+                    shutil.copy2(log_path, path)
+                else:
+                    content = self.log_widget.toPlainText() if hasattr(self, "log_widget") else ""
+                    with open(path, "w", encoding="utf-8") as stream:
+                        stream.write(content)
                 self.log(f"日志已导出: {path}")
             except Exception as e:
                 self.log(f"导出失败: {e}")
@@ -881,6 +956,57 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
         if mute_btn is not None:
             mute_btn.setEnabled(connected)
 
+    def _reset_disconnected_ui_state(self):
+        """断连时清理残留设备状态、防抖定时器和控件显示，避免旧值误导。"""
+        for timer in getattr(self, "_slider_debounce_timers", {}).values():
+            timer.stop()
+        current_vals = getattr(self, "current_vals", None)
+        if isinstance(current_vals, dict):
+            current_vals.clear()
+        for group in getattr(self, "state_buttons", {}).values():
+            for btn in group.values():
+                blocked = btn.blockSignals(True)
+                try:
+                    btn.setChecked(False)
+                finally:
+                    btn.blockSignals(blocked)
+        mute_btn = getattr(self, "sound_mute_btn", None)
+        if mute_btn is not None:
+            blocked = mute_btn.blockSignals(True)
+            try:
+                mute_btn.setChecked(False)
+            finally:
+                mute_btn.blockSignals(blocked)
+        for _slider, label in getattr(self, "sliders", {}).values():
+            if label is not None:
+                label.setText("--")
+        for label_attr, fallback_text in (
+            ("source_label", "未知"),
+            ("sound_output_label", "未知"),
+            ("picture_mode_hint_label", "当前场景：未连接"),
+        ):
+            label = getattr(self, label_attr, None)
+            if label is not None:
+                label.setText(fallback_text)
+        for card in getattr(self, "color_gain_cards", ()):
+            card.setVisible(False)
+        hdr_tone_card = getattr(self, "hdr_tone_mapping_card", None)
+        if hdr_tone_card is not None:
+            hdr_tone_card.setVisible(False)
+        chk_4k = getattr(self, "chk_4k", None)
+        if chk_4k is not None:
+            blocked = chk_4k.blockSignals(True)
+            try:
+                chk_4k.setChecked(False)
+            finally:
+                chk_4k.blockSignals(blocked)
+        update_game_hint = getattr(self, "_update_game_mode_hint", None)
+        if callable(update_game_hint):
+            update_game_hint()
+        banner = getattr(self, "_preset_banner", None)
+        if banner is not None:
+            banner.hide()
+
     def _on_status(self, text):
         text = normalize_status_text(text)
         adb_obj = getattr(self, "adb", None)
@@ -907,8 +1033,14 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
                 self._hdr_last_state = None
                 self._hdr_state_source = None
                 self._update_hdr_memory_status_label("等待显示器连接")
+                reset_ui = getattr(self, "_reset_disconnected_ui_state", None)
+                if callable(reset_ui):
+                    reset_ui()
             elif not was_connected and self.adb_connected:
                 self._page_loaded.clear()
+                self._hdr_last_state = None
+                if hasattr(self, "_update_preset_banner"):
+                    self._update_preset_banner()
                 # 触发当前页面加载
                 page = self.stackedWidget.currentWidget()
                 if page:
@@ -944,10 +1076,12 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
 
     def _show_message_box(self, mtype, title, text):
         w = MessageBox(title, text, self)
-        w.yesButton.setText("知道了")
-        w.cancelButton.hide()
-        w.exec()
-        w.deleteLater()
+        try:
+            w.yesButton.setText("知道了")
+            w.cancelButton.hide()
+            w.exec()
+        finally:
+            w.deleteLater()
 
     def _prompt_guardian_migration(self):
         """检测到旧包名时提示升级。
@@ -970,13 +1104,16 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
                 "升级过程会重启显示器的 ADB 连接，约 10 秒。",
                 self,
             )
-            box.yesButton.setText("立即升级")
-            box.cancelButton.hide()
-            box.exec()
-            box.deleteLater()
+            try:
+                box.yesButton.setText("立即升级")
+                box.cancelButton.hide()
+                box.exec()
+            finally:
+                box.deleteLater()
         finally:
             self._guardian_migration_dialog_open = False
-        self._migrate_guardian()
+        if not getattr(self, "_cleanup_done", False):
+            self._migrate_guardian()
 
 
     def log(self, m):

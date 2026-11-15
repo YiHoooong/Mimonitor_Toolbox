@@ -599,7 +599,10 @@ class TrayRowDelegate(QStyledItemDelegate):
         text_rect = QRect(text_left, rect.top(), max(0, up_rect.left() - text_left - self.TEXT_RIGHT_GAP), rect.height())
         # 与 BodyLabel 同字号：列表默认字体比页面其它文字小一号
         painter.setFont(getFont(self.TEXT_FONT_SIZE))
-        painter.setPen(QColor(255, 255, 255) if option.state & QStyle.StateFlag.State_Enabled else QColor(255, 255, 255, 120))
+        text_color = QColor(255, 255, 255) if isDarkTheme() else QColor(0, 0, 0)
+        if not (option.state & QStyle.StateFlag.State_Enabled):
+            text_color.setAlpha(120)
+        painter.setPen(text_color)
         painter.drawText(
             text_rect,
             int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
@@ -1037,6 +1040,15 @@ class OsdHud(QWidget):
         self.anim.finished.connect(self.hide)
         self.anim.start()
 
+    def shutdown(self):
+        """退出前停掉计时器和动画并销毁悬浮窗，避免残留顶层窗口。"""
+        self.timer.stop()
+        self.anim.stop()
+        self.countdown_bar.stop()
+        self.hide()
+        self.close()
+        self.deleteLater()
+
 
 class CloseConfirmDialog(QDialog):
     def __init__(self, parent=None):
@@ -1062,12 +1074,17 @@ class CloseConfirmDialog(QDialog):
         
         self.bg_frame = QFrame(self)
         self.bg_frame.setObjectName("BgFrame")
-        self.bg_frame.setStyleSheet("""
-            #BgFrame {
-                background-color: #2b2b2b;
-                border: 1px solid rgba(255, 255, 255, 0.1);
+        bg_css, border_css = (
+            ("#2b2b2b", "rgba(255, 255, 255, 0.1)")
+            if isDarkTheme()
+            else ("#f9f9f9", "rgba(0, 0, 0, 0.1)")
+        )
+        self.bg_frame.setStyleSheet(f"""
+            #BgFrame {{
+                background-color: {bg_css};
+                border: 1px solid {border_css};
                 border-radius: 12px;
-            }
+            }}
         """)
         top_layout.addWidget(self.bg_frame)
         
@@ -1172,12 +1189,17 @@ class InstallProgressDialog(QDialog):
 
         frame = QFrame(self)
         frame.setObjectName("InstallProgressFrame")
-        frame.setStyleSheet("""
-            #InstallProgressFrame {
-                background-color: #2b2b2b;
-                border: 1px solid rgba(255, 255, 255, 0.12);
+        bg_css, border_css = (
+            ("#2b2b2b", "rgba(255, 255, 255, 0.12)")
+            if isDarkTheme()
+            else ("#f9f9f9", "rgba(0, 0, 0, 0.1)")
+        )
+        frame.setStyleSheet(f"""
+            #InstallProgressFrame {{
+                background-color: {bg_css};
+                border: 1px solid {border_css};
                 border-radius: 12px;
-            }
+            }}
         """)
         top_layout.addWidget(frame)
 
@@ -1384,6 +1406,7 @@ class CurrentPresetBanner(QFrame):
     def eventFilter(self, obj, event):
         if obj is self.parentWidget() and event.type() == QEvent.Type.Resize:
             self._reposition()
+            self._sync_z_order()
         return False
 
     def _reposition(self):
@@ -1394,10 +1417,18 @@ class CurrentPresetBanner(QFrame):
         self.setGeometry((parent.width() - width) // 2, self.TOP_OFFSET,
                          width, self.height())
 
+    def _sync_z_order(self):
+        parent = self.parentWidget()
+        overlay = getattr(parent, "_preset_overlay", None) if parent is not None else None
+        if overlay is not None and overlay.isVisible():
+            self.stackUnder(overlay)
+        else:
+            self.raise_()
+
     def show_banner(self):
         self._reposition()
         self.show()
-        self.raise_()
+        self._sync_z_order()
 
 
 class FlowContainer(QWidget):
@@ -1717,6 +1748,7 @@ class AutoTaskCard(SimpleCardWidget):
         buttons.addWidget(self.options_button)
         row.addLayout(buttons)
 
+        self._picking_time = False
         self.set_editing(False)
 
     def is_editing(self):
@@ -1748,9 +1780,13 @@ class AutoTaskCard(SimpleCardWidget):
             return
         button = self.start_button if which == "start" else self.end_button
         current = self._start if which == "start" else self._end
-        chosen = pick_time(button, current,
-                           on_change=lambda value: self.set_time(which, value))
-        self.set_time(which, chosen)
+        self._picking_time = True
+        try:
+            chosen = pick_time(button, current,
+                               on_change=lambda value: self.set_time(which, value))
+            self.set_time(which, chosen)
+        finally:
+            self._picking_time = False
 
     def values(self):
         return {

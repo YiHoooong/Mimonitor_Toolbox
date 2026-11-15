@@ -11,6 +11,7 @@ hdr_tone_mapping / check_and_heal_jar 即可），所以可以用假的 adb 直�
 """
 
 from contextlib import nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 
 from .core import (
@@ -109,6 +110,35 @@ def _as_int(values, key):
 
 from . import core
 
+_PRESET_APPLY_CTX: ContextVar[dict | None] = ContextVar("_PRESET_APPLY_CTX", default=None)
+
+
+def _get_hdmi_source(adb):
+    ctx = _PRESET_APPLY_CTX.get()
+    if ctx is not None and "source" in ctx:
+        return ctx["source"]
+    source = adb.get("mitv.tvplayer.hdmi.last.source", check=True)
+    if ctx is not None:
+        ctx["source"] = source
+    return source
+
+
+def _get_hdmi_edid_and_freesync(adb):
+    ctx = _PRESET_APPLY_CTX.get()
+    if ctx is not None and "edid_raw" in ctx and "fs_raw" in ctx:
+        return ctx["edid_raw"], ctx["fs_raw"]
+    edid_raw, fs_raw = read_hdmi_edid_and_freesync(adb, check=True)
+    if ctx is not None:
+        ctx["edid_raw"] = edid_raw
+        ctx["fs_raw"] = fs_raw
+    return edid_raw, fs_raw
+
+
+def _set_hdmi_ctx(key, value):
+    ctx = _PRESET_APPLY_CTX.get()
+    if ctx is not None:
+        ctx[key] = str(value)
+
 
 def _apply_freesync(adb, values):
     """FreeSync 与画面模式是绑在一起的：开着它，设备会被锁在游戏模式。
@@ -119,11 +149,13 @@ def _apply_freesync(adb, values):
     否则保留当前 320Hz 状态。
     """
     wanted = _as_int(values, "freesync") == 1
-    source = adb.get("mitv.tvplayer.hdmi.last.source", check=True)
+    source = _get_hdmi_source(adb)
     key = freesync_jni_key(source)
+    fs_target = freesync_on_value(key) if wanted else 0
     if key == "g_video__freesync_switch":
-        edid_raw, _ = read_hdmi_edid_and_freesync(adb, check=True)
-        adb.jni_set(key, freesync_on_value(key) if wanted else 0, check=True)
+        edid_raw, _ = _get_hdmi_edid_and_freesync(adb)
+        adb.jni_set(key, fs_target, check=True)
+        _set_hdmi_ctx("fs_raw", fs_target)
         if edid_raw is not None:
             is_320 = parse_hdmi_edid_flags(edid_raw)[0] == 1
             if _has_mode_320(values)[0]:
@@ -133,13 +165,16 @@ def _apply_freesync(adb, values):
                     mode_320_raw = None
                 if mode_320_raw in {0, 1}:
                     is_320 = mode_320_raw == 1
+            edid_target = hdmi_edid_for(is_320, wanted)
             adb.jni_set(
                 "g_fusion_picture__hdmi_edid_version",
-                hdmi_edid_for(is_320, wanted),
+                edid_target,
                 check=True,
             )
+            _set_hdmi_ctx("edid_raw", edid_target)
     else:
-        adb.jni_set(key, freesync_on_value(key) if wanted else 0, check=True)
+        adb.jni_set(key, fs_target, check=True)
+        _set_hdmi_ctx("fs_raw", fs_target)
     adb.refresh_pq(check=True)
 
 
@@ -149,21 +184,27 @@ def _apply_mode_320(adb, values):
     if raw not in {0, 1}:
         raise ValueError(f"320Hz 竞技模式 {raw} 超出 0-1")
     wanted = raw == 1
-    source = adb.get("mitv.tvplayer.hdmi.last.source", check=True)
+    source = _get_hdmi_source(adb)
     if freesync_jni_key(source) == "g_video__freesync_switch":
-        edid_raw, fs_raw = read_hdmi_edid_and_freesync(adb, check=True)
+        edid_raw, fs_raw = _get_hdmi_edid_and_freesync(adb)
         has_fs = _has_freesync(values)[0]
         if has_fs:
             fs_on = _as_int(values, "freesync") == 1
         else:
+            if core.parse_hdmi_edid_int(edid_raw) is None and core.parse_hdmi_edid_int(fs_raw) is None:
+                raise ValueError("无法读取当前 HDMI FreeSync 状态，拒绝切换 320Hz 以免误改 FreeSync")
             fs_on = parse_hdmi_edid_flags(edid_raw, fs_raw)[1] == 1
         if has_fs and edid_raw is not None:
             cur_320, cur_fs = parse_hdmi_edid_flags(edid_raw, fs_raw)
             if cur_320 == raw and (cur_fs == 1) == fs_on:
                 return
-        if has_fs or (fs_raw is not None and core.parse_hdmi_edid_int(fs_raw) != (3 if fs_on else 0)):
-            adb.jni_set("g_video__freesync_switch", 3 if fs_on else 0, check=True)
-        adb.jni_set("g_fusion_picture__hdmi_edid_version", hdmi_edid_for(wanted, fs_on), check=True)
+        fs_target = 3 if fs_on else 0
+        if has_fs or (fs_raw is not None and core.parse_hdmi_edid_int(fs_raw) != fs_target):
+            adb.jni_set("g_video__freesync_switch", fs_target, check=True)
+            _set_hdmi_ctx("fs_raw", fs_target)
+        edid_target = hdmi_edid_for(wanted, fs_on)
+        adb.jni_set("g_fusion_picture__hdmi_edid_version", edid_target, check=True)
+        _set_hdmi_ctx("edid_raw", edid_target)
     else:
         adb.jni_set("g_fusion_picture__dp_edid_version", 3 if wanted else 2, check=True)
     adb.refresh_pq(check=True)
@@ -310,6 +351,26 @@ def _setting_with_pq(key, label, valid_values):
     return apply
 
 
+def _resolve_effective_picture_mode(values):
+    """解析用于游戏辅助条件判断的有效画面模式。
+
+    当预设会写入 `picture_mode` 时直接用预设值；当 `picture` 大项未启用或预设未包含
+    `picture_mode` 时，向设备查询当前实时 `picture_mode` 并缓存到本次应用上下文。
+    """
+    ctx = _PRESET_APPLY_CTX.get()
+    picture_enabled = True if ctx is None else ctx.get("picture_enabled", True)
+    if picture_enabled and "picture_mode" in values:
+        return values.get("picture_mode")
+    if ctx is not None and "adb" in ctx:
+        if "live_picture_mode" not in ctx:
+            try:
+                ctx["live_picture_mode"] = ctx["adb"].get("picture_mode", check=False)
+            except Exception:
+                ctx["live_picture_mode"] = None
+        return ctx["live_picture_mode"]
+    return None
+
+
 def _game_feature_condition(key, label, valid_values, dep_key=None, dep_label=None):
     """游戏覆盖层项条件：归零总是下发；非零仅在游戏画面模式（且前置项开启）时下发。"""
     has_key = _has_optional_setting(key, label)
@@ -325,10 +386,10 @@ def _game_feature_condition(key, label, valid_values, dep_key=None, dep_label=No
             return True, ""
         if val not in allowed or val == 0:
             return True, ""
-        raw_mode = values.get("picture_mode")
+        raw_mode = _resolve_effective_picture_mode(values)
         if raw_mode is not None:
             try:
-                mode = int(raw_mode)
+                mode = int(str(raw_mode).strip())
             except (TypeError, ValueError):
                 mode = None
             if mode is not None and not core.is_game_picture_mode(mode):
@@ -362,7 +423,9 @@ def _apply_media_muted(adb, values):
 def _apply_screen_light(adb, values):
     def _field(key):
         raw = values.get(key)
-        return core.SCREEN_LIGHT_DEFAULTS[key] if raw is None else int(raw)
+        if raw is None or (isinstance(raw, str) and raw.strip().lower() in ("", "null", "none", "n/a")):
+            return core.SCREEN_LIGHT_DEFAULTS[key]
+        return int(raw)
 
     core.write_screen_light_values(
         adb,
@@ -396,11 +459,13 @@ class PictureItem:
     - `label`：失败/跳过时汇报给人看的名字
     - `apply`：真正下发；抛异常即视为该项失败
     - `condition`：返回 False 表示本次应用跳过该项（返回 (bool, 原因)）
+    - `group`：所属预设大项（对应 `PRESET_OPTION_GROUPS` 中的 id）
     """
     id: str
     label: str
     apply: object
     condition: object = None
+    group: str = "picture"
 
 
 def _needs_custom_color_temp(values):
@@ -420,8 +485,8 @@ def _needs_hdr_mode(values):
 # 顺序即写入顺序。**FreeSync 第一、画面模式第二**，理由见模块文档字符串。
 PICTURE_ITEMS = (
     # FreeSync 与 320Hz 排在画面模式之前：它们切 EDID/同步时会牵动模式锁定，必须先到位
-    PictureItem("freesync", "FreeSync", _apply_freesync, _has_freesync),
-    PictureItem("mode_320", "320Hz 竞技模式", _apply_mode_320, _has_mode_320),
+    PictureItem("freesync", "FreeSync", _apply_freesync, _has_freesync, group="display_sync"),
+    PictureItem("mode_320", "320Hz 竞技模式", _apply_mode_320, _has_mode_320, group="display_sync"),
     PictureItem("picture_mode", "画面模式", _apply_picture_mode),
     PictureItem("light_sensor", "自动调整亮度", _apply_light_sensor),
     PictureItem("backlight", "背光", _apply_backlight),
@@ -453,12 +518,13 @@ PICTURE_ITEMS = (
                      "tv_picture_advanced_video_color_space",
                      "tv_picture_video_color_space"),
     ),
-    PictureItem("sound_output", "声音输出", _apply_sound_output, _has_sound_output),
+    PictureItem("sound_output", "声音输出", _apply_sound_output, _has_sound_output, group="audio"),
     PictureItem(
         "front_sight_index",
         "准星",
         _setting_with_pq("front_sight_index", "准星", (0, 1, 2, 3, 4, 5)),
         _game_feature_condition("front_sight_index", "准星", (0, 1, 2, 3, 4, 5)),
+        group="game_tools",
     ),
     PictureItem(
         "mt_game_dynamic_ft",
@@ -471,12 +537,14 @@ PICTURE_ITEMS = (
             dep_key="front_sight_index",
             dep_label="准星",
         ),
+        group="game_tools",
     ),
     PictureItem(
         "mt_game_scope",
         "狙击镜",
         _setting_with_pq("mt_game_scope", "狙击镜", (0, 1, 3, 5, 7, 10)),
         _game_feature_condition("mt_game_scope", "狙击镜", (0, 1, 3, 5, 7, 10)),
+        group="game_tools",
     ),
     PictureItem(
         "mt_game_scope_night",
@@ -489,29 +557,33 @@ PICTURE_ITEMS = (
             dep_key="mt_game_scope",
             dep_label="狙击镜",
         ),
+        group="game_tools",
     ),
     PictureItem(
         "monitor_menu_fps_counter",
         "FPS 计数器",
         _setting_with_pq("monitor_menu_fps_counter", "FPS 计数器", (0, 1, 2)),
         _has_optional_setting("monitor_menu_fps_counter", "FPS 计数器"),
+        group="game_tools",
     ),
     PictureItem(
         "monitor_menu_stopwatch",
         "秒表",
         _setting_with_pq("monitor_menu_stopwatch", "秒表", (0, 1)),
         _has_optional_setting("monitor_menu_stopwatch", "秒表"),
+        group="game_tools",
     ),
     PictureItem(
         "monitor_menu_timer",
         "定时器",
         _setting_with_pq("monitor_menu_timer", "定时器", (0, 60, 300, 1800, 3600)),
         _has_optional_setting("monitor_menu_timer", "定时器"),
+        group="game_tools",
     ),
     # 音量排在静音前：即使内部实现清静音状态，随后的静音目标仍会生效。
-    PictureItem("volume_music_speaker", "音量", _apply_media_volume, _has_media_volume),
-    PictureItem("media_muted", "静音", _apply_media_muted, _has_media_muted),
-    PictureItem("screen_light", "屏幕灯", _apply_screen_light, _has_screen_light),
+    PictureItem("volume_music_speaker", "音量", _apply_media_volume, _has_media_volume, group="audio"),
+    PictureItem("media_muted", "静音", _apply_media_muted, _has_media_muted, group="audio"),
+    PictureItem("screen_light", "屏幕灯", _apply_screen_light, _has_screen_light, group="screen_light"),
 )
 
 
@@ -527,21 +599,7 @@ PRESET_OPTION_GROUPS = (
 
 _PRESET_GROUP_LABELS = {group_id: label for group_id, label, _ in PRESET_OPTION_GROUPS}
 
-_ITEM_OPTION_GROUP = {
-    "freesync": "display_sync",
-    "mode_320": "display_sync",
-    "front_sight_index": "game_tools",
-    "mt_game_dynamic_ft": "game_tools",
-    "mt_game_scope": "game_tools",
-    "mt_game_scope_night": "game_tools",
-    "monitor_menu_fps_counter": "game_tools",
-    "monitor_menu_stopwatch": "game_tools",
-    "monitor_menu_timer": "game_tools",
-    "screen_light": "screen_light",
-    "sound_output": "audio",
-    "volume_music_speaker": "audio",
-    "media_muted": "audio",
-}
+_ITEM_OPTION_GROUP = {item.id: item.group for item in PICTURE_ITEMS if item.group != "picture"}
 
 _KEY_OPTION_GROUP = {
     "freesync": "display_sync",
@@ -635,37 +693,47 @@ def apply_preset(adb, values, on_item=None, options=None):
         if is_daemon and callable(getattr(adb, "batch_writes", None))
         else nullcontext()
     )
-    with batch_ctx:
-        for item in PICTURE_ITEMS:
-            if opts is not None:
-                group_id = item_option_group(item.id)
-                if not opts.get(group_id, True):
-                    reason = f"该预设未启用「{_PRESET_GROUP_LABELS.get(group_id, group_id)}」"
-                    result.skipped.append((item.label, reason))
-                    if on_item:
-                        on_item(item, "skipped", reason)
-                    continue
-            if item.condition is not None:
+    token = _PRESET_APPLY_CTX.set({
+        "adb": adb,
+        "picture_enabled": opts.get("picture", True) if opts is not None else True,
+    })
+    try:
+        with batch_ctx:
+            for item in PICTURE_ITEMS:
+                if opts is not None:
+                    group_id = item_option_group(item.id)
+                    if not opts.get(group_id, True):
+                        reason = f"该预设未启用「{_PRESET_GROUP_LABELS.get(group_id, group_id)}」"
+                        result.skipped.append((item.label, reason))
+                        if on_item:
+                            on_item(item, "skipped", reason)
+                        continue
+                if item.condition is not None:
+                    try:
+                        should_apply, reason = item.condition(values)
+                    except Exception as exc:
+                        reason = f"条件判断失败：{exc}"
+                        result.skipped.append((item.label, reason))
+                        if on_item:
+                            on_item(item, "skipped", reason)
+                        continue
+                    if not should_apply:
+                        result.skipped.append((item.label, reason))
+                        if on_item:
+                            on_item(item, "skipped", reason)
+                        continue
                 try:
-                    should_apply, reason = item.condition(values)
+                    item.apply(adb, values)
                 except Exception as exc:
-                    result.skipped.append((item.label, f"条件判断失败：{exc}"))
-                    continue
-                if not should_apply:
-                    result.skipped.append((item.label, reason))
+                    result.failed.append((item.label, str(exc)))
                     if on_item:
-                        on_item(item, "skipped", reason)
+                        on_item(item, "failed", str(exc))
                     continue
-            try:
-                item.apply(adb, values)
-            except Exception as exc:
-                result.failed.append((item.label, str(exc)))
+                result.applied.append(item.label)
                 if on_item:
-                    on_item(item, "failed", str(exc))
-                continue
-            result.applied.append(item.label)
-            if on_item:
-                on_item(item, "applied", "")
+                    on_item(item, "applied", "")
+    finally:
+        _PRESET_APPLY_CTX.reset(token)
     return result
 
 
