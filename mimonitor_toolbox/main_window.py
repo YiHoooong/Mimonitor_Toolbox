@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 
+from PyQt6 import sip
 from PyQt6.QtCore import QRect, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QCursor, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
@@ -22,6 +23,7 @@ from qfluentwidgets import (
     MenuAnimationType,
     MenuIndicatorType,
     MessageBox,
+    qconfig,
 )
 
 from . import adb as adb_runtime
@@ -56,6 +58,7 @@ from .widgets import (
     TrayMenu,
     TrayOptionMenu,
     TraySliderCard,
+    sync_system_theme,
 )
 from .windows import (
     MOD_ALT,
@@ -77,6 +80,22 @@ from .windows import (
 
 
 _log_file_lock = threading.RLock()
+
+
+def _safe_delete_later(widget):
+    """在 Qt C++ 对象仍存活（或测试替身）时安全排程 deleteLater。"""
+    if not isinstance(widget, sip.simplewrapper) or not sip.isdeleted(widget):
+        widget.deleteLater()
+
+
+def _is_immersive_color_set_lparam(lparam):
+    """判断 WM_SETTINGCHANGE 的 lParam 是否指向 ImmersiveColorSet。"""
+    if not lparam:
+        return False
+    try:
+        return ctypes.wstring_at(lparam) == "ImmersiveColorSet"
+    except Exception:
+        return False
 
 
 def _write_log_line(app_obj, text, ui_visible=True):
@@ -203,6 +222,12 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
         QTimer.singleShot(0, self._update_hdr_memory_status_label)
         QTimer.singleShot(0, self._update_freesync_memory_status_label)
         QTimer.singleShot(900, self._auto_connect_on_startup)
+        qconfig.themeChangedFinished.connect(self._refresh_theme_sensitive_widgets)
+        app_inst = QApplication.instance()
+        style_hints = app_inst.styleHints() if app_inst is not None and hasattr(app_inst, "styleHints") else None
+        if style_hints is not None and hasattr(style_hints, "colorSchemeChanged"):
+            style_hints.colorSchemeChanged.connect(self._on_system_theme_event)
+        self._style_hints_ref = style_hints
         QApplication.instance().aboutToQuit.connect(self.cleanup_before_exit)
 
     def setup_tray(self):
@@ -402,6 +427,7 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
     def _restore_main_window(self):
         if getattr(self, "_cleanup_done", False) or getattr(self, "is_forcing_exit", False):
             return
+        self._on_system_theme_event()
         state = self.windowState()
         self.setWindowState((state & ~Qt.WindowState.WindowMinimized) | Qt.WindowState.WindowActive)
         self.showNormal()
@@ -553,7 +579,32 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
                     self._schedule_display_change_refresh("WM_DISPLAYCHANGE", delay_ms=900)
             elif msg.message == WM_SETTINGCHANGE:
                 self._schedule_hdr_memory_check("windows_event", delay_ms=600)
+                if not msg.lParam or _is_immersive_color_set_lparam(msg.lParam):
+                    self._on_system_theme_event()
         return super().nativeEvent(eventType, message)
+
+    def _on_system_theme_event(self, *_args):
+        """跟随系统时同步 Windows 深浅色；未触发主题切换时重申 Mica 避免反色。"""
+        if getattr(self, "_cleanup_done", False) or sip.isdeleted(self):
+            return
+        if not sync_system_theme():
+            if hasattr(self, "isMicaEffectEnabled") and self.isMicaEffectEnabled():
+                self._onThemeChangedFinished()
+            self.update()
+
+    def _refresh_theme_sensitive_widgets(self):
+        """主题切换完成后刷新自定义颜色的提示控件与框架区重绘。"""
+        if getattr(self, "_cleanup_done", False) or sip.isdeleted(self):
+            return
+        if hasattr(self, "_update_game_mode_hint"):
+            self._update_game_mode_hint()
+        if hasattr(self, "_last_picture_mode_hint_value"):
+            self._update_picture_mode_hint(self._last_picture_mode_hint_value)
+        if hasattr(self, "navigationInterface"):
+            self.navigationInterface.update()
+        if hasattr(self, "titleBar"):
+            self.titleBar.update()
+        self.update()
 
 
 
@@ -606,6 +657,16 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
         if getattr(self, "_cleanup_done", False):
             return
         self._cleanup_done = True
+        try:
+            qconfig.themeChangedFinished.disconnect(self._refresh_theme_sensitive_widgets)
+        except Exception:
+            pass
+        try:
+            style_hints = getattr(self, "_style_hints_ref", None)
+            if style_hints is not None and hasattr(style_hints, "colorSchemeChanged"):
+                style_hints.colorSchemeChanged.disconnect(self._on_system_theme_event)
+        except Exception:
+            pass
         set_async_error_handler(None)
         self._invalidate_connection_intent()
         self._cancel_resume_reconnect()
@@ -851,7 +912,7 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
         try:
             accepted = w.exec()
         finally:
-            w.deleteLater()
+            _safe_delete_later(w)
         if getattr(self, "_cleanup_done", False):
             return
         if not accepted:
@@ -1081,7 +1142,7 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
             w.cancelButton.hide()
             w.exec()
         finally:
-            w.deleteLater()
+            _safe_delete_later(w)
 
     def _prompt_guardian_migration(self):
         """检测到旧包名时提示升级。

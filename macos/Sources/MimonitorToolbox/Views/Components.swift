@@ -205,6 +205,7 @@ struct SegmentedOptionPicker: NSViewRepresentable {
 struct FastSlider: View {
     @Binding var value: Double
     let range: ClosedRange<Double>
+    var trackRange: ClosedRange<Double>? = nil
     let step: Double
     let onCommit: (Double) -> Void
 
@@ -215,8 +216,9 @@ struct FastSlider: View {
         GeometryReader { geo in
             let width = max(geo.size.width, 1)
             let height = geo.size.height
-            let span = range.upperBound - range.lowerBound
-            let ratio = span > 0 ? (value - range.lowerBound) / span : 0
+            let visualRange = trackRange ?? range
+            let span = visualRange.upperBound - visualRange.lowerBound
+            let ratio = span > 0 ? (value - visualRange.lowerBound) / span : 0
             let clamped = min(max(ratio, 0), 1)
             let knobX = clamped * (width - knobSize) + knobSize / 2
 
@@ -240,7 +242,7 @@ struct FastSlider: View {
                 DragGesture(minimumDistance: 0)
                     .onChanged { g in
                         let x = min(max(g.location.x, 0), width)
-                        var v = range.lowerBound + (x / width) * span
+                        var v = visualRange.lowerBound + (x / width) * span
                         if step > 0 { v = (v / step).rounded() * step }
                         let clampedV = min(max(v, range.lowerBound), range.upperBound)
                         if clampedV != value { value = clampedV }
@@ -257,6 +259,7 @@ struct FastSlider: View {
 struct SliderRow: View {
     let title: String
     let range: ClosedRange<Double>
+    let trackRange: ClosedRange<Double>?
     let externalValue: Int
     let onCommit: (Int) -> Void
 
@@ -264,19 +267,21 @@ struct SliderRow: View {
 
     init(title: String,
          range: ClosedRange<Double>,
+         trackRange: ClosedRange<Double>? = nil,
          externalValue: Int,
          onCommit: @escaping (Int) -> Void) {
         self.title = title
         self.range = range
+        self.trackRange = trackRange
         self.externalValue = externalValue
         self.onCommit = onCommit
-        self._value = State(initialValue: Double(externalValue))
+        self._value = State(initialValue: min(max(Double(externalValue), range.lowerBound), range.upperBound))
     }
 
     var body: some View {
         HStack(spacing: 12) {
             Text(title).frame(width: 96, alignment: .leading)
-            FastSlider(value: $value, range: range, step: 1) { v in
+            FastSlider(value: $value, range: range, trackRange: trackRange, step: 1) { v in
                 onCommit(Int(v))
             }
             Text("\(Int(value))")
@@ -293,7 +298,7 @@ struct SliderRow: View {
         .background(RoundedRectangle(cornerRadius: 12).fill(Theme.card))
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.stroke))
         .onChange(of: externalValue) { newValue in
-            value = Double(newValue)
+            value = min(max(Double(newValue), range.lowerBound), range.upperBound)
         }
     }
 }

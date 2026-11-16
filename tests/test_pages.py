@@ -7,7 +7,7 @@ import _isolation  # noqa: F401  配置隔离：见 tests/_isolation.py
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtCore import QPoint, QSize, QTime, Qt
+from PyQt6.QtCore import QEvent, QPoint, QSize, QTime, Qt
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QAbstractButton, QApplication, QLabel, QWidget
 from qfluentwidgets import PrimaryPushButton, PushButton, TransparentToolButton
@@ -59,12 +59,15 @@ class TrayTestBase(unittest.TestCase):
         # 之前还会响 —— 实测会漏进 test_runtime 的进程计数里（那边统计整个窗口期
         # 内的所有 Popen 调用，多出几次就断言失败）。
         for name in ("adb_keepalive_timer", "adb_server_monitor_timer", "hdr_memory_timer",
-                     "_auto_task_timer"):
+                     "_auto_task_timer", "_preset_sync_timer"):
             timer = getattr(window, name, None)
             if timer is not None:
                 timer.stop()
+        for timer in getattr(window, "_slider_debounce_timers", {}).values():
+            timer.stop()
         window.hide()
         window.deleteLater()
+        _qt_application.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         _qt_application.processEvents()
 
     def _settings_patches(self, settings):
@@ -299,12 +302,15 @@ class CountdownSettingsUiTests(TrayTestBase):
             return
         window._cleanup_done = True
         for name in ("adb_keepalive_timer", "adb_server_monitor_timer", "hdr_memory_timer",
-                     "_auto_task_timer"):
+                     "_auto_task_timer", "_preset_sync_timer"):
             timer = getattr(window, name, None)
             if timer is not None:
                 timer.stop()
+        for timer in getattr(window, "_slider_debounce_timers", {}).values():
+            timer.stop()
         window.hide()
         window.deleteLater()
+        _qt_application.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         _qt_application.processEvents()
 
     def test_duration_slider_range_matches_macos(self):
@@ -1953,6 +1959,117 @@ class ConnectionModeUiTests(TrayTestBase):
                 # 托盘右键目录仍保留信号源子菜单
                 self.assertIn("input_source", window._cycle_action_catalog())
             finally:
+                self._close(window)
+
+    def test_picture_sliders_backlight_min_is_one_and_visually_aligned(self):
+        from mimonitor_toolbox import core
+
+        p1, p2 = self._settings_patches({})
+        with p1, p2:
+            window = self._app()
+            try:
+                backlight_slider, _ = window.sliders["backlight"]
+                self.assertEqual((backlight_slider.minimum(), backlight_slider.maximum()), (1, 100))
+                self.assertEqual(core.ADJUSTABLE_HOTKEY_PARAMS["backlight"]["min"], 1)
+                backlight_slider.setValue(0)
+                self.assertEqual(backlight_slider.value(), 1)
+                backlight_slider.resize(400, 22)
+                self.assertEqual(backlight_slider._posToValue(QPoint(0, 11)), 1)
+
+                # 视觉刻度 0..100：50 时背光手柄横向坐标与点击映射必须与 0..100 滑条一致
+                slider_keys = ("backlight", "black_level", "contrast", "saturation", "hue", "sharpness")
+                for key in slider_keys:
+                    s, _ = window.sliders[key]
+                    s.resize(400, 22)
+                    s.setValue(49)
+                    s.setValue(50)
+                    s._adjustHandlePos()
+                _qt_application.processEvents()
+
+                expected_x = window.sliders["black_level"][0].handle.x()
+                for key in slider_keys:
+                    self.assertEqual(window.sliders[key][0].handle.x(), expected_x, key)
+                self.assertEqual(
+                    backlight_slider._posToValue(QPoint(200, 11)),
+                    window.sliders["black_level"][0]._posToValue(QPoint(200, 11)),
+                )
+                from PyQt6.QtGui import QImage
+                image = QImage(400, 22, QImage.Format.Format_ARGB32)
+                backlight_slider.render(image)
+                self.assertFalse(image.isNull())
+            finally:
+                self._close(window)
+
+
+class ThemeSyncUiTests(TrayTestBase):
+    """跟随系统模式下 Windows 深浅色切换同步与自定义控件防反色错乱回归测试。"""
+
+    def setUp(self):
+        super().setUp()
+        # 前置用例在无主事件循环的 offscreen 进程里留下的 deleteLater 需先出队，
+        # 避免全局刷新样式表遍历到数万个半回收控件触发 Windows 访问违例。
+        _qt_application.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        _qt_application.processEvents()
+
+    def test_auto_theme_tracks_system_dark_to_light_and_back(self):
+        from qfluentwidgets import Theme, isDarkTheme, qconfig
+        from mimonitor_toolbox import widgets
+
+        p1, p2 = self._settings_patches({"theme": "auto"})
+        with p1, p2:
+            window = self._app()
+            previous_mode = qconfig.themeMode.value
+            try:
+                with mock.patch("darkdetect.theme", return_value="Dark"):
+                    widgets.apply_theme_mode("auto")
+                self.assertEqual(qconfig.themeMode.value, Theme.AUTO)
+                self.assertTrue(isDarkTheme())
+                self.assertIn("#f0b85a", window.game_mode_hint_label.styleSheet())
+                self.assertIn("rgba(45, 45, 45", window._preset_banner.styleSheet())
+
+                # 系统从深色切到浅色：即使 themeMode 已经是 AUTO，也必须重刷主题与自定义控件
+                with mock.patch("darkdetect.theme", return_value="Light"):
+                    window._on_system_theme_event()
+                self.assertFalse(isDarkTheme())
+                self.assertIn("#b06c00", window.game_mode_hint_label.styleSheet())
+                self.assertIn("rgba(252, 252, 252", window._preset_banner.styleSheet())
+                self.assertIn("color: black", window.titleBar.styleSheet())
+
+                # 再切回深色
+                with mock.patch("darkdetect.theme", return_value="Dark"):
+                    window._on_system_theme_event()
+                self.assertTrue(isDarkTheme())
+                self.assertIn("#f0b85a", window.game_mode_hint_label.styleSheet())
+                self.assertIn("rgba(45, 45, 45", window._preset_banner.styleSheet())
+                self.assertIn("color: white", window.titleBar.styleSheet())
+            finally:
+                restore = "auto" if previous_mode == Theme.AUTO else ("light" if previous_mode == Theme.LIGHT else "dark")
+                widgets.apply_theme_mode(restore)
+                self._close(window)
+
+    def test_fixed_theme_ignores_system_flip_and_reasserts_mica(self):
+        from qfluentwidgets import Theme, isDarkTheme, qconfig
+        from mimonitor_toolbox import widgets
+
+        p1, p2 = self._settings_patches({"theme": "dark"})
+        with p1, p2:
+            window = self._app()
+            previous_mode = qconfig.themeMode.value
+            try:
+                widgets.apply_theme_mode("dark")
+                self.assertEqual(qconfig.themeMode.value, Theme.DARK)
+                self.assertTrue(isDarkTheme())
+
+                with mock.patch("darkdetect.theme", return_value="Light"), \
+                        mock.patch.object(window, "isMicaEffectEnabled", return_value=True), \
+                        mock.patch.object(window, "_onThemeChangedFinished") as mica_mock:
+                    window._on_system_theme_event()
+
+                self.assertTrue(isDarkTheme())
+                mica_mock.assert_called_once()
+            finally:
+                restore = "auto" if previous_mode == Theme.AUTO else ("light" if previous_mode == Theme.LIGHT else "dark")
+                widgets.apply_theme_mode(restore)
                 self._close(window)
 
 

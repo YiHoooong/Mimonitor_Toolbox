@@ -57,7 +57,7 @@ from .presets import (
     normalize_preset_options,
     unique_name,
 )
-from .widgets import LoadingSpinner, OverlayResizeFilter
+from .widgets import LoadingSpinner, OverlayResizeFilter, warning_hint_style
 from .windows import (
     query_target_display_refresh_rate,
     query_windows_display_mode,
@@ -2246,13 +2246,13 @@ class DisplayFeaturesMixin:
         )
         if not mode_known:
             label.setText("当前画面模式未知；高亮值尚未确认是否生效。")
-            label.setStyleSheet("color: #f0b85a; font-size: 12px;")
+            label.setStyleSheet(warning_hint_style())
         elif DisplayFeaturesMixin._is_game_mode_active(self):
             label.setText("当前为游戏模式；下方高亮为当前生效值。")
-            label.setStyleSheet("font-size: 12px;")
+            FluentStyleSheet.LABEL.apply(label)
         else:
             label.setText("当前不是游戏模式；下方高亮为记忆值，功能当前未生效。")
-            label.setStyleSheet("color: #f0b85a; font-size: 12px;")
+            label.setStyleSheet(warning_hint_style())
 
     def _update_hdr_tone_mapping_visibility(self, mode=None):
         card = getattr(self, "hdr_tone_mapping_card", None)
@@ -2267,6 +2267,7 @@ class DisplayFeaturesMixin:
         label = getattr(self, "picture_mode_hint_label", None)
         if not label:
             return
+        self._last_picture_mode_hint_value = mode
 
         try:
             mode_int = int(mode)
@@ -2275,7 +2276,7 @@ class DisplayFeaturesMixin:
 
         if mode_int is None:
             label.setText(f"当前场景：未知（{mode}）")
-            label.setStyleSheet("color: #f0b85a; font-size: 12px;")
+            label.setStyleSheet(warning_hint_style())
             return
 
         group_name = self._picture_mode_group_name(mode_int)
@@ -2290,7 +2291,7 @@ class DisplayFeaturesMixin:
             FluentStyleSheet.LABEL.apply(label)
         else:
             label.setText(f"当前场景：未知场景（{mode_int}），不匹配上方模式按钮")
-            label.setStyleSheet("color: #f0b85a; font-size: 12px;")
+            label.setStyleSheet(warning_hint_style())
 
     def _set_mode(self, val, name):
         if not self.check_connection(): return

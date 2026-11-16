@@ -43,12 +43,9 @@ from qfluentwidgets import (
     Slider,
     SubtitleLabel,
     SwitchButton,
-    Theme,
     TitleLabel,
     ToggleButton,
     TransparentToolButton,
-    isDarkTheme,
-    setTheme,
 )
 
 from .core import (
@@ -96,6 +93,8 @@ from .widgets import (
     RefreshableComboBox,
     ScanSettingsDialog,
     TrayItemList,
+    apply_theme_mode,
+    warning_hint_style,
 )
 
 # 有预设生效时两个「记忆」暂停的原因说明。
@@ -390,8 +389,8 @@ class PagesMixin:
         lf_layout.addLayout(h)
         layout.addWidget(lf)
 
-        # Sliders
-        self._add_slider(layout, "背光", "backlight", 1, 100, 50, jni_key="g_disp__disp_back_light", settings_keys=["picture_backlight", "xiaomi_picture_backlight"])
+        # Sliders（背光硬件不可置 0，最小仍为 1，视觉刻度按 0..100 绘制以保证 50 等刻度与下方滑条对齐）
+        self._add_slider(layout, "背光", "backlight", 1, 100, 50, jni_key="g_disp__disp_back_light", settings_keys=["picture_backlight", "xiaomi_picture_backlight"], visual_lo=0)
         self._add_slider(layout, "黑色级别", "black_level", 0, 100, 50, settings_keys=["picture_brightness"])
         self._add_slider(layout, "对比度", "contrast", 0, 100, 50, settings_keys=["picture_contrast"])
         self._add_slider(layout, "饱和度", "saturation", 0, 100, 50, settings_keys=["picture_saturation"])
@@ -487,8 +486,7 @@ class PagesMixin:
         layout.addLayout(title_row)
 
         self.game_mode_hint_label = BodyLabel("当前画面模式未知；高亮值尚未确认是否生效。", container)
-        hint_color = "#f0b85a" if isDarkTheme() else "#b06c00"
-        self.game_mode_hint_label.setStyleSheet(f"color: {hint_color}; font-size: 12px;")
+        self.game_mode_hint_label.setStyleSheet(warning_hint_style())
         layout.addWidget(self.game_mode_hint_label)
 
         # Game Switches
@@ -1616,14 +1614,12 @@ class PagesMixin:
         def on_theme_changed(index):
             if index == 0:
                 theme_str = "auto"
-                setTheme(Theme.AUTO)
             elif index == 1:
                 theme_str = "dark"
-                setTheme(Theme.DARK)
             else:
                 theme_str = "light"
-                setTheme(Theme.LIGHT)
-            
+
+            apply_theme_mode(theme_str)
             update_settings({"theme": theme_str})
             
         self.theme_combo.currentIndexChanged.connect(on_theme_changed)
@@ -2284,7 +2280,7 @@ class PagesMixin:
         layout.addWidget(main_frame)
         return container
 
-    def _add_slider(self, parent_layout, title, name, lo, hi, default, jni_key=None, settings_keys=None):
+    def _add_slider(self, parent_layout, title, name, lo, hi, default, jni_key=None, settings_keys=None, visual_lo=None):
         card = SimpleCardWidget(self)
         layout = QHBoxLayout(card)
         layout.setContentsMargins(15, 10, 15, 10)
@@ -2296,6 +2292,8 @@ class PagesMixin:
         slider = PageScrollSlider(Qt.Orientation.Horizontal, card)
         slider.setRange(lo, hi)
         slider.setValue(default)
+        if visual_lo is not None:
+            slider.setVisualMinimum(visual_lo)
         layout.addWidget(slider)
 
         val_label = BodyLabel(str(default), card)

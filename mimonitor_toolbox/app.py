@@ -9,10 +9,10 @@ from datetime import datetime
 from PyQt6.QtCore import QTimer
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import QApplication
-from qfluentwidgets import Theme, setTheme
 
 from .core import cleanup_stale_extract_dirs, get_app_data_dir, load_settings
 from .main_window import App
+from .widgets import apply_theme_mode
 
 
 SERVER_NAME = "mitv_gpro27u_controller_single_instance"
@@ -124,13 +124,7 @@ def main() -> int:
         return 1
 
     settings = load_settings()
-    theme_value = settings.get("theme", "dark")
-    if theme_value == "auto":
-        setTheme(Theme.AUTO)
-    elif theme_value == "light":
-        setTheme(Theme.LIGHT)
-    else:
-        setTheme(Theme.DARK)
+    apply_theme_mode(settings.get("theme", "dark"))
 
     window = App()
     local_server.newConnection.connect(

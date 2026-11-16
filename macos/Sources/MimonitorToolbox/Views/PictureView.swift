@@ -57,7 +57,7 @@ struct PictureView: View {
                 }
 
                 // 滑条
-                SliderRow(title: "背光", range: 1...100,
+                SliderRow(title: "背光", range: 1...100, trackRange: 0...100,
                           externalValue: state.intValue("picture_backlight", default: 50)) { v in
                     state.setPictureSlider(title: "背光", value: v,
                                            jniKey: "g_disp__disp_back_light",

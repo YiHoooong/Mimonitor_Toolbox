@@ -2,6 +2,8 @@
 
 import sys
 
+import darkdetect
+from PyQt6 import sip
 from PyQt6.QtCore import (
     QEasingCurve,
     QEvent,
@@ -9,6 +11,7 @@ from PyQt6.QtCore import (
     QPoint,
     QPropertyAnimation,
     QRect,
+    QRectF,
     QSize,
     Qt,
     QTimer,
@@ -73,8 +76,12 @@ from qfluentwidgets import (
     Theme,
     drawIcon,
     isDarkTheme,
+    qconfig,
+    setTheme,
 )
 from qfluentwidgets.common import getFont
+from qfluentwidgets.common.color import autoFallbackThemeColor
+from qfluentwidgets.common.style_sheet import styleSheetManager, updateStyleSheet
 
 from .core import (
     CONNECTION_MODE_ADB,
@@ -84,6 +91,97 @@ from .core import (
 )
 from .network_scan import adapter_matches_device_rule, select_scan_networks
 from .windows import user32
+
+
+def detect_system_theme():
+    """读取系统当前深浅色偏好，依次回退到 Qt colorScheme 与浅色默认。"""
+    try:
+        detected = darkdetect.theme()
+    except Exception:
+        detected = None
+    if detected:
+        lowered = str(detected).strip().lower()
+        if lowered == "dark":
+            return Theme.DARK
+        if lowered == "light":
+            return Theme.LIGHT
+
+    app = QApplication.instance()
+    hints = app.styleHints() if app is not None and hasattr(app, "styleHints") else None
+    if hints is not None and hasattr(hints, "colorScheme"):
+        scheme = hints.colorScheme()
+        if scheme == Qt.ColorScheme.Dark:
+            return Theme.DARK
+        if scheme == Qt.ColorScheme.Light:
+            return Theme.LIGHT
+    return Theme.LIGHT
+
+
+def sync_qt_color_scheme(theme_mode):
+    """同步 Qt 6 原生 ColorScheme，避免固定深浅色下系统切换导致原生调色板反色。"""
+    app = QApplication.instance()
+    hints = app.styleHints() if app is not None and hasattr(app, "styleHints") else None
+    if hints is None:
+        return
+    if theme_mode == Theme.AUTO:
+        if hasattr(hints, "unsetColorScheme"):
+            hints.unsetColorScheme()
+        return
+    if hasattr(hints, "setColorScheme"):
+        scheme = Qt.ColorScheme.Dark if theme_mode == Theme.DARK else Qt.ColorScheme.Light
+        hints.setColorScheme(scheme)
+
+
+def _safe_update_style_sheet():
+    """清理已析构的 Qt 控件引用后再全量刷新样式表。"""
+    for widget in list(styleSheetManager.widgets.keys()):
+        if isinstance(widget, sip.simplewrapper) and sip.isdeleted(widget):
+            styleSheetManager.deregister(widget)
+    updateStyleSheet(False)
+
+
+def sync_system_theme(force=False):
+    """在「跟随系统」模式下检测系统深浅色并刷新 qfluentwidgets 主题。
+
+    ``qconfig.set(qconfig.themeMode, Theme.AUTO)`` 在已处于 AUTO 时会直接早退，
+    不会重新读取系统主题，因此这里显式更新 ``qconfig.theme`` 并全量刷新样式表。
+    """
+    if qconfig.themeMode.value != Theme.AUTO:
+        return False
+    detected = detect_system_theme()
+    if not force and detected == qconfig.theme:
+        return False
+    sync_qt_color_scheme(Theme.AUTO)
+    qconfig.theme = detected
+    qconfig.themeChanged.emit(Theme.AUTO)
+    _safe_update_style_sheet()
+    qconfig.themeChangedFinished.emit()
+    return True
+
+
+def apply_theme_mode(theme_value):
+    """应用 ``auto`` / ``dark`` / ``light`` 主题配置。"""
+    normalized = str(theme_value or "dark").strip().lower()
+    if normalized == "auto":
+        mode = Theme.AUTO
+    elif normalized == "light":
+        mode = Theme.LIGHT
+    else:
+        mode = Theme.DARK
+
+    sync_qt_color_scheme(mode)
+    if mode == Theme.AUTO:
+        if qconfig.themeMode.value != Theme.AUTO:
+            qconfig.themeMode.value = Theme.AUTO
+        sync_system_theme(force=True)
+        return
+    setTheme(mode)
+
+
+def warning_hint_style():
+    """在深浅主题下都保持高对比度的提示文案样式。"""
+    hint_color = "#f0b85a" if isDarkTheme() else "#b06c00"
+    return f"color: {hint_color}; font-size: 12px;"
 
 
 class RefreshableComboBox(ComboBox):
@@ -270,6 +368,7 @@ class TraySliderCard(RoundMenu):
         self.view.setItemDelegate(QStyledItemDelegate(self.view))
         self.view.setViewportMargins(0, 0, 0, 0)
         self._apply_card_style()
+        qconfig.themeChangedFinished.connect(self._apply_card_style)
 
         # 圆角卡片本体由 view 绘制，阴影挂在 view 上所以跟着圆角走。
         # 用库默认参数（blur 30 / offset (0,8) / alpha 30）—— 托盘菜单本身
@@ -430,6 +529,8 @@ class TraySliderCard(RoundMenu):
         return self.size()
 
     def _apply_card_style(self):
+        if sip.isdeleted(self):
+            return
         if isDarkTheme():
             background, border = "rgba(20, 20, 20, 215)", "rgba(255, 255, 255, 45)"
         else:
@@ -1160,7 +1261,54 @@ class LoadingSpinner(QWidget):
 
 
 class PageScrollSlider(Slider):
-    """横向数值条：忽略滚轮改值，把滚轮交给外层 ScrollArea 滚动页面。"""
+    """横向数值条：忽略滚轮改值，把滚轮交给外层 ScrollArea 滚动页面；支持独立视觉刻度下界。"""
+
+    def __init__(self, *args, **kwargs):
+        self._visual_min = None
+        super().__init__(*args, **kwargs)
+
+    def setVisualMinimum(self, value):
+        """设置刻度绘制与点击定位使用的视觉下界，同时保留 QSlider 自身 minimum 约束。"""
+        self._visual_min = value
+        self._adjustHandlePos()
+        self.update()
+
+    def _visual_ratio(self):
+        lo = self._visual_min
+        span = self.maximum() - lo
+        if span <= 0:
+            return 0.0
+        return max(0.0, min(1.0, (self.value() - lo) / span))
+
+    def _adjustHandlePos(self):
+        if self._visual_min is None:
+            return super()._adjustHandlePos()
+        delta = int(self._visual_ratio() * self.grooveLength)
+        if self.orientation() == Qt.Orientation.Vertical:
+            self.handle.move(0, delta)
+        else:
+            self.handle.move(delta, 0)
+
+    def _posToValue(self, pos: QPoint):
+        if self._visual_min is None:
+            return super()._posToValue(pos)
+        pd = self.handle.width() / 2
+        gs = max(self.grooveLength, 1)
+        v = pos.x() if self.orientation() == Qt.Orientation.Horizontal else pos.y()
+        lo = self._visual_min
+        raw = int((v - pd) / gs * (self.maximum() - lo) + lo)
+        return max(self.minimum(), min(self.maximum(), raw))
+
+    def _drawHorizonGroove(self, painter):
+        if self._visual_min is None:
+            return super()._drawHorizonGroove(painter)
+        w, r = self.width(), self.handle.width() / 2
+        painter.drawRoundedRect(QRectF(r, r - 2, w - r * 2, 4), 2, 2)
+        if self.maximum() - self._visual_min <= 0:
+            return
+        painter.setBrush(autoFallbackThemeColor(self.lightGrooveColor, self.darkGrooveColor))
+        aw = self._visual_ratio() * (w - r * 2)
+        painter.drawRoundedRect(QRectF(r, r - 2, aw, 4), 2, 2)
 
     def wheelEvent(self, event):
         # 不 accept：事件继续向上传递，页面仍可滚动；也不改 slider 数值。
@@ -1374,6 +1522,7 @@ class CurrentPresetBanner(QFrame):
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setFixedHeight(44)
         self._apply_style()
+        qconfig.themeChangedFinished.connect(self._apply_style)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(18, 6, 18, 6)
@@ -1391,6 +1540,8 @@ class CurrentPresetBanner(QFrame):
         parent.installEventFilter(self)
 
     def _apply_style(self):
+        if sip.isdeleted(self):
+            return
         if isDarkTheme():
             background, border = "rgba(45, 45, 45, 240)", "rgba(255, 255, 255, 45)"
         else:
