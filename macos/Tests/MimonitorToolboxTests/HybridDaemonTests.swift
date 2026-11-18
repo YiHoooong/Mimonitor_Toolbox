@@ -258,6 +258,7 @@ final class HybridDaemonTests: XCTestCase {
         client.testForwardPortOverride = server.port
 
         XCTAssertTrue(try client.ensureDaemon())
+        XCTAssertTrue(client.isDaemonChannelReady)
         let q = try client.daemonQuery(
             settingsKeys: ["picture_mode"],
             jniKeys: ["g_disp__disp_back_light"],
@@ -284,6 +285,7 @@ final class HybridDaemonTests: XCTestCase {
 
         // Switching back to .adb sends QUIT + removes forward port
         client.setConnectionMode(.adb)
+        XCTAssertFalse(client.isDaemonChannelReady)
         XCTAssertTrue(server.requests.contains { $0.hasPrefix("QUIT") })
         let adbLog = try String(contentsOf: logURL, encoding: .utf8)
         XCTAssertTrue(adbLog.contains("forward tcp:"))
@@ -293,6 +295,7 @@ final class HybridDaemonTests: XCTestCase {
         // Switch back to .daemon and verify disconnect() also tears down daemon + forward
         client.setConnectionMode(.daemon)
         XCTAssertTrue(try client.ensureDaemon())
+        XCTAssertTrue(client.isDaemonChannelReady)
         let quitCountBefore = server.requests.filter { $0.hasPrefix("QUIT") }.count
         _ = client.disconnect(ip: "192.168.1.20")
         let quitCountAfter = server.requests.filter { $0.hasPrefix("QUIT") }.count
@@ -361,6 +364,49 @@ final class HybridDaemonTests: XCTestCase {
         XCTAssertThrowsError(try client.batchWrites(check: true) {
             client.settingsPut("error_key", "1")
         })
+    }
+
+    func testJniRampDoesNotReplayAfterSettingsPutDenied() throws {
+        let server = try MockDaemonServer { req in
+            if req.hasPrefix("PING") {
+                return "OK MtkDirectTool v2.1 pid=66 uid=1000 put=0\nEND\n"
+            }
+            if req.hasPrefix("BATCH") && req.contains("JNI_RAMP") {
+                return """
+                ERR_AT 1 PUT_DENIED:picture_backlight:no_resolver
+                STEP 0 OK JNI_RAMP g_disp__disp_back_light=43
+                END
+                """ + "\n"
+            }
+            if req.hasPrefix("QUIT") {
+                return "OK BYE\nEND\n"
+            }
+            return "ERR UNKNOWN_CMD\nEND\n"
+        }
+        server.start()
+        defer { server.stop() }
+
+        let (dir, adbPath, logURL) = try makeFakeAdb()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let client = AdbClient(adbPath: adbPath, connectionMode: .daemon)
+        client.ip = "192.168.1.20"
+        client.testForwardPortOverride = server.port
+
+        client.jniRamp(key: "g_disp__disp_back_light", from: 31, to: 43,
+                       settingsKeys: ["picture_backlight", "xiaomi_picture_backlight"],
+                       step: 1)
+
+        let batchReqs = server.requests.filter { $0.hasPrefix("BATCH") }
+        XCTAssertEqual(batchReqs.count, 1)
+        XCTAssertTrue(batchReqs[0].contains("JNI_RAMP g_disp__disp_back_light 31 43 3 0 1"))
+
+        // JNI_RAMP 已在 Daemon 成功执行；只允许用 ADB 补写被拒的 settings，
+        // 不能再跑一次 MtkDirectTool ramp（否则会从 31 重新推一遍，画面先闪回 31）。
+        let adbLog = try String(contentsOf: logURL, encoding: .utf8)
+        XCTAssertFalse(adbLog.contains("MtkDirectTool ramp"))
+        XCTAssertTrue(adbLog.contains("settings put global picture_backlight 43"))
+        XCTAssertTrue(adbLog.contains("settings put global xiaomi_picture_backlight 43"))
     }
 
     func testForwardFailureSetsCooldownAndFallsBackToStandardAdb() throws {
