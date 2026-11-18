@@ -3186,6 +3186,7 @@ final class AppState: ObservableObject {
 
     /// Daemon 模式下的原生跟随：只写 JNI，不把 settings 放进按键关键路径。
     /// 同一时间最多一个写在途；新按键只更新预览，完成后自动追最新值。
+    /// 单格 6–7% 的跳变拆成 1% 微步（约 40–48ms），减少高亮区背光跳变。
     private func pumpMediaBrightnessFast() {
         guard adb.isDaemonChannelReady,
               !mediaBrightnessFastInFlight,
@@ -3197,10 +3198,7 @@ final class AppState: ObservableObject {
         let from = mediaBrightnessHardware ?? target
         guard from != target else { return }
 
-        let delta = abs(target - from)
-        let oneChiclet = Int(ceil(100.0 / Double(NativeOSD.chicletCount)))
-        let isOneChiclet = delta <= oneChiclet
-        let step = max(1, Int(ceil(Double(delta) / 16.0)))
+        let plan = BrightnessRampPlanner.plan(from: from, to: target)
         let request = connectionIntent.generation
         let identity = adb.ip
         mediaBrightnessFastInFlight = true
@@ -3215,11 +3213,11 @@ final class AppState: ObservableObject {
             }
             if current {
                 self.adb.transaction {
-                    if isOneChiclet {
-                        self.adb.jniSet(key: "g_disp__disp_back_light", value: String(target))
-                    } else {
+                    if plan.useRamp {
                         self.adb.jniRamp(key: "g_disp__disp_back_light", from: from, to: target,
-                                         settingsKeys: [], step: step)
+                                         settingsKeys: [], stepMs: plan.stepMs, step: plan.step)
+                    } else {
+                        self.adb.jniSet(key: "g_disp__disp_back_light", value: String(target))
                     }
                 }
             }
