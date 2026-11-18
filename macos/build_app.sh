@@ -87,18 +87,39 @@ fetch_adb() {
 # 纯命令行工具会报错，所以这里退而求其次分开编。
 # 想加快本地构建可以 UNIVERSAL=0 ./build_app.sh
 UNIVERSAL="${UNIVERSAL:-1}"
+DEPLOYMENT_TARGET="13.0"
+SDK_VERSION="$(xcrun --show-sdk-version)"
+
+# SwiftPM 默认只传 `-target arm64-apple-macos13.0`，Xcode 27 的链接器会把
+# LC_BUILD_VERSION 的 sdk 字段记成 13.0。AppKit 用这个字段判断「链接时的
+# SDK」，于是即使实际用的是 macOS 27 SDK，液态玻璃也会按旧外观关闭。
+# 显式补 -platform_version，把真实的 SDK 版本写进二进制。
+LINK_VERSION_FLAGS=(
+    -Xlinker -platform_version
+    -Xlinker macos
+    -Xlinker "$DEPLOYMENT_TARGET"
+    -Xlinker "$SDK_VERSION"
+)
 
 echo "==> 1/6 编译 release 版本（通用二进制: ${UNIVERSAL}）..."
 if [ "$UNIVERSAL" = "1" ]; then
-    swift build -c release --arch arm64
-    swift build -c release --arch x86_64
+    # 不要写死 .build/arm64-apple-macosx/...：Xcode 27 的 SwiftPM 把两个
+    # 架构都输出到 .build/out/Products/Release，旧路径会找不到文件。
+    # 用 --show-bin-path 逐架构取产物，兼容新旧 SwiftPM 布局。
+    TMP_BIN_DIR="$(mktemp -d)"
+    trap 'rm -rf "$TMP_BIN_DIR"' EXIT
+    for arch in arm64 x86_64; do
+        swift build -c release --arch "$arch" "${LINK_VERSION_FLAGS[@]}"
+        ARCH_BIN_DIR="$(swift build -c release --arch "$arch" --show-bin-path)"
+        cp "$ARCH_BIN_DIR/$EXEC_NAME" "$TMP_BIN_DIR/$EXEC_NAME-$arch"
+    done
     BIN_PATH="$BUILD_DIR/release-universal/$EXEC_NAME"
     mkdir -p "$(dirname "$BIN_PATH")"
     lipo -create -output "$BIN_PATH" \
-        "$BUILD_DIR/arm64-apple-macosx/release/$EXEC_NAME" \
-        "$BUILD_DIR/x86_64-apple-macosx/release/$EXEC_NAME"
+        "$TMP_BIN_DIR/$EXEC_NAME-arm64" \
+        "$TMP_BIN_DIR/$EXEC_NAME-x86_64"
 else
-    swift build -c release
+    swift build -c release "${LINK_VERSION_FLAGS[@]}"
     BIN_PATH="$BUILD_DIR/release/$EXEC_NAME"
 fi
 echo "    架构: $(lipo -archs "$BIN_PATH")"
