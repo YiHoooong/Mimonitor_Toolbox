@@ -148,6 +148,18 @@ final class AdbClient {
         return connectionMode == .daemon
     }
 
+    /// Daemon 通道是否已就绪，可用于亮度键这类低延迟写入。
+    /// 真正的请求仍会走 `ensureDaemon` 探活；这里只用来决定是否启用快速跟随路径。
+    var isDaemonChannelReady: Bool {
+        daemonStateLock.lock()
+        defer { daemonStateLock.unlock() }
+        return connectionMode == .daemon
+            && daemonReady
+            && daemonForwardPort != nil
+            && daemonIp == ip
+            && !daemonNeedsRestart
+    }
+
     // MARK: - 资源定位
 
     /// 仓库根目录（开发态定位 assets/ 用）。打包成 .app 后走 Bundle.main。
@@ -1798,9 +1810,12 @@ final class AdbClient {
             for sk in settingsKeys {
                 ops.append(.put(key: sk, value: String(to)))
             }
-            if let (ok, _, _) = try? daemonBatch(ops), ok {
-                return
-            }
+            // 只回退失败的那几步。Daemon 以 system_app 运行时 Settings.Global
+            // 写入会被拒（PUT_DENIED），但前面的 JNI_RAMP 已经生效；如果这里
+            // 整体回退到 adbJniRampDirect，会把同一段渐变从旧值再跑一遍，
+            // 表现为“到目标亮度后又闪回旧值、再回到目标”。
+            try? executeDaemonSegmentWithFallback(ops, check: false)
+            return
         }
         adbJniRampDirect(key: key, from: from, to: to, settingsKeys: settingsKeys, upd: upd, stepMs: stepMs, step: step)
     }
