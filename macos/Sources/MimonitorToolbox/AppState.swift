@@ -241,6 +241,7 @@ final class AppState: ObservableObject {
     }()
 
     init() {
+        AudioOutputMonitor.startObservingDefaultOutput()
         adb.connectionMode = connectionMode
         startPresetFeatures()
         log("系统就绪，等待连接...（连接模式：\(connectionMode.shortLabel)）")
@@ -263,7 +264,11 @@ final class AppState: ObservableObject {
         }
         // 媒体键拦截门：亮度键看多屏焦点，音量键看当前默认音频输出，其余一律放行。
         hotkeyManager.shouldHandleMediaKey = { [weak self] keyType in
-            guard let self else { return true }
+            guard let self else { return false }
+            // 不能处理时交给系统：断开/预设期间如果还吞掉事件，用户会得到“按键没反应”。
+            guard self.isConnected,
+                  !self.isPresetBusy,
+                  !self.presetConfiguration.applicationIncomplete else { return false }
             if HotkeyManager.isBrightnessKeyType(keyType) {
                 return self.shouldHandleMediaBrightnessForFocus()
             }
@@ -333,6 +338,16 @@ final class AppState: ObservableObject {
         adjustPendingValues.removeAll()
         mediaBrightnessCommit?.cancel()
         mediaBrightnessCommit = nil
+        mediaBrightnessIdleWork?.cancel()
+        mediaBrightnessIdleWork = nil
+        mediaVolumeCommit?.cancel()
+        mediaVolumeCommit = nil
+        mediaBrightnessFastGeneration &+= 1
+        mediaBrightnessExternalWriteEpoch &+= 1
+        mediaVolumeExternalWriteEpoch &+= 1
+        mediaBrightnessFastInFlight = false
+        mediaBrightnessPreview = nil
+        mediaBrightnessHardware = nil
         mediaVolumeCommit?.cancel()
         mediaVolumeCommit = nil
         HUDWindow.shared.endCountdown()
@@ -375,6 +390,17 @@ final class AppState: ObservableObject {
         connectionMode = mode
         mode.save()
         log("连接模式已切换为：\(mode.label)")
+        mediaBrightnessCommit?.cancel()
+        mediaBrightnessCommit = nil
+        mediaBrightnessIdleWork?.cancel()
+        mediaBrightnessIdleWork = nil
+        mediaVolumeCommit?.cancel()
+        mediaVolumeCommit = nil
+        mediaBrightnessFastGeneration &+= 1
+        mediaBrightnessExternalWriteEpoch &+= 1
+        mediaVolumeExternalWriteEpoch &+= 1
+        mediaBrightnessPreview = nil
+        mediaBrightnessHardware = nil
 
         let connectedNow = isConnected
         let request = connectionIntent.generation
@@ -490,8 +516,6 @@ final class AppState: ObservableObject {
                         self.check4KState()
                         self.checkGuardian()
                         self.refreshMediaVolumeState()
-                    } else {
-                        self.log("ADB 链路已恢复")
                     }
                     if probe.daemonOk == true && !wasConnected {
                         self.log("混合加速 Daemon 已就绪")
@@ -1134,6 +1158,13 @@ final class AppState: ObservableObject {
         var merged = currentValues
         for (k, v) in values { merged[k] = v }
         currentValues = merged
+        // 背光回读后丢掉旧的硬件基准，下一次按键以最新回读值为起点。
+        // 正在快速跟随时不能清，否则起点会被回读值带偏。
+        if values["picture_backlight"] != nil,
+           !mediaBrightnessFastInFlight,
+           !mediaBrightnessCommitInFlight {
+            mediaBrightnessHardware = nil
+        }
     }
 
     func forceRefreshPage(_ page: String) {
@@ -1141,7 +1172,10 @@ final class AppState: ObservableObject {
         refreshPage(page)
     }
 
-    var hasPendingDeviceControls: Bool { !cyclePending.isEmpty || !adjustPendingWork.isEmpty }
+    var hasPendingDeviceControls: Bool {
+        !cyclePending.isEmpty || !adjustPendingWork.isEmpty
+            || mediaBrightnessCommitInFlight || mediaBrightnessFastInFlight
+    }
 
     func invalidatePictureRefreshesForPreset() {
         for page in ["picture", "game"] {
@@ -1207,6 +1241,13 @@ final class AppState: ObservableObject {
         // 背光：同步本地预览。媒体键下次拿它当基准，不会被刷新回读到的 JNI 值带偏
         // （那个值偶发会跳，表现就是亮度先冲高再回落）。同时记住已下发到硬件的值，供下次渐变当起点。
         if jniKey == "g_disp__disp_back_light" {
+            mediaBrightnessCommit?.cancel()
+            mediaBrightnessCommit = nil
+            mediaBrightnessIdleWork?.cancel()
+            mediaBrightnessIdleWork = nil
+            mediaBrightnessFastGeneration &+= 1
+            // 滑块/菜单/自定义热键是权威写入；正在跑的按键快速路径不能再用旧 target 回写。
+            if jniRampFrom == nil { mediaBrightnessExternalWriteEpoch &+= 1 }
             mediaBrightnessPreview = value
             mediaBrightnessHardware = value
         }
@@ -3052,10 +3093,22 @@ final class AppState: ObservableObject {
     private var mediaBrightnessCommit: DispatchWorkItem?
     /// 是否有一次下发正在跑（设备队列里跑渐变 + 等完成信号，约 0.4s）
     private var mediaBrightnessCommitInFlight = false
+    /// Daemon 快速跟随：同一时间最多一个 JNI 写在途，新按键只覆盖最新目标。
+    private var mediaBrightnessFastInFlight = false
+    /// 每次按键自增，用来让已经排队的旧 settings 落盘失效。
+    private var mediaBrightnessFastGeneration = 0
+    /// 外部写入（滑块/菜单/预设）的代际；快速路径完成时用它判断自己是否已被接管。
+    /// 内部可见：预设应用在 AppState+Presets 里也要推进它。
+    var mediaBrightnessExternalWriteEpoch = 0
+    /// 停手后把最终值写回 settings 的收尾任务。
+    private var mediaBrightnessIdleWork: DispatchWorkItem?
 
     /// 收尾提交延迟：一段连按结束后多久补上最终值。首次按下是立即下发的，
     /// 这个延迟只决定「连按过程中的中间值什么时候被合并掉」。
     private let mediaBrightnessCommitDelay: TimeInterval = 0.12
+    /// Daemon 模式下停手后多久落 settings。JNI 已经实时生效，
+    /// settings 只是持久化/给 ContentObserver 对齐，不需要挡在按键路径上。
+    private let mediaBrightnessIdleDelay: TimeInterval = 0.4
 
     private func adjustMediaBrightness(increase: Bool) {
         guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
@@ -3064,6 +3117,8 @@ final class AppState: ObservableObject {
         guard shouldHandleMediaBrightnessForFocus() else { return }
 
         let current = mediaBrightnessPreview ?? intValue("picture_backlight", default: 50)
+        // 首次按键时记住真实起点，后面的渐变不要拿刚更新过的目标值当 from。
+        if mediaBrightnessHardware == nil { mediaBrightnessHardware = current }
         let next: Int
         if mediaBrightnessNativeOSD {
             // 系统 OSD 固定 16 格，按用户步长（如 10）会出现「一格 / 两格」乱跳，
@@ -3086,6 +3141,22 @@ final class AppState: ObservableObject {
             HUDWindow.shared.show(title: "背光", value: "\(next)")
         }
 
+        // Daemon 模式下 JNI 写入已经是毫秒级，可以按原生逻辑跟随按键：
+        // 每次按键只更新预览/OSD，JNI 用「最新值覆盖」方式追，settings 停手后再落。
+        if adb.isDaemonChannelReady {
+            mediaBrightnessCommit?.cancel()
+            mediaBrightnessCommit = nil
+            mediaBrightnessFastGeneration &+= 1
+            let generation = mediaBrightnessFastGeneration
+            mediaBrightnessIdleWork?.cancel()
+            mediaBrightnessIdleWork = nil
+            pumpMediaBrightnessFast()
+            scheduleMediaBrightnessIdlePersistence(generation: generation)
+            return
+        }
+
+        mediaBrightnessIdleWork?.cancel()
+        mediaBrightnessIdleWork = nil
         // 首次按下立即下发：按键即响应，不等去抖。
         // 之后连按只更新预览，由收尾任务在「当前下发完成」后再补一次最终值，
         // 既不会堆积好几条渐变，也不会把第一次的响应拖到停手之后。
@@ -3122,7 +3193,104 @@ final class AppState: ObservableObject {
         setPictureSlider(title: "背光", value: value, jniKey: "g_disp__disp_back_light",
                          settingsKeys: ["picture_backlight", "xiaomi_picture_backlight"],
                          jniRampFrom: from) { [weak self] in
-            self?.mediaBrightnessCommitInFlight = false
+            guard let self else { return }
+            self.mediaBrightnessCommitInFlight = false
+            // 如果切换到 Daemon 模式时还有旧提交在跑，等它结束后立即接上快速路径。
+            if self.adb.isDaemonChannelReady {
+                self.pumpMediaBrightnessFast()
+            }
+        }
+    }
+
+    /// Daemon 模式下的原生跟随：只写 JNI，不把 settings 放进按键关键路径。
+    /// 同一时间最多一个写在途；新按键只更新预览，完成后自动追最新值。
+    /// 单格 6–7% 的跳变拆成 1% 微步（约 40–48ms），减少高亮区背光跳变。
+    private func pumpMediaBrightnessFast() {
+        guard adb.isDaemonChannelReady,
+              !mediaBrightnessFastInFlight,
+              !mediaBrightnessCommitInFlight,
+              isConnected,
+              !isPresetBusy,
+              !presetConfiguration.applicationIncomplete,
+              let target = mediaBrightnessPreview else { return }
+        let from = mediaBrightnessHardware ?? target
+        guard from != target else { return }
+
+        let plan = BrightnessRampPlanner.plan(from: from, to: target)
+        let request = connectionIntent.generation
+        let identity = adb.ip
+        let writeEpoch = mediaBrightnessExternalWriteEpoch
+        mediaBrightnessFastInFlight = true
+
+        deviceQueue.async {
+            let current = DispatchQueue.main.sync {
+                self.isConnected
+                    && self.connectionIntent.isCurrent(request)
+                    && self.adb.ip == identity
+                    && !self.isPresetBusy
+                    && !self.presetConfiguration.applicationIncomplete
+            }
+            if current {
+                self.adb.transaction {
+                    if plan.useRamp {
+                        self.adb.jniRamp(key: "g_disp__disp_back_light", from: from, to: target,
+                                         settingsKeys: [], stepMs: plan.stepMs, step: plan.step)
+                    } else {
+                        self.adb.jniSet(key: "g_disp__disp_back_light", value: String(target))
+                    }
+                }
+            }
+            DispatchQueue.main.async {
+                self.mediaBrightnessFastInFlight = false
+                // 滑块/菜单/预设已经接管时，旧 target 不能覆盖新的硬件基准，
+                // 也不能再从旧起点 pump 一次（否则会先掉回旧值再升上去）。
+                guard current, self.mediaBrightnessExternalWriteEpoch == writeEpoch else { return }
+                self.mediaBrightnessHardware = target
+                if self.mediaBrightnessPreview != self.mediaBrightnessHardware {
+                    self.pumpMediaBrightnessFast()
+                }
+            }
+        }
+    }
+
+    /// 停手后只落一次 settings；期间又有按键就取消重排。
+    private func scheduleMediaBrightnessIdlePersistence(generation: Int) {
+        mediaBrightnessIdleWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard self.mediaBrightnessFastGeneration == generation else { return }
+            if self.mediaBrightnessFastInFlight || self.mediaBrightnessCommitInFlight {
+                self.scheduleMediaBrightnessIdlePersistence(generation: generation)
+                return
+            }
+            self.mediaBrightnessIdleWork = nil
+            self.persistMediaBrightnessSettings(generation: generation)
+        }
+        mediaBrightnessIdleWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + mediaBrightnessIdleDelay, execute: work)
+    }
+
+    /// 把最终背光值同步回 settings。JNI 已经是目标值，这一步只负责持久化，
+    /// 同时复用 `runPictureChange` 的预设自动保存/延迟回读语义。
+    private func persistMediaBrightnessSettings(generation: Int) {
+        guard let value = mediaBrightnessPreview else { return }
+        runPictureChange { [weak self] in
+            guard let self else { return }
+            let stillCurrent = DispatchQueue.main.sync {
+                self.mediaBrightnessFastGeneration == generation
+                    && self.mediaBrightnessPreview == value
+            }
+            guard stillCurrent else { return }
+            self.adb.settingsPutBatch([
+                ("picture_backlight", String(value)),
+                ("xiaomi_picture_backlight", String(value))
+            ])
+            // 快速跟随期间可能有页面刷新读到中间值；停手落盘后把 UI 也钉回最终值。
+            DispatchQueue.main.async {
+                guard self.mediaBrightnessFastGeneration == generation else { return }
+                self.currentValues["picture_backlight"] = String(value)
+                self.currentValues["xiaomi_picture_backlight"] = String(value)
+            }
         }
     }
 
@@ -3141,6 +3309,8 @@ final class AppState: ObservableObject {
     private var mediaVolumeCommit: DispatchWorkItem?
     /// 是否有一次下发正在跑
     private var mediaVolumeCommitInFlight = false
+    /// 外部写入（滑块/菜单）的代际；按键提交完成时用它判断自己是否已被接管。
+    private var mediaVolumeExternalWriteEpoch = 0
     /// 是否正在进行未知静音状态的首次探测切换
     private var mediaMuteToggleInFlight = false
     /// 回退通道只提示一次，避免连按刷屏
@@ -3250,6 +3420,7 @@ final class AppState: ObservableObject {
         guard mediaVolumeHardware != value || unmute else { return }
         let request = connectionIntent.generation
         let identity = adb.ip
+        let writeEpoch = mediaVolumeExternalWriteEpoch
         mediaVolumeNeedsUnmute = false
         mediaVolumeCommitInFlight = true
         let showUI = showVolumeOSD
@@ -3259,7 +3430,8 @@ final class AppState: ObservableObject {
                 self.mediaVolumeCommitInFlight = false
                 guard self.isConnected,
                       self.connectionIntent.isCurrent(request),
-                      self.adb.ip == identity else { return }
+                      self.adb.ip == identity,
+                      self.mediaVolumeExternalWriteEpoch == writeEpoch else { return }
                 self.mediaVolumeHardware = value
                 if !usedBinder, !self.mediaVolumeFallbackLogged {
                     self.mediaVolumeFallbackLogged = true
@@ -3277,6 +3449,10 @@ final class AppState: ObservableObject {
         let target = clamp(value, 0, 100)
         let shouldUnmute = unmuteIfNeeded && mediaVolumeMuted == true
         if shouldUnmute { mediaVolumeMuted = false }
+        // 滑块/菜单是权威写入：取消按键尾部提交，并让在途按键提交完成时不要回写旧值。
+        mediaVolumeExternalWriteEpoch &+= 1
+        mediaVolumeCommit?.cancel()
+        mediaVolumeCommit = nil
         mediaVolumeNeedsUnmute = false
         mediaVolumePreview = target
         mediaVolumeHardware = target

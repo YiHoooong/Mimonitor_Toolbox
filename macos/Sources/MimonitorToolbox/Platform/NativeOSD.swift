@@ -33,7 +33,9 @@ final class NativeOSD {
     static let chicletCount = 16
 
     private var connection: NSXPCConnection?
-    private var proxy: OSDUIHelperProtocol?
+    /// 私有服务不可用时短暂退避，避免每次按键都同步重连一次。
+    private var unavailableUntil: Date?
+    private let retryInterval: TimeInterval = 30
 
     private init() {}
 
@@ -54,34 +56,34 @@ final class NativeOSD {
     /// 显示静音 OSD（喇叭加斜线），对应系统静音键的提示。
     @discardableResult
     func showMute(displayID: CGDirectDisplayID? = nil) -> Bool {
-        guard let helper = helper() else { return false }
-        helper.showImage(Self.muteImage,
-                         onDisplayID: UInt32(displayID ?? Self.preferredDisplayID()),
-                         priority: 0x1F4,
-                         msecUntilFade: 1000,
-                         filledChiclets: 0,
-                         totalChiclets: UInt32(Self.chicletCount),
-                         locked: false)
-        return true
+        perform { helper in
+            helper.showImage(Self.muteImage,
+                             onDisplayID: UInt32(displayID ?? Self.preferredDisplayID()),
+                             priority: 0x1F4,
+                             msecUntilFade: 1000,
+                             filledChiclets: 0,
+                             totalChiclets: UInt32(Self.chicletCount),
+                             locked: false)
+        }
     }
 
     private func showImage(_ image: Int64, value: Int, maxValue: Int,
                            displayID: CGDirectDisplayID?) -> Bool {
-        guard let helper = helper() else { return false }
         let clamped = min(max(0, value), maxValue)
         let filled = UInt32((Double(clamped) / Double(max(1, maxValue)) * Double(Self.chicletCount)).rounded())
-        helper.showImage(image,
-                         onDisplayID: UInt32(displayID ?? Self.preferredDisplayID()),
-                         priority: 0x1F4,
-                         msecUntilFade: 1000,
-                         filledChiclets: filled,
-                         totalChiclets: UInt32(Self.chicletCount),
-                         locked: false)
-        return true
+        return perform { helper in
+            helper.showImage(image,
+                             onDisplayID: UInt32(displayID ?? Self.preferredDisplayID()),
+                             priority: 0x1F4,
+                             msecUntilFade: 1000,
+                             filledChiclets: filled,
+                             totalChiclets: UInt32(Self.chicletCount),
+                             locked: false)
+        }
     }
 
-    private func helper() -> OSDUIHelperProtocol? {
-        if let proxy { return proxy }
+    private func xpcConnection() -> NSXPCConnection {
+        if let connection { return connection }
         let conn = NSXPCConnection(machServiceName: "com.apple.OSDUIHelper", options: [])
         conn.remoteObjectInterface = NSXPCInterface(with: OSDUIHelperProtocol.self)
         conn.invalidationHandler = { [weak self] in
@@ -92,8 +94,31 @@ final class NativeOSD {
         }
         conn.resume()
         connection = conn
-        proxy = conn.remoteObjectProxyWithErrorHandler { _ in } as? OSDUIHelperProtocol
-        return proxy
+        return conn
+    }
+
+    /// 用同步代理投递。服务不存在 / 接口签名不匹配时，XPC 错误会在方法返回前
+    /// 回调；这样调用方才能立刻回退 HUD。OSD 是本地 mach service，一次往返
+    /// 的延迟可以忽略。
+    private func perform(_ body: (OSDUIHelperProtocol) -> Void) -> Bool {
+        if let unavailableUntil, Date() < unavailableUntil { return false }
+        var failed = false
+        let proxy = xpcConnection().synchronousRemoteObjectProxyWithErrorHandler { _ in
+            failed = true
+        }
+        guard let helper = proxy as? OSDUIHelperProtocol else {
+            reset()
+            unavailableUntil = Date().addingTimeInterval(retryInterval)
+            return false
+        }
+        body(helper)
+        guard !failed else {
+            reset()
+            unavailableUntil = Date().addingTimeInterval(retryInterval)
+            return false
+        }
+        unavailableUntil = nil
+        return true
     }
 
     private func reset() {
@@ -101,7 +126,6 @@ final class NativeOSD {
         connection?.interruptionHandler = nil
         connection?.invalidate()
         connection = nil
-        proxy = nil
     }
 
     /// 取鼠标所在屏幕的 displayID（用户正看着的那块），拿不到就退回主屏。

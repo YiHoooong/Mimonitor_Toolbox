@@ -144,6 +144,62 @@ final class AdbClientTests: XCTestCase {
         }
     }
 
+    func testAdbEnvironmentDisablesMDNSForEveryServerStartupPath() {
+        let client = AdbClient(adbPath: "/usr/bin/true", serverPort: "5038")
+        let env = client.adbEnvironment(base: [:])
+        XCTAssertEqual(env["ANDROID_ADB_SERVER_PORT"], "5038")
+        XCTAssertEqual(env["ADB_MDNS"], "0")
+
+        let explicit = client.adbEnvironment(base: ["ADB_MDNS": "1"])
+        XCTAssertEqual(explicit["ADB_MDNS"], "1")
+    }
+
+    func testVolumeVerificationDoesNotMaskMuteBinderTransaction() throws {
+        let log = FileManager.default.temporaryDirectory
+            .appendingPathComponent("adb-mute-verify-\(UUID().uuidString).log")
+        defer { try? FileManager.default.removeItem(at: log) }
+
+        try fake("""
+        case "$*" in
+          *"service call audio 22 i32 3"*) echo "Result: Parcel(\t00000000 0000002a   '....*...')" ;;
+          *"service call audio 17 i32 3"*) echo "Result: Parcel(\t00000000 00000000   '........')" ;;
+          *"service call audio 12"*) echo "Result: Parcel(00000000    '....')" ;;
+          *"service call audio 10"*) echo "Result: Parcel(00000000    '....')" ;;
+          *"input keyevent"*) echo "$*" >> "\(log.path)" ;;
+          *) echo "" ;;
+        esac
+        """) { client in
+            XCTAssertTrue(client.setMediaVolume(42))
+            // txn 12 已验证通过；txn 10 返回成功但静音状态没变，必须独立回读并回退。
+            XCTAssertFalse(client.setMediaMuted(true))
+            let commands = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+            XCTAssertTrue(commands.contains("KEYCODE_VOLUME_MUTE"))
+        }
+    }
+
+    func testMuteVerificationDoesNotMaskVolumeBinderTransaction() throws {
+        let log = FileManager.default.temporaryDirectory
+            .appendingPathComponent("adb-volume-verify-\(UUID().uuidString).log")
+        defer { try? FileManager.default.removeItem(at: log) }
+
+        try fake("""
+        case "$*" in
+          *"service call audio 22 i32 3"*) echo "Result: Parcel(\t00000000 00000028   '....(...)'" ;;
+          *"service call audio 17 i32 3"*) echo "Result: Parcel(\t00000000 00000001   '........')" ;;
+          *"service call audio 12"*) echo "Result: Parcel(00000000    '....')" ;;
+          *"service call audio 10"*) echo "Result: Parcel(00000000    '....')" ;;
+          *"input keyevent"*) echo "$*" >> "\(log.path)" ;;
+          *) echo "" ;;
+        esac
+        """) { client in
+            XCTAssertTrue(client.setMediaMuted(true))
+            // txn 10 已验证通过；txn 12 返回成功但音量没变，必须独立回读并回退。
+            XCTAssertFalse(client.setMediaVolume(42))
+            let commands = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+            XCTAssertTrue(commands.contains("KEYCODE_VOLUME_UP"))
+        }
+    }
+
     func testScanProbeCachesUnauthorizedAndNonMitvIPsUntilCleared() throws {
         let logFile = FileManager.default.temporaryDirectory
             .appendingPathComponent("adb-scan-cache-\(UUID().uuidString).log")
