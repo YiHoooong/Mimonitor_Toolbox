@@ -205,6 +205,7 @@ extension AppState {
         presetOperationText = label
         // 预设/自动任务直接写 JNI+settings，不走 setPictureSlider，
         // 所以这里丢掉背光预览，下次亮度键以新的设备值为准。
+        mediaBrightnessExternalWriteEpoch &+= 1
         mediaBrightnessPreview = nil
         mediaBrightnessHardware = nil
         if refresh || navigateToPicture { invalidatePictureRefreshesForPreset() }

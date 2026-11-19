@@ -123,5 +123,45 @@ final class FunctionKeyPassthroughTests: XCTestCase {
         XCTAssertTrue(manager.handleSystemDefined(event, functionKeyDown: false))
         XCTAssertEqual(triggered, [HotkeyManager.mediaVolumeUpID])
     }
+
+    /// 没注册媒体键时，NX_SYSDEFINED 不应该再走门控（音量门会查 CoreAudio）。
+    func testSystemDefinedDoesNotQueryGateWithoutMediaBindings() {
+        let manager = HotkeyManager()
+        var gateCalls = 0
+        manager.shouldHandleMediaKey = { _ in
+            gateCalls += 1
+            return true
+        }
+
+        let event = systemDefinedEvent(keyType: HotkeyManager.keyTypeVolumeUp, down: true)
+        XCTAssertFalse(manager.handleSystemDefined(event, functionKeyDown: false))
+        XCTAssertEqual(gateCalls, 0)
+    }
+
+    /// 普通打字不应该为了判断 fn 去查 WindowServer；只有媒体绑定才需要。
+    func testFunctionKeyStateIsOnlyNeededForMediaBindings() {
+        let manager = HotkeyManager()
+        XCTAssertFalse(manager.needsFunctionKeyState)
+
+        manager.register(id: "user_cmd_a", modifierName: "Cmd", keyName: "A")
+        XCTAssertFalse(manager.needsFunctionKeyState)
+
+        manager.registerRaw(id: HotkeyManager.mediaBrightnessUpID,
+                            keyCode: HotkeyManager.keyCodeBrightnessUp)
+        XCTAssertTrue(manager.needsFunctionKeyState)
+        XCTAssertTrue(manager.needsFunctionKeyState(for: HotkeyManager.keyCodeBrightnessUp))
+        XCTAssertFalse(manager.needsFunctionKeyState(for: CGKeyCode(144)))
+        XCTAssertFalse(manager.needsFunctionKeyState(for: CGKeyCode(0)))
+
+        manager.clear()
+        manager.registerMedia(id: HotkeyManager.mediaVolumeUpID,
+                              keyType: HotkeyManager.keyTypeVolumeUp)
+        manager.registerMedia(id: HotkeyManager.mediaBrightnessUpID,
+                              keyType: HotkeyManager.keyTypeBrightnessUp)
+        XCTAssertTrue(manager.needsFunctionKeyState)
+        XCTAssertTrue(manager.needsFunctionKeyState(for: CGKeyCode(72)))
+        XCTAssertTrue(manager.needsFunctionKeyState(for: CGKeyCode(144)))
+        XCTAssertFalse(manager.needsFunctionKeyState(for: CGKeyCode(0)))
+    }
 }
 #endif

@@ -241,6 +241,7 @@ final class AppState: ObservableObject {
     }()
 
     init() {
+        AudioOutputMonitor.startObservingDefaultOutput()
         adb.connectionMode = connectionMode
         startPresetFeatures()
         log("系统就绪，等待连接...（连接模式：\(connectionMode.shortLabel)）")
@@ -263,7 +264,11 @@ final class AppState: ObservableObject {
         }
         // 媒体键拦截门：亮度键看多屏焦点，音量键看当前默认音频输出，其余一律放行。
         hotkeyManager.shouldHandleMediaKey = { [weak self] keyType in
-            guard let self else { return true }
+            guard let self else { return false }
+            // 不能处理时交给系统：断开/预设期间如果还吞掉事件，用户会得到“按键没反应”。
+            guard self.isConnected,
+                  !self.isPresetBusy,
+                  !self.presetConfiguration.applicationIncomplete else { return false }
             if HotkeyManager.isBrightnessKeyType(keyType) {
                 return self.shouldHandleMediaBrightnessForFocus()
             }
@@ -335,7 +340,11 @@ final class AppState: ObservableObject {
         mediaBrightnessCommit = nil
         mediaBrightnessIdleWork?.cancel()
         mediaBrightnessIdleWork = nil
+        mediaVolumeCommit?.cancel()
+        mediaVolumeCommit = nil
         mediaBrightnessFastGeneration &+= 1
+        mediaBrightnessExternalWriteEpoch &+= 1
+        mediaVolumeExternalWriteEpoch &+= 1
         mediaBrightnessFastInFlight = false
         mediaBrightnessPreview = nil
         mediaBrightnessHardware = nil
@@ -385,7 +394,11 @@ final class AppState: ObservableObject {
         mediaBrightnessCommit = nil
         mediaBrightnessIdleWork?.cancel()
         mediaBrightnessIdleWork = nil
+        mediaVolumeCommit?.cancel()
+        mediaVolumeCommit = nil
         mediaBrightnessFastGeneration &+= 1
+        mediaBrightnessExternalWriteEpoch &+= 1
+        mediaVolumeExternalWriteEpoch &+= 1
         mediaBrightnessPreview = nil
         mediaBrightnessHardware = nil
 
@@ -1233,6 +1246,8 @@ final class AppState: ObservableObject {
             mediaBrightnessIdleWork?.cancel()
             mediaBrightnessIdleWork = nil
             mediaBrightnessFastGeneration &+= 1
+            // 滑块/菜单/自定义热键是权威写入；正在跑的按键快速路径不能再用旧 target 回写。
+            if jniRampFrom == nil { mediaBrightnessExternalWriteEpoch &+= 1 }
             mediaBrightnessPreview = value
             mediaBrightnessHardware = value
         }
@@ -3082,6 +3097,9 @@ final class AppState: ObservableObject {
     private var mediaBrightnessFastInFlight = false
     /// 每次按键自增，用来让已经排队的旧 settings 落盘失效。
     private var mediaBrightnessFastGeneration = 0
+    /// 外部写入（滑块/菜单/预设）的代际；快速路径完成时用它判断自己是否已被接管。
+    /// 内部可见：预设应用在 AppState+Presets 里也要推进它。
+    var mediaBrightnessExternalWriteEpoch = 0
     /// 停手后把最终值写回 settings 的收尾任务。
     private var mediaBrightnessIdleWork: DispatchWorkItem?
 
@@ -3201,6 +3219,7 @@ final class AppState: ObservableObject {
         let plan = BrightnessRampPlanner.plan(from: from, to: target)
         let request = connectionIntent.generation
         let identity = adb.ip
+        let writeEpoch = mediaBrightnessExternalWriteEpoch
         mediaBrightnessFastInFlight = true
 
         deviceQueue.async {
@@ -3223,10 +3242,11 @@ final class AppState: ObservableObject {
             }
             DispatchQueue.main.async {
                 self.mediaBrightnessFastInFlight = false
-                if current {
-                    self.mediaBrightnessHardware = target
-                }
-                if current, self.mediaBrightnessPreview != self.mediaBrightnessHardware {
+                // 滑块/菜单/预设已经接管时，旧 target 不能覆盖新的硬件基准，
+                // 也不能再从旧起点 pump 一次（否则会先掉回旧值再升上去）。
+                guard current, self.mediaBrightnessExternalWriteEpoch == writeEpoch else { return }
+                self.mediaBrightnessHardware = target
+                if self.mediaBrightnessPreview != self.mediaBrightnessHardware {
                     self.pumpMediaBrightnessFast()
                 }
             }
@@ -3289,6 +3309,8 @@ final class AppState: ObservableObject {
     private var mediaVolumeCommit: DispatchWorkItem?
     /// 是否有一次下发正在跑
     private var mediaVolumeCommitInFlight = false
+    /// 外部写入（滑块/菜单）的代际；按键提交完成时用它判断自己是否已被接管。
+    private var mediaVolumeExternalWriteEpoch = 0
     /// 是否正在进行未知静音状态的首次探测切换
     private var mediaMuteToggleInFlight = false
     /// 回退通道只提示一次，避免连按刷屏
@@ -3398,6 +3420,7 @@ final class AppState: ObservableObject {
         guard mediaVolumeHardware != value || unmute else { return }
         let request = connectionIntent.generation
         let identity = adb.ip
+        let writeEpoch = mediaVolumeExternalWriteEpoch
         mediaVolumeNeedsUnmute = false
         mediaVolumeCommitInFlight = true
         let showUI = showVolumeOSD
@@ -3407,7 +3430,8 @@ final class AppState: ObservableObject {
                 self.mediaVolumeCommitInFlight = false
                 guard self.isConnected,
                       self.connectionIntent.isCurrent(request),
-                      self.adb.ip == identity else { return }
+                      self.adb.ip == identity,
+                      self.mediaVolumeExternalWriteEpoch == writeEpoch else { return }
                 self.mediaVolumeHardware = value
                 if !usedBinder, !self.mediaVolumeFallbackLogged {
                     self.mediaVolumeFallbackLogged = true
@@ -3425,6 +3449,10 @@ final class AppState: ObservableObject {
         let target = clamp(value, 0, 100)
         let shouldUnmute = unmuteIfNeeded && mediaVolumeMuted == true
         if shouldUnmute { mediaVolumeMuted = false }
+        // 滑块/菜单是权威写入：取消按键尾部提交，并让在途按键提交完成时不要回写旧值。
+        mediaVolumeExternalWriteEpoch &+= 1
+        mediaVolumeCommit?.cancel()
+        mediaVolumeCommit = nil
         mediaVolumeNeedsUnmute = false
         mediaVolumePreview = target
         mediaVolumeHardware = target

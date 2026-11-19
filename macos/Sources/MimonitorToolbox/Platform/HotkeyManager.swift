@@ -236,6 +236,22 @@ final class HotkeyManager {
         CGEventSource.flagsState(.combinedSessionState).contains(.maskSecondaryFn)
     }
 
+    /// 只有注册了媒体键或 F1/F2、F10~F12 兜底时才需要查询物理 fn 状态。
+    /// 没有这些绑定时，普通打字不应该每个 keyDown 都进一次 WindowServer。
+    var needsFunctionKeyState: Bool {
+        !mediaBindings.isEmpty || bindings.contains { $0.isMediaFallback }
+    }
+
+    /// 这个 keyCode 是否需要物理 fn 状态。普通打字（字母/数字/普通快捷键）
+    /// 不应该为了媒体键兜底去查 WindowServer。
+    func needsFunctionKeyState(for keyCode: CGKeyCode) -> Bool {
+        if let keyType = Self.mediaKeyType(forKeyCode: Int64(keyCode)),
+           mediaBindings.contains(where: { $0.keyType == keyType }) {
+            return true
+        }
+        return bindings.contains { $0.isMediaFallback && $0.keyCode == keyCode }
+    }
+
     /// 触发回调：参数为绑定 id（cycle 用 action 名，adjust 用 "adjust:<index>"）。
     var onTrigger: ((String) -> Void)?
 
@@ -317,14 +333,17 @@ final class HotkeyManager {
                     manager.receivedKeyEvents += 1
                     manager.onKeyEvent?(event)
                     // fn 组合键是标准功能键（fn+F10 就是 F10），不能按媒体键处理。
-                    let functionKeyDown = manager.isFunctionKeyDown
+                    let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
+                    let functionKeyDown = manager.needsFunctionKeyState(for: keyCode)
+                        ? manager.isFunctionKeyDown : false
                     // 媒体键若以普通 keyDown 到达（keyCode 72/73/74、144/145），先拦下并吞掉，
                     // 否则内置屏/系统音量会跟着变。
                     if manager.handleMediaKeyDown(event, functionKeyDown: functionKeyDown) { return nil }
                     manager.handle(event, functionKeyDown: functionKeyDown)
                 } else if type.rawValue == nxSystemDefinedEventType {
                     // 命中我们注册的媒体键就吞掉（返回 nil）；按住 fn 时原样放行。
-                    if manager.handleSystemDefined(event, functionKeyDown: manager.isFunctionKeyDown) { return nil }
+                    let functionKeyDown = manager.needsFunctionKeyState ? manager.isFunctionKeyDown : false
+                    if manager.handleSystemDefined(event, functionKeyDown: functionKeyDown) { return nil }
                 }
                 return Unmanaged.passUnretained(event)
             },
@@ -381,6 +400,7 @@ final class HotkeyManager {
         guard !mediaBindings.isEmpty, !functionKeyDown else { return false }
         let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
         guard let keyType = Self.mediaKeyType(forKeyCode: keyCode) else { return false }
+        guard mediaBindings.contains(where: { $0.keyType == keyType }) else { return false }
         guard shouldHandleMediaKey?(keyType) ?? true else { return false }
         for binding in mediaBindings where binding.keyType == keyType {
             onTrigger?(binding.id)
@@ -412,6 +432,9 @@ final class HotkeyManager {
         // 只看按下，抬起事件原样放行
         guard isDown else { return false }
         receivedMediaKeyEvents += 1
+        // 没有注册媒体键时不要调用门控：音量门会做 CoreAudio 查询。
+        guard !mediaBindings.isEmpty else { return false }
+        guard mediaBindings.contains(where: { $0.keyType == keyType }) else { return false }
         guard shouldHandleMediaKey?(keyType) ?? true else { return false }
         for binding in mediaBindings where binding.keyType == keyType {
             onTrigger?(binding.id)
