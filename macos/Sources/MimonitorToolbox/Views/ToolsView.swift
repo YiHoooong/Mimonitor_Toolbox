@@ -349,41 +349,33 @@ struct HotkeyConfigSheet: View {
                         }
                         Spacer()
                     }
-                    Text("开启后系统亮度调节键被本应用接管：调暗键减小、调亮键增大显示器背光，内置屏幕不再变亮。需辅助功能权限，且已连接显示器。")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+                    VStack(alignment: .leading, spacing: 12) {
+                        Toggle("使用 macOS 原生亮度提示（OSD）", isOn: $state.mediaBrightnessNativeOSD)
+                            .toggleStyle(.checkbox)
+                            .disabled(!state.mediaBrightnessKeysEnabled)
 
-                    Toggle("使用 macOS 原生亮度提示（OSD）", isOn: $state.mediaBrightnessNativeOSD)
-                        .toggleStyle(.checkbox)
-                        .disabled(!state.mediaBrightnessKeysEnabled)
-                    Text(state.mediaBrightnessNativeOSD
-                         ? "开启后按亮度键弹出系统原生亮度条（与系统亮度键同款），固定 16 格、每按一次一格，步长不可调。"
-                         : "开启后按亮度键弹出系统原生亮度条；关掉则用本应用的悬浮提示。")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-
-                    Toggle("多屏时仅在鼠标位于「\(state.mediaBrightnessDisplayName)」时拦截", isOn: $state.mediaBrightnessFocusOnly)
-                        .toggleStyle(.checkbox)
-                        .disabled(!state.mediaBrightnessKeysEnabled)
-                    HStack(spacing: 8) {
-                        Text("显示器名称")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        TextField("Mi Monitor", text: $state.mediaBrightnessDisplayName)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 200)
-                        Spacer()
+                        Toggle("仅在鼠标位于目标显示器时接管", isOn: $state.mediaBrightnessFocusOnly)
+                            .toggleStyle(.checkbox)
+                            .disabled(!state.mediaBrightnessKeysEnabled)
+                        HStack(spacing: 8) {
+                            Text("显示器名称")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            TextField("Mi Monitor", text: $state.mediaBrightnessDisplayName)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 200)
+                            Spacer()
+                        }
+                        .disabled(!state.mediaBrightnessKeysEnabled || !state.mediaBrightnessFocusOnly)
                     }
-                    .disabled(!state.mediaBrightnessKeysEnabled)
-                    Text("鼠标不在目标显示器上时，亮度键交回系统处理（去调内置屏亮度）。")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+                    .padding(.leading, 22)
+                    .padding(.top, 4)
 
                     Divider().padding(.vertical, 4)
 
                     // 系统音量调节键接管为显示器音量。
                     HStack(spacing: 12) {
-                        Toggle("音量调节键调显示器音量", isOn: $state.mediaVolumeKeysEnabled)
+                        Toggle("音量/静音键调显示器音量", isOn: $state.mediaVolumeKeysEnabled)
                             .toggleStyle(.checkbox)
                         if !state.mediaVolumeNativeOSD {
                             Stepper("步长 \(state.mediaVolumeStep)", value: $state.mediaVolumeStep, in: 1...100)
@@ -392,32 +384,27 @@ struct HotkeyConfigSheet: View {
                         }
                         Spacer()
                     }
-                    Text("开启后音量加减键、静音键接管为显示器音量（0~100，一次一格）；仅在默认音频输出匹配下方设备时生效，其余情况交回系统。需辅助功能权限，且已连接显示器。")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+                    VStack(alignment: .leading, spacing: 12) {
+                        Toggle("使用 macOS 原生音量提示（OSD）", isOn: $state.mediaVolumeNativeOSD)
+                            .toggleStyle(.checkbox)
+                            .disabled(!state.mediaVolumeKeysEnabled)
 
-                    Toggle("使用 macOS 原生音量提示（OSD）", isOn: $state.mediaVolumeNativeOSD)
-                        .toggleStyle(.checkbox)
-                        .disabled(!state.mediaVolumeKeysEnabled)
-                    Text(state.mediaVolumeNativeOSD
-                         ? "开启后按音量键弹出系统原生音量条（与系统音量键同款）；失败自动回退本应用悬浮提示。"
-                         : "开启后按音量键弹出系统原生音量条；关掉则用本应用的悬浮提示。")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-
-                    Toggle("仅当默认音频输出为指定设备时接管", isOn: $state.mediaVolumeOutputGateEnabled)
-                        .toggleStyle(.checkbox)
-                        .disabled(!state.mediaVolumeKeysEnabled)
-                    HStack(spacing: 8) {
-                        Text("音频输出设备名")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        TextField("Mi Monitor", text: $state.mediaVolumeOutputName)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 200)
-                        Spacer()
+                        Toggle("仅当默认音频输出为指定设备时接管", isOn: $state.mediaVolumeOutputGateEnabled)
+                            .toggleStyle(.checkbox)
+                            .disabled(!state.mediaVolumeKeysEnabled)
+                        HStack(spacing: 8) {
+                            Text("音频输出设备名")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            TextField("Mi Monitor", text: $state.mediaVolumeOutputName)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 200)
+                            Spacer()
+                        }
+                        .disabled(!state.mediaVolumeKeysEnabled || !state.mediaVolumeOutputGateEnabled)
                     }
-                    .disabled(!state.mediaVolumeKeysEnabled || !state.mediaVolumeOutputGateEnabled)
+                    .padding(.leading, 22)
+                    .padding(.top, 4)
                 }
                 .padding(16)
             }
@@ -425,7 +412,7 @@ struct HotkeyConfigSheet: View {
             Divider()
 
             HStack(spacing: 12) {
-                Text("点「未设置」后直接按组合键即可录入")
+                Text("点「未设置」后直接按组合键录入；全局快捷键需辅助功能权限")
                     .font(.caption)
                     .foregroundColor(.secondary)
 

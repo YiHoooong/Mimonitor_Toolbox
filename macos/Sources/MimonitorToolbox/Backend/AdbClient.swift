@@ -148,6 +148,18 @@ final class AdbClient {
         return connectionMode == .daemon
     }
 
+    /// Daemon 通道是否已就绪，可用于亮度键这类低延迟写入。
+    /// 真正的请求仍会走 `ensureDaemon` 探活；这里只用来决定是否启用快速跟随路径。
+    var isDaemonChannelReady: Bool {
+        daemonStateLock.lock()
+        defer { daemonStateLock.unlock() }
+        return connectionMode == .daemon
+            && daemonReady
+            && daemonForwardPort != nil
+            && daemonIp == ip
+            && !daemonNeedsRestart
+    }
+
     // MARK: - 资源定位
 
     /// 仓库根目录（开发态定位 assets/ 用）。打包成 .app 后走 Bundle.main。
@@ -226,6 +238,22 @@ final class AdbClient {
 
     // MARK: - 进程执行
 
+    /// adb 子进程统一环境：私有 server 端口 + 关闭 mDNS。
+    ///
+    /// 内嵌的 platform-tools 37.x 在 macOS 26 上 mDNS zero-config 会偶发 panic
+    /// （SIGABRT，crash 栈是 libadbmdns_zero_config_driver → FQServiceName::try_from），
+    /// 直接把 adb server 带走：表现为 install 只回一句空错误。
+    /// 本 App 全程按 IP:5555 连接，不需要 mDNS 发现；外部显式设置优先。
+    ///
+    /// server 由 `adb start-server` fork 后环境就定型了，所以所有启动路径
+    /// （普通命令和 `spawnStartServerDetached()`）必须共用这份环境。
+    func adbEnvironment(base: [String: String] = ProcessInfo.processInfo.environment) -> [String: String] {
+        var env = base
+        env["ANDROID_ADB_SERVER_PORT"] = serverPort
+        if env["ADB_MDNS"] == nil { env["ADB_MDNS"] = "0" }
+        return env
+    }
+
     @discardableResult
     func run(_ args: [String], timeout: TimeInterval = 15, useChannelLock: Bool = true) -> ProcessResult {
         if useChannelLock {
@@ -247,9 +275,7 @@ final class AdbClient {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: adbPath)
         process.arguments = args
-        var env = ProcessInfo.processInfo.environment
-        env["ANDROID_ADB_SERVER_PORT"] = serverPort
-        process.environment = env
+        process.environment = adbEnvironment()
 
         let stdout = Pipe()
         let stderr = Pipe()
@@ -552,7 +578,8 @@ final class AdbClient {
         daemonStateLock.lock()
         let shouldStopDaemon = !ip.isEmpty && (daemonIp == ip || daemonIp.isEmpty)
         if shouldStopDaemon {
-            mediaVolumeBinderVerified = nil
+            mediaVolumeSetBinderVerified = nil
+            mediaVolumeMuteBinderVerified = nil
         }
         daemonStateLock.unlock()
         if shouldStopDaemon {
@@ -646,9 +673,7 @@ final class AdbClient {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: adbPath)
         process.arguments = ["start-server"]
-        var env = ProcessInfo.processInfo.environment
-        env["ANDROID_ADB_SERVER_PORT"] = serverPort
-        process.environment = env
+        process.environment = adbEnvironment()
         process.standardOutput = Pipe()
         process.standardError = Pipe()
         try? process.run()
@@ -725,7 +750,8 @@ final class AdbClient {
         daemonJarHealedIp = ""
         daemonRetryAfter = .distantPast
         daemonNeedsRestart = false
-        mediaVolumeBinderVerified = nil
+        mediaVolumeSetBinderVerified = nil
+        mediaVolumeMuteBinderVerified = nil
         daemonStateLock.unlock()
 
         if removeForward, let oldPort, !oldIp.isEmpty {
@@ -1602,7 +1628,10 @@ final class AdbClient {
     static let adjustUnmute = 100
     static let binderShellPackage = "com.android.shell"
 
-    private var mediaVolumeBinderVerified: Bool?
+    /// AudioService 的两个 transaction 是不同方法，必须分别回读验证：
+    /// ROM 可能只改其中一个，不能拿一个的验证结果去信任另一个。
+    private var mediaVolumeSetBinderVerified: Bool?
+    private var mediaVolumeMuteBinderVerified: Bool?
 
     func mediaVolume() -> Int? {
         if isDaemonMode, let q = try? daemonQuery(flags: ["volume"]),
@@ -1652,18 +1681,18 @@ final class AdbClient {
         let clamped = max(0, min(100, target))
         let flags = showUI ? 1 : 0
         if unmuteFirst { _ = adbSetMediaMutedDirect(false, showUI: false) }
-        if mediaVolumeBinderVerified != false {
+        if mediaVolumeSetBinderVerified != false {
             let output = shell("service call audio \(AudioServiceTxn.setStreamVolume) i32 \(Self.streamMusic) i32 \(clamped) i32 \(flags) s16 \(Self.binderShellPackage)")
             if Self.serviceCallSucceeded(output) {
-                if mediaVolumeBinderVerified == nil {
+                if mediaVolumeSetBinderVerified == nil {
                     let applied = mediaVolume() == clamped
-                    mediaVolumeBinderVerified = applied
+                    mediaVolumeSetBinderVerified = applied
                     if applied { return true }
                 } else {
                     return true
                 }
             } else {
-                mediaVolumeBinderVerified = false
+                mediaVolumeSetBinderVerified = false
             }
         }
         applyMediaVolumeByKeyEvent(clamped)
@@ -1691,19 +1720,19 @@ final class AdbClient {
     @discardableResult
     private func adbSetMediaMutedDirect(_ muted: Bool, showUI: Bool) -> Bool {
         let flags = showUI ? 1 : 0
-        if mediaVolumeBinderVerified != false {
+        if mediaVolumeMuteBinderVerified != false {
             let direction = muted ? Self.adjustMute : Self.adjustUnmute
             let output = shell("service call audio \(AudioServiceTxn.adjustStreamVolume) i32 \(Self.streamMusic) i32 \(direction) i32 \(flags) s16 \(Self.binderShellPackage)")
             if Self.serviceCallSucceeded(output) {
-                if mediaVolumeBinderVerified == nil {
+                if mediaVolumeMuteBinderVerified == nil {
                     let applied = mediaMuted() == muted
-                    mediaVolumeBinderVerified = applied
+                    mediaVolumeMuteBinderVerified = applied
                     if applied { return true }
                 } else {
                     return true
                 }
             } else {
-                mediaVolumeBinderVerified = false
+                mediaVolumeMuteBinderVerified = false
             }
         }
         shell("input keyevent KEYCODE_VOLUME_MUTE")
@@ -1793,9 +1822,12 @@ final class AdbClient {
             for sk in settingsKeys {
                 ops.append(.put(key: sk, value: String(to)))
             }
-            if let (ok, _, _) = try? daemonBatch(ops), ok {
-                return
-            }
+            // 只回退失败的那几步。Daemon 以 system_app 运行时 Settings.Global
+            // 写入会被拒（PUT_DENIED），但前面的 JNI_RAMP 已经生效；如果这里
+            // 整体回退到 adbJniRampDirect，会把同一段渐变从旧值再跑一遍，
+            // 表现为“到目标亮度后又闪回旧值、再回到目标”。
+            try? executeDaemonSegmentWithFallback(ops, check: false)
+            return
         }
         adbJniRampDirect(key: key, from: from, to: to, settingsKeys: settingsKeys, upd: upd, stepMs: stepMs, step: step)
     }

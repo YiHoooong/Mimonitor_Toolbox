@@ -11,8 +11,65 @@ import Foundation
 ///   - 经过 eqMac 等虚拟声卡转发：`Mi Monitor (eqMac)`
 /// 所以匹配用「包含」而不是全等，默认关键字 `Mi Monitor` 两种都能命中。
 enum AudioOutputMonitor {
+    private static let cacheLock = NSLock()
+    private static var cachedOutputName: String?
+    private static var cacheEnabled = false
+    private static var listenerInstalled = false
+
+    /// 开始监听默认输出设备变化。App 启动时调用一次；之后音量键门控直接读缓存，
+    /// 避免每次按键都在 CGEventTap 回调里做两次 CoreAudio 查询。
+    static func startObservingDefaultOutput() {
+        cacheLock.lock()
+        let installed = listenerInstalled
+        listenerInstalled = true
+        cacheLock.unlock()
+        guard !installed else { return }
+
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        let status = AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            DispatchQueue.main
+        ) { _, _ in
+            refreshCachedOutputName()
+        }
+        cacheLock.lock()
+        cacheEnabled = status == noErr
+        cacheLock.unlock()
+        refreshCachedOutputName()
+    }
+
+    private static func refreshCachedOutputName() {
+        let name = queryDefaultOutputDeviceName()
+        cacheLock.lock()
+        cachedOutputName = name
+        cacheLock.unlock()
+    }
+
+    private static func cachedOrDefaultOutputName() -> String? {
+        cacheLock.lock()
+        let cached = cachedOutputName
+        let enabled = cacheEnabled
+        cacheLock.unlock()
+        if enabled, let cached { return cached }
+        let name = queryDefaultOutputDeviceName()
+        if enabled {
+            cacheLock.lock()
+            cachedOutputName = name
+            cacheLock.unlock()
+        }
+        return name
+    }
+
     /// 默认输出设备的名称。查不到（无输出设备 / CoreAudio 异常）时返回 nil。
     static func defaultOutputDeviceName() -> String? {
+        queryDefaultOutputDeviceName()
+    }
+
+    private static func queryDefaultOutputDeviceName() -> String? {
         var deviceID = AudioDeviceID(kAudioObjectUnknown)
         var deviceSize = UInt32(MemoryLayout<AudioDeviceID>.size)
         var deviceAddress = AudioObjectPropertyAddress(
@@ -50,6 +107,6 @@ enum AudioOutputMonitor {
 
     /// 便捷入口：直接按当前默认输出设备判断。
     static func defaultOutputMatches(configuredName: String) -> Bool {
-        matches(configuredName: configuredName, outputName: defaultOutputDeviceName())
+        matches(configuredName: configuredName, outputName: cachedOrDefaultOutputName())
     }
 }
