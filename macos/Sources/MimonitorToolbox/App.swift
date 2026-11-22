@@ -181,7 +181,32 @@ private struct MenuBarPanel: View {
                     .font(.callout)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Spacer()
+                Spacer(minLength: 4)
+                if state.selectableKnownDevices.count >= 2 {
+                    Menu {
+                        ForEach(state.selectableKnownDevices) { device in
+                            Button {
+                                state.switchToKnownDevice(device)
+                            } label: {
+                                if state.isConnected && state.adb.ip == device.ip {
+                                    Label(device.label, systemImage: "checkmark")
+                                } else {
+                                    Text(device.label)
+                                }
+                            }
+                            .disabled(state.connectionStatus == .connecting || state.connectionStatus == .scanning)
+                        }
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "arrow.left.arrow.right")
+                            Text("切换")
+                        }
+                        .font(.caption)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .help("切换当前控制的显示器")
+                }
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 8)

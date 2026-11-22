@@ -535,13 +535,14 @@ final class AdbClient {
                 if Date() >= deadline { return nil }
                 Thread.sleep(forTimeInterval: 0.25)
             }
-            guard let model = try? checkedShell("getprop ro.product.model", target: target), !model.isEmpty else { return nil }
-            if model.lowercased().contains("mitv") {
+            guard let output = try? checkedShell(DeviceIdentity.probeShellCommand, target: target),
+                  let identity = DeviceIdentity.parse(shellOutput: output) else { return nil }
+            if identity.model.lowercased().contains("mitv") {
                 unignoreScanIP(targetIP)
             } else {
                 ignoreScanIP(targetIP)
             }
-            return ScannedDevice(ip: targetIP, model: model)
+            return ScannedDevice(ip: targetIP, model: identity.model, serial: identity.serial)
         }
     }
 
@@ -702,14 +703,13 @@ final class AdbClient {
             .output.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    func getDeviceIdentity() -> DeviceIdentity {
+        let raw = shell(DeviceIdentity.probeShellCommand)
+        return DeviceIdentity.parse(shellOutput: raw) ?? DeviceIdentity(model: "", serial: "")
+    }
+
     func getModel() -> String {
-        let raw = shell("getprop ro.product.model").trimmingCharacters(in: .whitespacesAndNewlines)
-        let lower = raw.lowercased()
-        let looksLikeError = raw.isEmpty
-            || lower.contains("error") || lower.contains("offline")
-            || lower.contains("unauthorized") || lower.contains("not found")
-            || lower.contains("adb:")
-        return looksLikeError ? "" : raw
+        getDeviceIdentity().model
     }
 
     func transportWorks() -> Bool {

@@ -5,6 +5,15 @@ import UniformTypeIdentifiers
 struct HomeView: View {
     @EnvironmentObject var state: AppState
     @State private var showModeHelp = false
+    @State private var showAliasPopover = false
+    @State private var aliasDraft = ""
+
+    private var editableDevice: KnownDevice? {
+        let targetIP = state.selectedDevice.isEmpty
+            ? state.ipInput.trimmingCharacters(in: .whitespaces)
+            : state.selectedDevice
+        return state.knownDevice(forIP: targetIP)
+    }
 
     var body: some View {
         ScrollView {
@@ -28,17 +37,70 @@ struct HomeView: View {
                         Spacer()
                     }
                     HStack(spacing: 10) {
-                        Text("已扫描设备:")
+                        Text("显示器列表:")
                         Picker("", selection: Binding(
                             get: { state.selectedDevice },
                             set: { state.selectScannedDevice($0) }
                         )) {
-                            Text("请选择扫描到的显示器...").tag("")
-                            ForEach(state.scannedDevices, id: \.self) { d in
-                                Text(state.scannedDeviceModels[d].map { "\($0) (\(d))" } ?? d).tag(d)
+                            Text("请选择显示器...").tag("")
+                            ForEach(state.devicePickerIPs, id: \.self) { d in
+                                Text(state.deviceDisplayLabel(forIP: d)).tag(d)
                             }
                         }
-                        .frame(width: 220)
+                        .frame(width: 240)
+                        Button {
+                            aliasDraft = editableDevice?.alias ?? ""
+                            showAliasPopover = true
+                        } label: {
+                            Image(systemName: "pencil")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(editableDevice == nil)
+                        .help(editableDevice == nil ? "连接或选中一台显示器后可设置备注" : "编辑当前显示器备注（用于多屏区分）")
+                        .popover(isPresented: $showAliasPopover) {
+                            if let device = editableDevice {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    Text("显示器备注").font(.headline)
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text("型号：\(device.model.isEmpty ? "未知" : device.model)")
+                                        Text("IP：\(device.ip)")
+                                        Text("标识：\(device.identityDescription)")
+                                    }
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                    .textSelection(.enabled)
+
+                                    TextField("例如：左屏 / 主屏", text: $aliasDraft)
+                                        .textFieldStyle(.roundedBorder)
+                                        .onSubmit {
+                                            state.updateDeviceAlias(id: device.id, alias: aliasDraft)
+                                            showAliasPopover = false
+                                        }
+
+                                    HStack(spacing: 8) {
+                                        Button("移除设备", role: .destructive) {
+                                            state.removeKnownDevice(id: device.id)
+                                            showAliasPopover = false
+                                        }
+                                        Spacer()
+                                        if device.hasAlias {
+                                            Button("清空") {
+                                                state.updateDeviceAlias(id: device.id, alias: "")
+                                                showAliasPopover = false
+                                            }
+                                        }
+                                        Button("保存") {
+                                            state.updateDeviceAlias(id: device.id, alias: aliasDraft)
+                                            showAliasPopover = false
+                                        }
+                                        .buttonStyle(.borderedProminent)
+                                    }
+                                }
+                                .padding(14)
+                                .frame(width: 300)
+                            }
+                        }
                         Text("连接状态:")
                         Text(state.statusText).fontWeight(.bold).foregroundColor(state.statusColor)
                         Spacer()

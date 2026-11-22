@@ -101,6 +101,7 @@ final class AppState: ObservableObject {
     @Published var logSeq: Int = 0
     @Published var scannedDevices: [String] = []
     @Published var scannedDeviceModels: [String: String] = [:]
+    @Published var knownDevices: [KnownDevice] = KnownDeviceStore.load()
     @Published var selectedDevice: String = ""
     @Published var activeSource: String = "未知"
     @Published var activeSoundOutput: String = "未知"
@@ -243,6 +244,9 @@ final class AppState: ObservableObject {
     init() {
         AudioOutputMonitor.startObservingDefaultOutput()
         adb.connectionMode = connectionMode
+        if !ipInput.isEmpty, KnownDeviceStore.device(in: knownDevices, matchingIP: ipInput) != nil {
+            selectedDevice = ipInput
+        }
         startPresetFeatures()
         log("系统就绪，等待连接...（连接模式：\(connectionMode.shortLabel)）")
         if FileManager.default.isExecutableFile(atPath: adb.adbPath) {
@@ -453,11 +457,11 @@ final class AppState: ObservableObject {
         runConnectionTask {
             defer { DispatchQueue.main.async { self.monitorChecking = false } }
 
-            let probe = self.adb.transaction { () -> (ok: Bool, state: String, model: String, daemonOk: Bool?) in
+            let probe = self.adb.transaction { () -> (ok: Bool, state: String, model: String, serial: String, daemonOk: Bool?) in
                 guard DispatchQueue.main.sync(execute: {
                     self.connectionIntent.isCurrent(request) && self.connectionIntent.allowsAutomaticRecovery
                 }) else {
-                    return (false, "cancelled", "", nil)
+                    return (false, "cancelled", "", "", nil)
                 }
 
                 if self.adb.ip.isEmpty { self.adb.ip = target }
@@ -467,7 +471,7 @@ final class AppState: ObservableObject {
                     if modeSnapshot == .daemon {
                         daemonOk = (try? self.adb.ensureDaemon(check: false)) ?? false
                     }
-                    return (true, "device", "", daemonOk)
+                    return (true, "device", "", "", daemonOk)
                 }
 
                 if !self.adb.isServerAlive() { self.adb.restartServer() }
@@ -476,7 +480,7 @@ final class AppState: ObservableObject {
                     if !wasConnected && self.adb.ip == target {
                         self.adb.ip = ""
                     }
-                    return (false, state, "", nil)
+                    return (false, state, "", "", nil)
                 }
                 self.adb.unignoreScanIP(target)
                 self.adb.ensureJars()
@@ -484,8 +488,8 @@ final class AppState: ObservableObject {
                 if modeSnapshot == .daemon {
                     daemonOk = (try? self.adb.ensureDaemon(check: false)) ?? false
                 }
-                let model = self.adb.getModel()
-                return (true, state, model, daemonOk)
+                let identity = self.adb.getDeviceIdentity()
+                return (true, state, identity.model, identity.serial, daemonOk)
             }
 
             if probe.state == "cancelled" { return }
@@ -500,7 +504,10 @@ final class AppState: ObservableObject {
                 }
                 if probe.ok {
                     let ip = target
-                    let detail = probe.model.isEmpty ? ip : "\(probe.model) · \(ip)"
+                    if !probe.model.isEmpty || !probe.serial.isEmpty {
+                        self.recordKnownDevice(ip: ip, model: probe.model, serial: probe.serial)
+                    }
+                    let detail = self.connectedDetail(ip: ip, model: probe.model)
                     self.connectionStatus = .connected(detail)
                     if !wasConnected {
                         // 关键：恢复后必须把连接状态也置回已连接，
@@ -662,13 +669,44 @@ final class AppState: ObservableObject {
     func connect(isAuto: Bool = false) {
         let ip = ipInput.trimmingCharacters(in: .whitespaces)
         guard !ip.isEmpty else { log("请输入显示器 IP 地址"); return }
+        let previousIP = adb.ip
+        let isSwitchingDevice = !previousIP.isEmpty && previousIP != ip
+        if isSwitchingDevice {
+            pendingPresetSave?.cancel()
+            pendingPresetSave = nil
+            cancelAllPendingWorkAndTimers()
+            for page in Self.refreshablePages {
+                _ = pageRefreshIntent.begin(page)
+            }
+            currentValues = [:]
+            loadedPages = []
+            loadingPages = []
+            activeSource = "未知"
+            activeSoundOutput = "未知"
+            mediaVolumePreview = nil
+            mediaVolumeHardware = nil
+            mediaVolumeMuted = nil
+            mediaVolumeNeedsUnmute = false
+            mediaMuteToggleInFlight = false
+            memcPrompt = nil
+            guardianMigrationPrompt = false
+            crosshairLastMode = nil
+            hdrLastState = nil
+            stopSourcePolling()
+        }
         let request = connectionIntent.beginConnection()
         UserDefaults.standard.set(ip, forKey: "saved_ip")
         adb.ip = ip
         connectionStatus = .connecting
-        if !isAuto { log("正在连接 \(ip)...") }
+        if !isAuto {
+            let label = deviceDisplayLabel(forIP: ip)
+            log(isSwitchingDevice ? "正在切换显示器至 \(label)..." : "正在连接 \(label)...")
+        }
 
         runConnectionTask {
+            if isSwitchingDevice {
+                _ = self.adb.disconnect(ip: previousIP)
+            }
             let (ok, state) = self.adb.ensureConnected()
 
             if ok {
@@ -681,10 +719,13 @@ final class AppState: ObservableObject {
                     daemonReady = (try? self.adb.ensureDaemon(check: false)) ?? false
                 }
                 guard DispatchQueue.main.sync(execute: { self.connectionIntent.isCurrent(request) }) else { return }
-                let model = self.adb.getModel()
-                let detail = model.isEmpty ? ip : "\(model) · \(ip)"
+                let identity = self.adb.getDeviceIdentity()
+                let model = identity.model
+                let serial = identity.serial
                 DispatchQueue.main.async {
                     guard self.connectionIntent.isCurrent(request) else { return }
+                    self.recordKnownDevice(ip: ip, model: model, serial: serial)
+                    let detail = self.connectedDetail(ip: ip, model: model)
                     self.connectionStatus = .connected(detail)
                     self.log(isAuto ? "启动自动连接成功: \(detail)" : "已连接: \(detail)")
                     if self.connectionMode == .daemon {
@@ -829,11 +870,14 @@ final class AppState: ObservableObject {
                 self.scannedDeviceModels = Dictionary(uniqueKeysWithValues: found.map { ($0.ip, $0.model) })
                 self.connectionStatus = .disconnected
                 let monitors = found.filter(\.isMonitor)
+                for monitor in monitors {
+                    self.recordKnownDevice(ip: monitor.ip, model: monitor.model, serial: monitor.serial)
+                }
                 self.log("扫描完成，发现 \(found.count) 台 ADB 设备，其中 \(monitors.count) 台 MiTV 显示器")
                 if let target = self.connectionIntent.scanConnectionTarget(request: request, devices: found) {
                     self.selectedDevice = target.ip
                     self.ipInput = target.ip
-                    self.log("扫描识别到唯一显示器，自动连接 \(target.label)")
+                    self.log("扫描识别到唯一显示器，自动连接 \(self.deviceDisplayLabel(forIP: target.ip))")
                     self.connect()
                 } else if monitors.count > 1 {
                     self.selectedDevice = ""
@@ -849,10 +893,101 @@ final class AppState: ObservableObject {
     func selectScannedDevice(_ ip: String) {
         guard !ip.isEmpty else { selectedDevice = ""; return }
         if case .connecting = connectionStatus { log("正在连接显示器，请等待连接完成"); return }
+        if case .scanning = connectionStatus { log("正在扫描内网，请等待扫描完成"); return }
         selectedDevice = ip
         ipInput = ip
         guard !isConnected || adb.ip != ip else { return }
         connect()
+    }
+
+    // MARK: - 已知显示器列表与备注管理
+
+    /// 可供切换的已知显示器（排除因 DHCP 冲突被清空 IP、等待重扫的离线占位项）。
+    var selectableKnownDevices: [KnownDevice] {
+        knownDevices.filter { !$0.ip.isEmpty }
+    }
+
+    /// 首页下拉列表展示的 IP 集合：合并已保存的已知显示器 + 本次扫描到的设备（去重保序）。
+    var devicePickerIPs: [String] {
+        var result: [String] = []
+        var seen: Set<String> = []
+        for device in selectableKnownDevices {
+            if seen.insert(device.ip).inserted {
+                result.append(device.ip)
+            }
+        }
+        for ip in scannedDevices {
+            if !ip.isEmpty, seen.insert(ip).inserted {
+                result.append(ip)
+            }
+        }
+        return result
+    }
+
+    func knownDevice(forIP ip: String) -> KnownDevice? {
+        KnownDeviceStore.device(in: knownDevices, matchingIP: ip)
+    }
+
+    func deviceDisplayLabel(forIP ip: String) -> String {
+        if let device = knownDevice(forIP: ip) {
+            return device.label
+        }
+        if let model = scannedDeviceModels[ip], !model.isEmpty {
+            return "\(model) (\(ip))"
+        }
+        return ip
+    }
+
+    func connectedDetail(ip: String, model: String = "") -> String {
+        if let device = knownDevice(forIP: ip) {
+            if device.hasAlias {
+                return "\(device.trimmedAlias) · \(ip)"
+            }
+            let resolvedModel = !model.isEmpty ? model : device.model
+            return resolvedModel.isEmpty ? ip : "\(resolvedModel) · \(ip)"
+        }
+        return model.isEmpty ? ip : "\(model) · \(ip)"
+    }
+
+    func recordKnownDevice(ip: String, model: String, serial: String) {
+        let updated = KnownDeviceStore.upsert(knownDevices, ip: ip, model: model, serial: serial)
+        guard updated != knownDevices else { return }
+        knownDevices = updated
+        KnownDeviceStore.save(updated)
+    }
+
+    func updateDeviceAlias(id: String, alias: String) {
+        let updated = KnownDeviceStore.setAlias(knownDevices, id: id, alias: alias)
+        knownDevices = updated
+        KnownDeviceStore.save(updated)
+        if isConnected, let active = updated.first(where: { $0.id == id && $0.ip == adb.ip }) {
+            connectionStatus = .connected(active.statusDetail)
+        }
+        if let device = updated.first(where: { $0.id == id }) {
+            if device.hasAlias {
+                log("已更新显示器备注：\(device.trimmedAlias) (\(device.ip))")
+            } else {
+                log("已清空显示器备注：\(device.label)")
+            }
+        }
+    }
+
+    func removeKnownDevice(id: String) {
+        let removed = knownDevices.first(where: { $0.id == id })
+        let updated = KnownDeviceStore.remove(knownDevices, id: id)
+        knownDevices = updated
+        KnownDeviceStore.save(updated)
+        if let removed {
+            if !isConnected, selectedDevice == removed.ip {
+                selectedDevice = ""
+            }
+            log("已从设备列表移除：\(removed.label)")
+        }
+    }
+
+    func switchToKnownDevice(_ device: KnownDevice) {
+        guard !device.ip.isEmpty else { return }
+        selectScannedDevice(device.ip)
     }
 
     // MARK: - 改动后的合并刷新

@@ -22,6 +22,30 @@ final class AdbClientTests: XCTestCase {
         }
     }
 
+    func testScanProbeParsesStructuredSerialAlongWithModel() throws {
+        try fake("""
+        case "$1" in
+          connect|disconnect) [ "$2" = "192.168.1.41:5555" ] || exit 2 ;;
+          -s)
+            [ "$2" = "192.168.1.41:5555" ] || exit 2
+            case "$3" in
+              get-state) echo device ;;
+              shell)
+                echo "model=MiTV-MUFF1"
+                echo "serial=SN-LEFT-001"
+                echo "boot_serial=SN-LEFT-001"
+                echo "wlan_mac=aa:bb:cc:dd:ee:ff"
+                echo "eth_mac="
+                ;;
+            esac ;;
+          *) exit 2 ;;
+        esac
+        """) { client in
+            let device = client.probeScannedDevice(ip: "192.168.1.41")
+            XCTAssertEqual(device, ScannedDevice(ip: "192.168.1.41", model: "MiTV-MUFF1", serial: "SN-LEFT-001"))
+        }
+    }
+
     func testScanProbeRejectsUnauthorizedAndFailedModelReads() throws {
         try fake("""
         case "$3" in
