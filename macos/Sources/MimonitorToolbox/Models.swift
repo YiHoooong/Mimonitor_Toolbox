@@ -68,9 +68,45 @@ enum RegisterMap {
         return table[primary] ?? primary
     }
 
+    /// 是否为标准/游戏组下的专业或游戏子场景（恢复默认后 MTK 会跳回主模式，需自动切回）
+    static let presetSubScenarioModes: Set<Int> = [
+        25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
+        64, 65, 66, 67, 68, 69, 70, 71, 72, 73,
+    ]
+
     /// 是否处于「仅关闭画面 / 音响模式」（MTK g_audio__audio only / power_picture_off == 0，亮屏为 1）
     static func isScreenOffOnline(_ values: [String: String]) -> Bool {
         values["power_picture_off"]?.trimmingCharacters(in: .whitespacesAndNewlines) == "0"
+    }
+
+    /// 将设备端实时推送的变更键映射为需要刷新的页面名数组（按优先级排序）
+    static func classifyWatchedKeyPages(_ key: String) -> [String] {
+        let k = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !k.isEmpty else { return [] }
+        if k == "picture_mode" || k == "picture_preset_scenario"
+            || k == "power_picture_off" || k == "jni:g_video__picture_mode" {
+            return ["picture", "game"]
+        }
+        if k == "mitv.tvplayer.hdmi.last.source" {
+            return ["source", "game", "picture"]
+        }
+        if k == soundOutputKey {
+            return ["source"]
+        }
+        if k == "front_sight_index" || k.hasPrefix("mt_game_") || k.hasPrefix("monitor_menu_")
+            || k == "jni:g_video__freesync_switch" || k == "jni:g_video__dp_adaptive_sync"
+            || k == "jni:g_fusion_picture__hdmi_edid_version" || k == "jni:g_fusion_picture__dp_edid_version" {
+            return ["game"]
+        }
+        if k.hasPrefix("atmosphere_light_") {
+            return ["light"]
+        }
+        if k.hasPrefix("picture_") || k.hasPrefix("xiaomi_picture_")
+            || k.hasPrefix("tv_picture_") || k.hasPrefix("settings_display_hdr_")
+            || k.hasPrefix("jni:g_disp__") || k.hasPrefix("jni:g_video__") {
+            return ["picture"]
+        }
+        return []
     }
 
     /// 组名（移植自 _picture_mode_group_name）

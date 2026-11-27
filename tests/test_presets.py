@@ -234,7 +234,7 @@ class ItemWriteSequenceTests(unittest.TestCase):
         """色温 settings 存小米枚举、JNI 存 MTK 枚举，必须映射。"""
         calls = self._calls_for(full_values(color_temp=2))
         self.assertIn(("jni_set", "g_video__clr_temp", 3, 3, True), calls)
-        self.assertIn(("put", "picture_color_temperature", "2", True), calls)
+        self.assertIn(("put", "picture_color_temperature", "3", True), calls)
 
     def test_hdr_tone_mapping_writes_both_enums_separately(self):
         """两个键存不同枚举：MTK 5 / UI 0，不能写同一份值。"""

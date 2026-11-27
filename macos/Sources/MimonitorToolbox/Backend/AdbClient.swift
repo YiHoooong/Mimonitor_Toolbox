@@ -84,9 +84,18 @@ final class AdbClient {
     private var daemonForwardPort: Int?
     private var daemonPutSupported: Bool?
     private var daemonVolSupported: Bool?
+    private var daemonWatchSupported: Bool = false
     private var daemonJarHealedIp: String = ""
     private var daemonRetryAfter: Date = .distantPast
     private var daemonNeedsRestart: Bool = false
+
+    private let watchLock = NSLock()
+    private var watchGeneration: Int = 0
+    private var watchFd: Int32 = -1
+    private var watchTargetIp: String = ""
+    private var watchTargetPort: Int = 0
+    private var watchCallback: ((String, String, String) -> Void)?
+    private var lastWriteUptime: TimeInterval = 0
 
     private var batchDepth: Int = 0
     private var batchOps: [DaemonBatchOp] = []
@@ -738,7 +747,231 @@ final class AdbClient {
         return mode
     }
 
+    var lastLocalWriteUptime: TimeInterval {
+        daemonStateLock.lock()
+        defer { daemonStateLock.unlock() }
+        return lastWriteUptime
+    }
+
+    private func noteLocalWrite() {
+        daemonStateLock.lock()
+        lastWriteUptime = ProcessInfo.processInfo.systemUptime
+        daemonStateLock.unlock()
+    }
+
+    func setDaemonEventCallback(_ callback: ((String, String, String) -> Void)?) {
+        watchLock.lock()
+        watchCallback = callback
+        watchLock.unlock()
+    }
+
+    func stopDaemonWatch() {
+        watchLock.lock()
+        watchGeneration &+= 1
+        let fd = watchFd
+        watchFd = -1
+        watchTargetIp = ""
+        watchTargetPort = 0
+        watchLock.unlock()
+        if fd >= 0 {
+            _ = shutdown(fd, Int32(SHUT_RDWR))
+            _ = close(fd)
+        }
+    }
+
+    @discardableResult
+    func startDaemonWatch(keys: [String] = []) -> Bool {
+        guard isDaemonMode else { return false }
+        lifecycleLock.lock()
+        let blocked = spawnBlocked
+        lifecycleLock.unlock()
+        if blocked { return false }
+
+        daemonStateLock.lock()
+        let activeIp = ip
+        let dIp = daemonIp
+        let port = daemonForwardPort
+        let ready = daemonReady
+        let supported = daemonWatchSupported
+        daemonStateLock.unlock()
+        guard !activeIp.isEmpty, ready, dIp == activeIp, let port, port > 0, supported else {
+            return false
+        }
+
+        watchLock.lock()
+        guard watchCallback != nil else {
+            watchLock.unlock()
+            return false
+        }
+        if watchFd >= 0 && watchTargetIp == activeIp && watchTargetPort == port {
+            watchLock.unlock()
+            return true
+        }
+        watchLock.unlock()
+
+        stopDaemonWatch()
+
+        watchLock.lock()
+        watchGeneration &+= 1
+        let myGen = watchGeneration
+        watchTargetIp = activeIp
+        watchTargetPort = port
+        watchLock.unlock()
+
+        let safeKeys = keys.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            self?.runDaemonWatchLoop(generation: myGen, targetIp: activeIp, port: port, keys: safeKeys)
+        }
+        return true
+    }
+
+    private func runDaemonWatchLoop(generation: Int, targetIp: String, port: Int, keys: [String]) {
+        var addr = sockaddr_in()
+        #if canImport(Darwin)
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        #endif
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = in_port_t(UInt16(port)).bigEndian
+        guard "127.0.0.1".withCString({ inet_pton(AF_INET, $0, &addr.sin_addr) }) == 1 else {
+            return
+        }
+
+        let fd = socket(AF_INET, tcpStreamType, 0)
+        guard fd >= 0 else { return }
+
+        var keepAlive: Int32 = 1
+        _ = setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepAlive, socklen_t(MemoryLayout<Int32>.size))
+        let flags = fcntl(fd, F_GETFL, 0)
+        guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) >= 0 else {
+            _ = close(fd)
+            return
+        }
+
+        let connectRes = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                posixConnect(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if connectRes != 0 {
+            guard errno == EINPROGRESS else {
+                _ = close(fd)
+                return
+            }
+            var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+            guard poll(&pfd, 1, 2000) > 0 else {
+                _ = close(fd)
+                return
+            }
+            var soErr: Int32 = 0
+            var soLen = socklen_t(MemoryLayout<Int32>.size)
+            guard getsockopt(fd, SOL_SOCKET, SO_ERROR, &soErr, &soLen) == 0, soErr == 0 else {
+                _ = close(fd)
+                return
+            }
+        }
+
+        watchLock.lock()
+        guard watchGeneration == generation else {
+            watchLock.unlock()
+            _ = close(fd)
+            return
+        }
+        watchFd = fd
+        watchLock.unlock()
+
+        defer {
+            watchLock.lock()
+            let stillMine = (watchGeneration == generation && watchFd == fd)
+            if stillMine {
+                watchFd = -1
+                watchTargetIp = ""
+                watchTargetPort = 0
+            }
+            watchLock.unlock()
+            if stillMine {
+                _ = close(fd)
+            }
+        }
+
+        var reqLines = ["SUBSCRIBE"]
+        if !keys.isEmpty {
+            reqLines.append("KEYS " + keys.joined(separator: " "))
+        }
+        reqLines.append("END")
+        let reqData = Data((reqLines.joined(separator: "\n") + "\n").utf8)
+        var sent = 0
+        while sent < reqData.count {
+            let n = reqData.withUnsafeBytes { raw -> Int in
+                guard let base = raw.baseAddress else { return -1 }
+                return send(fd, base.advanced(by: sent), reqData.count - sent, 0)
+            }
+            if n > 0 {
+                sent += n
+            } else if n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+                var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+                if poll(&pfd, 1, 2000) <= 0 { return }
+            } else {
+                return
+            }
+        }
+
+        var buffer = Data()
+        var acked = false
+        var tmp = [UInt8](repeating: 0, count: 1024)
+        while true {
+            watchLock.lock()
+            let active = (watchGeneration == generation)
+            watchLock.unlock()
+            if !active { return }
+
+            var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let waitMs: Int32 = acked ? 35000 : 3000
+            let pr = poll(&pfd, 1, waitMs)
+            if pr <= 0 {
+                if pr < 0 && errno == EINTR { continue }
+                return
+            }
+            let n = recv(fd, &tmp, tmp.count, 0)
+            if n <= 0 {
+                if n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                    continue
+                }
+                return
+            }
+            buffer.append(tmp, count: n)
+            while let nl = buffer.firstIndex(of: 0x0A) {
+                let lineData = buffer[..<nl]
+                buffer.removeSubrange(...nl)
+                let line = String(decoding: lineData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !acked {
+                    guard line.hasPrefix("OK SUBSCRIBED") else { return }
+                    acked = true
+                    continue
+                }
+                if line.isEmpty || line == "HEARTBEAT" { continue }
+                if line.hasPrefix("EVENT ") {
+                    let body = String(line.dropFirst(6))
+                    let key: String
+                    let val: String
+                    if let eq = body.firstIndex(of: "=") {
+                        key = String(body[..<eq]).trimmingCharacters(in: .whitespaces)
+                        val = String(body[body.index(after: eq)...])
+                    } else {
+                        key = body.trimmingCharacters(in: .whitespaces)
+                        val = ""
+                    }
+                    guard !key.isEmpty else { continue }
+                    watchLock.lock()
+                    let cb = (watchGeneration == generation) ? watchCallback : nil
+                    watchLock.unlock()
+                    cb?(targetIp, key, val)
+                }
+            }
+        }
+    }
+
     func resetDaemonState(removeForward: Bool = true, nonBlockingForwardRemoval: Bool = false) {
+        stopDaemonWatch()
         daemonStateLock.lock()
         let oldPort = daemonForwardPort
         let oldIp = daemonIp
@@ -747,6 +980,7 @@ final class AdbClient {
         daemonForwardPort = nil
         daemonPutSupported = nil
         daemonVolSupported = nil
+        daemonWatchSupported = false
         daemonJarHealedIp = ""
         daemonRetryAfter = .distantPast
         daemonNeedsRestart = false
@@ -843,6 +1077,7 @@ final class AdbClient {
     private func parseDaemonPong(_ pongLine: String) {
         daemonStateLock.lock()
         defer { daemonStateLock.unlock() }
+        var watchCap = false
         for token in pongLine.split(whereSeparator: \.isWhitespace) {
             if token == "put=0" {
                 daemonPutSupported = false
@@ -852,8 +1087,13 @@ final class AdbClient {
                 daemonVolSupported = false
             } else if token == "vol=1" {
                 daemonVolSupported = true
+            } else if token == "watch=1" {
+                watchCap = true
+            } else if token == "watch=0" {
+                watchCap = false
             }
         }
+        daemonWatchSupported = watchCap
     }
 
     @discardableResult
@@ -893,6 +1133,7 @@ final class AdbClient {
                     daemonStateLock.lock()
                     daemonRetryAfter = .distantPast
                     daemonStateLock.unlock()
+                    startDaemonWatch()
                     return true
                 }
                 daemonStateLock.lock()
@@ -948,6 +1189,7 @@ final class AdbClient {
                     daemonReady = true
                     daemonRetryAfter = .distantPast
                     daemonStateLock.unlock()
+                    startDaemonWatch()
                     return true
                 }
                 _ = daemonSocketRequest("QUIT\n", timeout: 0.8)
@@ -989,6 +1231,7 @@ final class AdbClient {
                     daemonReady = true
                     daemonRetryAfter = .distantPast
                     daemonStateLock.unlock()
+                    startDaemonWatch()
                     return true
                 }
             }
@@ -1171,8 +1414,11 @@ final class AdbClient {
 
         let resp: [String]? = try transaction {
             guard try ensureDaemon(check: check) else { return nil }
+            noteLocalWrite()
             // 不对已发送写入载荷的超时/断连盲目重放，防止写操作重复触发
-            return daemonSocketRequest(payload, timeout: batchTimeout)
+            let out = daemonSocketRequest(payload, timeout: batchTimeout)
+            noteLocalWrite()
+            return out
         }
         guard let resp, let head = resp.first else {
             return (false, nil, [])
@@ -1792,6 +2038,7 @@ final class AdbClient {
     }
 
     func jniSet(key: String, value: String, upd: Int = 3) {
+        noteLocalWrite()
         if let intVal = Int(value.trimmingCharacters(in: .whitespacesAndNewlines)) {
             if recordOrRun(.jniSet(key: key, value: intVal, upd: upd)) { return }
             if isDaemonMode, let (ok, _, _) = try? daemonBatch([.jniSet(key: key, value: intVal, upd: upd)]), ok {
@@ -1800,10 +2047,12 @@ final class AdbClient {
         }
         let jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
         shell(buildTvserviceCommand(jar: jar, args: ["MtkDirectTool", "set", key, value, String(upd)]))
+        noteLocalWrite()
     }
 
     func jniRamp(key: String, from: Int, to: Int, settingsKeys: [String] = [],
                  upd: Int = 3, stepMs: Int = 0, step: Int = 1) {
+        noteLocalWrite()
         daemonStateLock.lock()
         let inBatch = connectionMode == .daemon && batchDepth > 0
         if inBatch {
@@ -1850,6 +2099,7 @@ final class AdbClient {
     }
 
     func hdrToneMapping(_ value: String, upd: Int = 3) {
+        noteLocalWrite()
         if let intVal = Int(value.trimmingCharacters(in: .whitespacesAndNewlines)) {
             if recordOrRun(.hdrToneMapping(value: intVal, upd: upd)) { return }
             if isDaemonMode, let (ok, _, _) = try? daemonBatch([.hdrToneMapping(value: intVal, upd: upd)]), ok {
@@ -1858,9 +2108,11 @@ final class AdbClient {
         }
         let jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
         shell(buildTvserviceCommand(jar: jar, args: ["MtkDirectTool", "setHdrToneMapping", value, String(upd)]))
+        noteLocalWrite()
     }
 
     func setColorGains(red: String, green: String, blue: String) {
+        noteLocalWrite()
         if let r = Int(red), let g = Int(green), let b = Int(blue) {
             if recordOrRun(.colorGains(red: r, green: g, blue: b)) { return }
             if isDaemonMode, let (ok, _, _) = try? daemonBatch([.colorGains(red: r, green: g, blue: b)]), ok {
@@ -1869,9 +2121,11 @@ final class AdbClient {
         }
         let jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
         shell(buildTvserviceCommand(jar: jar, args: ["MtkDirectTool", "setColorGains", red, green, blue]))
+        noteLocalWrite()
     }
 
     func setSoundOutput(_ deviceId: Int, target: String? = nil) throws {
+        noteLocalWrite()
         let resolvedTarget = (target?.isEmpty == false) ? target! : serial
         if resolvedTarget == serial {
             if recordOrRun(.soundOutput(deviceId: deviceId)) { return }
@@ -1884,10 +2138,12 @@ final class AdbClient {
             buildTvserviceCommand(jar: jar, args: ["MtkDirectTool", "setSoundOutput", String(deviceId)]),
             target: resolvedTarget
         )
+        noteLocalWrite()
     }
 
     /// 优先通过 MtkDirectTool.jar（Daemon / CLI）切换输入信号源，失败时回退原始 ADB。
     func setInputSource(_ sourceId: Int, target: String? = nil, check: Bool = true) throws {
+        noteLocalWrite()
         let resolvedTarget = (target?.isEmpty == false) ? target! : serial
         if resolvedTarget == serial {
             if recordOrRun(.setSource(sourceId: sourceId)) { return }
@@ -2061,6 +2317,11 @@ final class AdbClient {
         }
 
         if pushed || cacheSize != localSize {
+            if filename == "MtkDirectTool.jar" {
+                daemonStateLock.lock()
+                daemonNeedsRestart = true
+                daemonStateLock.unlock()
+            }
             let cpOut = shell(buildTvserviceShellCommand(parts: ["cp", sdcardJar, cacheJar]))
             if Self.hasAdbDisconnectMarker(cpOut) {
                 return false

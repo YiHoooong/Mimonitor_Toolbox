@@ -288,8 +288,9 @@ def _apply_color_temp(adb, values):
     ui_value = _as_int(values, "picture_color_temperature")
     if ui_value not in XIAOMI_TO_MTK_COLOR_TEMP:
         raise ValueError(f"未知色温枚举 {ui_value}")
-    adb.jni_set("g_video__clr_temp", XIAOMI_TO_MTK_COLOR_TEMP[ui_value], check=True)
-    adb.put("picture_color_temperature", str(ui_value), check=True)
+    mtk_value = XIAOMI_TO_MTK_COLOR_TEMP[ui_value]
+    adb.jni_set("g_video__clr_temp", mtk_value, check=True)
+    adb.put("picture_color_temperature", str(mtk_value), check=True)
     adb.refresh_pq(check=True)
 
 
@@ -301,8 +302,9 @@ def _apply_color_gains(adb, values):
     for name in (red, green, blue):
         if not 524 <= name <= 1524:
             raise ValueError(f"色增益 {name} 超出 524-1524")
-    adb.jni_set("g_video__clr_temp", XIAOMI_TO_MTK_COLOR_TEMP[CUSTOM_COLOR_TEMP_VALUE], check=True)
-    adb.put("picture_color_temperature", str(CUSTOM_COLOR_TEMP_VALUE), check=True)
+    custom_mtk = XIAOMI_TO_MTK_COLOR_TEMP[CUSTOM_COLOR_TEMP_VALUE]
+    adb.jni_set("g_video__clr_temp", custom_mtk, check=True)
+    adb.put("picture_color_temperature", str(custom_mtk), check=True)
     adb.jni_set_color_gains(red, green, blue, check=True)
     adb.put("picture_red_gain", str(red), check=True)
     adb.put("picture_green_gain", str(green), check=True)

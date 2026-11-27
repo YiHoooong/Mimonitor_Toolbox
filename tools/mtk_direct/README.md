@@ -26,9 +26,14 @@ It provides:
 - `getSoundOutput` reads current `IAudioService` `xmGetForceUse(1)`,
   `isHdmiSystemAudioSupported()`, `xmfeaspdifdet`, and `ITvService.getSoundOutputDevice()` (tx 34).
 
+- `daemon [port]` runs the resident loopback TCP service (`PING` / `QUERY` / `BATCH` / `SUBSCRIBE` / `QUIT`).
+  `SUBSCRIBE` attaches zero-polling native `MtkTvTVCallbackHandler` (`MtkTvWatchBridge`) and `FileObserver`
+  watchers while clients are connected and unregisters them automatically when the last subscriber disconnects.
+
 The color gain command uses the factory white-balance API
 `MtkTvFApiDisplay.setWbGainOffsetEx(...)` so red, green, and blue are committed
 as one group. Writing the three `g_video__clr_gain_*` keys independently can
 make the firmware restore untouched channels to `1024`.
 
-Rebuild the bundled jar from `MtkDirectTool.java` after changing this source.
+Rebuild the bundled jar from `MtkDirectTool.java` + `MtkTvWatchBridge.java` (compiling against `stubs/`
+and excluding `com/mediatek/...` stubs from `d8`) after changing this source.

@@ -270,4 +270,15 @@ final class AdbClientTests: XCTestCase {
         XCTAssertFalse(RegisterMap.isScreenOffOnline(["power_picture_off": ""]))
         XCTAssertFalse(RegisterMap.isScreenOffOnline([:]))
     }
+
+    func testClassifyWatchedKeyPagesMapsDeviceEventsToTargetPages() {
+        XCTAssertEqual(RegisterMap.classifyWatchedKeyPages("picture_mode"), ["picture", "game"])
+        XCTAssertEqual(RegisterMap.classifyWatchedKeyPages("picture_preset_scenario"), ["picture", "game"])
+        XCTAssertEqual(RegisterMap.classifyWatchedKeyPages("power_picture_off"), ["picture", "game"])
+        XCTAssertEqual(RegisterMap.classifyWatchedKeyPages("jni:g_disp__disp_back_light"), ["picture"])
+        XCTAssertEqual(RegisterMap.classifyWatchedKeyPages("front_sight_index"), ["game"])
+        XCTAssertEqual(RegisterMap.classifyWatchedKeyPages("mitv.tvplayer.hdmi.last.source"), ["source", "game", "picture"])
+        XCTAssertEqual(RegisterMap.classifyWatchedKeyPages("atmosphere_light_color_value"), ["light"])
+        XCTAssertEqual(RegisterMap.classifyWatchedKeyPages("unrelated_key"), [])
+    }
 }

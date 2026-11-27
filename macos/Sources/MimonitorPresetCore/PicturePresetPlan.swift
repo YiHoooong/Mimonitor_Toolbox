@@ -193,14 +193,14 @@ public enum PicturePresetPlan {
         item("色温") {
             let value = try number("picture_color_temperature")
             guard let mtk = colorTempToMtk[value] else { throw PresetError("未知色温枚举") }
-            return [.jni("g_video__clr_temp", String(mtk), 3), .setting("picture_color_temperature", String(value)), .refresh]
+            return [.jni("g_video__clr_temp", String(mtk), 3), .setting("picture_color_temperature", String(mtk)), .refresh]
         }
         if (try? number("picture_color_temperature")) == 3 {
             item("色增益") {
                 let r = try text("picture_red_gain", range: 524...1524)
                 let g = try text("picture_green_gain", range: 524...1524)
                 let b = try text("picture_blue_gain", range: 524...1524)
-                return [.jni("g_video__clr_temp", "0", 3), .setting("picture_color_temperature", "3"),
+                return [.jni("g_video__clr_temp", "0", 3), .setting("picture_color_temperature", "0"),
                         .colorGains(r, g, b), .setting("picture_red_gain", r),
                         .setting("picture_green_gain", g), .setting("picture_blue_gain", b), .refresh]
             }

@@ -546,6 +546,38 @@ def is_screen_off_online(values):
         return int(str(raw).strip()) == 0
     except (TypeError, ValueError):
         return False
+
+
+def classify_watched_key_pages(key):
+    """将设备端实时推送的变更键映射为需要静默刷新的页面名元组（按优先级排序）。"""
+    k = str(key or "").strip()
+    if not k:
+        return ()
+    if k in ("picture_mode", "picture_preset_scenario", "power_picture_off", "jni:g_video__picture_mode"):
+        return ("picturePage", "gamePage")
+    if k == "mitv.tvplayer.hdmi.last.source":
+        return ("sourcePage", "gamePage", "picturePage")
+    if k == SOUND_OUTPUT_SETTINGS_KEY:
+        return ("sourcePage",)
+    if k in GAME_FEATURE_KEYS or k in MONITOR_MENU_KEYS or k in (
+        "jni:g_video__freesync_switch",
+        "jni:g_video__dp_adaptive_sync",
+        "jni:g_fusion_picture__hdmi_edid_version",
+        "jni:g_fusion_picture__dp_edid_version",
+    ):
+        return ("gamePage",)
+    if k in SCREEN_LIGHT_KEYS:
+        return ("lightPage",)
+    if (
+        k.startswith("picture_")
+        or k.startswith("xiaomi_picture_")
+        or k.startswith("tv_picture_")
+        or k.startswith("settings_display_hdr_")
+        or k.startswith("jni:g_disp__")
+        or k.startswith("jni:g_video__")
+    ):
+        return ("picturePage",)
+    return ()
 GAME_FEATURE_KEYS = (
     "front_sight_index",
     "mt_game_dynamic_ft",

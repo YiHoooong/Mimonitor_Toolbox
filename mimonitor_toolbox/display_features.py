@@ -2369,10 +2369,20 @@ class DisplayFeaturesMixin:
         w.deleteLater()
         if accepted:
             self._mark_adb_busy(4.0)
+            is_sub_scenario = cur_int in {
+                25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
+                64, 65, 66, 67, 68, 69, 70, 71, 72, 73,
+            }
 
             def operation():
                 with self.adb.transaction():
                     self.adb.jni_set("g_fusion_picture__pic_reset_def_bypicmode", 0, check=True)
+                    if is_sub_scenario:
+                        # MTK 底层 reset_def_bypicmode 重置完当前子场景参数后会把 mode 跳回主模式(个人设定)，
+                        # 紧接着写回原 mode/preset_scenario 即可留在已恢复默认的当前子场景内。
+                        time.sleep(0.35)
+                        self.adb.put("picture_mode", str(cur_int), check=True)
+                        self.adb.put("picture_preset_scenario", str(cur_int), check=True)
                     self.adb.refresh_pq(check=True)
 
             def success():
@@ -2937,7 +2947,7 @@ class DisplayFeaturesMixin:
         def operation():
             with _batch_tx(self.adb):
                 self.adb.jni_set("g_video__clr_temp", jv, check=True)
-                self.adb.put("picture_color_temperature", str(sv), check=True)
+                self.adb.put("picture_color_temperature", str(jv), check=True)
                 self.adb.refresh_pq(check=True)
 
         def success():
@@ -3025,8 +3035,9 @@ class DisplayFeaturesMixin:
             final_gains = {**resolved, **known_gains}
             with _batch_tx(self.adb):
                 if not was_custom:
-                    self.adb.jni_set("g_video__clr_temp", XIAOMI_TO_MTK_COLOR_TEMP[CUSTOM_COLOR_TEMP_VALUE], check=True)
-                    self.adb.put("picture_color_temperature", str(CUSTOM_COLOR_TEMP_VALUE), check=True)
+                    custom_mtk = XIAOMI_TO_MTK_COLOR_TEMP[CUSTOM_COLOR_TEMP_VALUE]
+                    self.adb.jni_set("g_video__clr_temp", custom_mtk, check=True)
+                    self.adb.put("picture_color_temperature", str(custom_mtk), check=True)
                 self.adb.jni_set_color_gains(
                     final_gains["picture_red_gain"],
                     final_gains["picture_green_gain"],

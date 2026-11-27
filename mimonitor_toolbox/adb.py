@@ -462,9 +462,17 @@ class Adb:
         self._daemon_forward_port = None
         self._daemon_put_supported = None
         self._daemon_vol_supported = None
+        self._daemon_watch_supported = False
         self._daemon_jar_healed_ip = ""
         self._daemon_retry_after = 0.0
         self._daemon_needs_restart = False
+        self.last_write_monotonic = 0.0
+        self._watch_lock = threading.Lock()
+        self._watch_stop_event = None
+        self._watch_socket = None
+        self._watch_thread = None
+        self._watch_target = None
+        self._watch_callback = None
         self._batch_depth = 0
         self._batch_ops = []
         self._batch_check_required = False
@@ -498,7 +506,137 @@ class Adb:
         with self._state_lock:
             return self.connection_mode == CONNECTION_MODE_DAEMON
 
+    def _note_local_write(self):
+        self.last_write_monotonic = time.monotonic()
+
+    def set_daemon_event_callback(self, callback):
+        with self._watch_lock:
+            self._watch_callback = callback if callable(callback) else None
+
+    def stop_daemon_watch(self):
+        with self._watch_lock:
+            stop_evt = self._watch_stop_event
+            sock = self._watch_socket
+            self._watch_stop_event = None
+            self._watch_socket = None
+            self._watch_thread = None
+            self._watch_target = None
+        if stop_evt is not None:
+            stop_evt.set()
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def start_daemon_watch(self, keys=()):
+        if not self.is_daemon_mode():
+            return False
+        with _adb_process_lock:
+            if _adb_spawn_blocked:
+                return False
+        with self._state_lock:
+            ip = self._ip
+            daemon_ip = self._daemon_ip
+            port = self._daemon_forward_port
+            ready = self._daemon_ready
+            watch_supported = self._daemon_watch_supported
+        if not ip or not ready or daemon_ip != ip or not port or not watch_supported:
+            return False
+        with self._watch_lock:
+            callback = self._watch_callback
+            if callback is None:
+                return False
+            target = (ip, int(port))
+            if (
+                self._watch_target == target
+                and self._watch_thread is not None
+                and self._watch_thread.is_alive()
+            ):
+                return True
+        self.stop_daemon_watch()
+
+        safe_keys = [
+            self._validate_daemon_token(k, "watch key")
+            for k in (keys or ())
+            if str(k).strip()
+        ]
+        stop_evt = threading.Event()
+        target = (ip, int(port))
+
+        def _watch_loop():
+            sock = None
+            try:
+                sock = socket.create_connection(("127.0.0.1", int(port)), timeout=2.0)
+                with self._watch_lock:
+                    if stop_evt.is_set() or self._watch_stop_event is not stop_evt:
+                        return
+                    self._watch_socket = sock
+                sock.settimeout(3.0)
+                lines = ["SUBSCRIBE"]
+                if safe_keys:
+                    lines.append("KEYS " + " ".join(safe_keys))
+                lines.append("END")
+                sock.sendall(("\n".join(lines) + "\n").encode("utf-8"))
+                with sock.makefile("r", encoding="utf-8", errors="replace") as reader:
+                    ack = reader.readline()
+                    if not ack or not ack.strip().startswith("OK SUBSCRIBED"):
+                        return
+                    # 服务端每 20s 发一次 HEARTBEAT，35s 无数据则判定隧道断开自动退出
+                    sock.settimeout(35.0)
+                    for raw_line in reader:
+                        if stop_evt.is_set():
+                            break
+                        line = raw_line.strip()
+                        if not line or line == "HEARTBEAT":
+                            continue
+                        if line.startswith("EVENT "):
+                            body = line[6:]
+                            if "=" in body:
+                                k, v = body.split("=", 1)
+                            else:
+                                k, v = body, ""
+                            k = k.strip()
+                            if not k:
+                                continue
+                            with self._watch_lock:
+                                cb = self._watch_callback
+                            if cb is not None and not stop_evt.is_set():
+                                try:
+                                    cb(ip, k, v)
+                                except Exception:
+                                    pass
+            except OSError:
+                pass
+            except Exception:
+                pass
+            finally:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                with self._watch_lock:
+                    if self._watch_stop_event is stop_evt:
+                        self._watch_stop_event = None
+                        self._watch_socket = None
+                        self._watch_thread = None
+                        self._watch_target = None
+
+        thread = threading.Thread(target=_watch_loop, name="mtk-watch-client", daemon=True)
+        with self._watch_lock:
+            self._watch_stop_event = stop_evt
+            self._watch_target = target
+            self._watch_thread = thread
+        thread.start()
+        return True
+
     def _reset_daemon_state(self):
+        self.stop_daemon_watch()
         with self._state_lock:
             old_ip = self._daemon_ip
             old_port = self._daemon_forward_port
@@ -508,6 +646,7 @@ class Adb:
             self._daemon_forward_port = None
             self._daemon_put_supported = None
             self._daemon_vol_supported = None
+            self._daemon_watch_supported = False
             self._daemon_jar_healed_ip = ""
             self._daemon_retry_after = 0.0
             self._daemon_needs_restart = False
@@ -522,16 +661,20 @@ class Adb:
 
     def set_connection_mode(self, mode):
         normalized = normalize_connection_mode(mode)
+        leaving_daemon = False
         with self._state_lock:
             self._daemon_retry_after = 0.0
             if normalized != self.connection_mode:
                 self.connection_mode = normalized
                 if normalized != CONNECTION_MODE_DAEMON:
+                    leaving_daemon = True
                     self._batch_depth = 0
                     self._batch_check_required = False
                     self._batch_ops.clear()
                     self._batch_read_cache.clear()
                     self._batch_jni_cache.clear()
+        if leaving_daemon:
+            self.stop_daemon_watch()
         return normalized
 
     def stop_daemon(self):
@@ -636,11 +779,17 @@ class Adb:
         return lines
 
     def _parse_daemon_pong(self, pong_line):
+        watch_supported = False
         for token in str(pong_line or "").split():
             if token == "put=0":
                 self._daemon_put_supported = False
             elif token == "put=1":
                 self._daemon_put_supported = True
+            elif token == "watch=1":
+                watch_supported = True
+            elif token == "watch=0":
+                watch_supported = False
+        self._daemon_watch_supported = watch_supported
 
     def ensure_daemon(self, check=False):
         if not self.is_daemon_mode() or not self.ip:
@@ -666,6 +815,7 @@ class Adb:
                     with self._state_lock:
                         self._parse_daemon_pong(pong[0])
                         self._daemon_retry_after = 0.0
+                    self.start_daemon_watch()
                     return True
                 with self._state_lock:
                     self._daemon_ready = False
@@ -705,6 +855,7 @@ class Adb:
                         self._daemon_ready = True
                         self._daemon_retry_after = 0.0
                     _adb_log(f"daemon: 已复用常驻服务 ({pong[0]})")
+                    self.start_daemon_watch()
                     return True
                 self._daemon_socket_request("QUIT\n", timeout=0.8)
                 with self._state_lock:
@@ -744,6 +895,7 @@ class Adb:
                         self._daemon_ready = True
                         self._daemon_retry_after = 0.0
                     _adb_log(f"daemon: 启动就绪 ({pong[0]})")
+                    self.start_daemon_watch()
                     return True
 
         with self._state_lock:
@@ -916,9 +1068,11 @@ class Adb:
 
         if not self.ensure_daemon(check=check):
             return False, None, []
+        self._note_local_write()
         with self.transaction():
             # Write batches are not idempotent on socket timeout; never blindly replay them.
             resp = self._daemon_socket_request(payload, timeout=timeout)
+        self._note_local_write()
         if not resp:
             return False, None, []
 
@@ -1230,8 +1384,9 @@ class Adb:
                     return False
             if jar_updated:
                 if filename == "MtkDirectTool.jar":
-                    self._daemon_needs_restart = True
                     self.stop_daemon()
+                    with self._state_lock:
+                        self._daemon_needs_restart = True
                 cp_out = self.shell(
                     build_tvservice_shell_command(["cp", sdcard_jar, cache_jar]),
                     check=check,
@@ -1326,11 +1481,14 @@ class Adb:
         return v
 
     def _adb_put(self, k, v, check=False):
+        self._note_local_write()
         _adb_log(f"settings put {k} = {v}")
-        return self.shell(
+        res = self.shell(
             f"settings put global {shlex.quote(str(k))} {shlex.quote(str(v))}",
             check=check,
         )
+        self._note_local_write()
+        return res
 
     def put(self, k, v, check=False):
         key = str(k)
@@ -1393,12 +1551,15 @@ class Adb:
         return self._adb_colorful_led(action, *args, check=check)
 
     def _adb_jni_set(self, key, val, upd=3, check=False):
+        self._note_local_write()
         _adb_log(f"jni_set {key} = {val}")
         jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
         command = build_tvservice_app_process_command(
             jar, ["MtkDirectTool", "set", key, val, upd]
         )
-        return self.shell(command, check=check)
+        res = self.shell(command, check=check)
+        self._note_local_write()
+        return res
 
     def jni_set(self, key, val, upd=3, check=False):
         op = ("JNI_SET", str(key), int(val), int(upd))
@@ -1415,12 +1576,15 @@ class Adb:
         return self._adb_jni_set(key, val, upd=upd, check=check)
 
     def _adb_hdr_tone_mapping(self, val, upd=3, check=False):
+        self._note_local_write()
         _adb_log(f"hdr_tone_mapping = {val}")
         jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
         command = build_tvservice_app_process_command(
             jar, ["MtkDirectTool", "setHdrToneMapping", val, upd]
         )
-        return self.shell(command, check=check)
+        res = self.shell(command, check=check)
+        self._note_local_write()
+        return res
 
     def hdr_tone_mapping(self, val, upd=3, check=False):
         op = ("HDR_TM", int(val), int(upd))
@@ -1438,12 +1602,15 @@ class Adb:
 
     def _adb_set_sound_output(self, device_id, check=False):
         """通过 TvService 3 调用 MtkDirectTool 切换音频输出设备（不在此处写 Settings.Global）。"""
+        self._note_local_write()
         _adb_log(f"set_sound_output = {device_id}")
         jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
         command = build_tvservice_app_process_command(
             jar, ["MtkDirectTool", "setSoundOutput", int(device_id)]
         )
-        return self.shell(command, check=check)
+        res = self.shell(command, check=check)
+        self._note_local_write()
+        return res
 
     def set_sound_output(self, device_id, check=False):
         """通过 TvService 3 调用 MtkDirectTool 切换音频输出设备（不在此处写 Settings.Global）。"""
@@ -1497,6 +1664,7 @@ class Adb:
 
     def set_input_source(self, source_id, check=False):
         """优先通过 MtkDirectTool.jar（Daemon / CLI）切换信号源，不可用时回退原始 ADB。"""
+        self._note_local_write()
         target = int(source_id)
         op = ("SET_SOURCE", target)
         if self.is_daemon_mode():
@@ -1670,12 +1838,15 @@ class Adb:
         return self._adb_set_media_muted(muted, show_ui=show_ui, check=check)
 
     def _adb_jni_set_color_gains(self, red, green, blue, check=False):
+        self._note_local_write()
         _adb_log(f"jni_set_color_gains r={red} g={green} b={blue}")
         jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
         command = build_tvservice_app_process_command(
             jar, ["MtkDirectTool", "setColorGains", red, green, blue]
         )
-        return self.shell(command, check=check)
+        res = self.shell(command, check=check)
+        self._note_local_write()
+        return res
 
     def jni_set_color_gains(self, red, green, blue, check=False):
         op = ("COLOR_GAINS", int(red), int(green), int(blue))
@@ -1796,8 +1967,11 @@ class Adb:
         return vals
 
     def _adb_refresh_pq(self, check=False):
+        self._note_local_write()
         _adb_log("refresh_pq")
-        return self.shell("am broadcast -a com.xiaomi.mitv.action.PIC_MODE_CHANGED --ei picmode 7", check=check)
+        res = self.shell("am broadcast -a com.xiaomi.mitv.action.PIC_MODE_CHANGED --ei picmode 7", check=check)
+        self._note_local_write()
+        return res
 
     def refresh_pq(self, check=False):
         if self.is_daemon_mode():

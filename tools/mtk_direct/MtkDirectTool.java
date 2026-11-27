@@ -1,7 +1,14 @@
+import android.content.BroadcastReceiver;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
+import android.database.ContentObserver;
+import android.net.Uri;
 import android.os.Build;
+import android.os.FileObserver;
+import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.Process;
 import android.provider.Settings;
 import android.util.Log;
@@ -20,14 +27,18 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 public class MtkDirectTool {
     private static final String TAG = "MtkDirectTool";
-    private static final String VERSION = "v2.1";
+    private static final String VERSION = "v2.2";
     private static final int DEFAULT_DAEMON_PORT = 27891;
     private static final String RESULT_FILE = "/data/data/mitv.service/cache/.jni_result";
     private static final String BATCH_RESULT_FILE =
@@ -228,17 +239,41 @@ public class MtkDirectTool {
             if (at != null) {
                 Object ctx = atClass.getMethod("getSystemContext").invoke(at);
                 if (ctx instanceof Context) {
-                    sContext = (Context) ctx;
-                    sResolver = sContext.getContentResolver();
+                    Context baseCtx = (Context) ctx;
+                    sContext = baseCtx;
+                    sResolver = baseCtx.getContentResolver();
                     sResolverGetBroken = false;
                     sResolverPutBroken = false;
+                    boolean probeOk = false;
                     try {
                         Settings.Global.getString(sResolver, "picture_mode");
-                    } catch (SecurityException probeSec) {
+                        probeOk = true;
+                    } catch (Throwable ignoredProbe) {
+                    }
+                    if (!probeOk) {
+                        String[] candidatePkgs = {
+                                "mitv.service",
+                                "com.xiaomi.mitv.settings",
+                                "com.android.providers.settings",
+                                "com.android.shell"
+                        };
+                        for (String pkg : candidatePkgs) {
+                            try {
+                                Context pkgCtx = baseCtx.createPackageContext(
+                                        pkg, Context.CONTEXT_IGNORE_SECURITY);
+                                ContentResolver pkgResolver = pkgCtx.getContentResolver();
+                                Settings.Global.getString(pkgResolver, "picture_mode");
+                                sContext = pkgCtx;
+                                sResolver = pkgResolver;
+                                probeOk = true;
+                                break;
+                            } catch (Throwable ignoredPkg) {
+                            }
+                        }
+                    }
+                    if (!probeOk) {
                         sResolverGetBroken = true;
                         sResolverPutBroken = true;
-                    } catch (Throwable probeErr) {
-                        Log.w(TAG, "Settings probe warning: " + probeErr.getMessage());
                     }
                 }
             }
@@ -1332,6 +1367,470 @@ public class MtkDirectTool {
         }
     }
 
+    private static final int MAX_SUBSCRIBERS = 4;
+    private static final long HEARTBEAT_INTERVAL_MS = 20000L;
+    private static final long COALESCE_WINDOW_MS = 40L;
+    private static final long DIFF_DEBOUNCE_MS = 120L;
+    private static final String SELF_JAR_PATH = "/data/data/mitv.service/cache/MtkDirectTool.jar";
+    private static final String SETTINGS_GLOBAL_DIR = "/data/system/users/0";
+    private static final String[] WATCH_JNI_DIFF_KEYS = {
+            "g_video__picture_mode",
+            "g_disp__disp_back_light",
+            "g_video__vid_local_dimming",
+            "g_video__vid_gamut_mapping_mode",
+            "g_video__clr_temp",
+            "g_video__vid_hdr_tone_mapping_mode",
+            "g_video__light_sensor_switch",
+            "g_video__vid_mjc_effect",
+            "g_video__freesync_switch",
+            "g_video__dp_adaptive_sync"
+    };
+    private static final String[] DEFAULT_WATCH_KEYS = {
+            "picture_mode",
+            "picture_preset_scenario",
+            "power_picture_off",
+            "picture_backlight",
+            "xiaomi_picture_backlight",
+            "picture_brightness",
+            "picture_contrast",
+            "picture_saturation",
+            "picture_hue",
+            "picture_sharpness",
+            "picture_color_temperature",
+            "picture_red_gain",
+            "picture_green_gain",
+            "picture_blue_gain",
+            "picture_local_dimming",
+            "tv_picture_video_local_dimming",
+            "picture_hdr_tone_mapping",
+            "settings_display_hdr_color_tone",
+            "picture_dynamic_definition",
+            "tv_picture_mjc_effect",
+            "tv_picture_game_mjc_effect",
+            "picture_response_time",
+            "tv_picture_advanced_video_color_space",
+            "tv_picture_video_color_space",
+            "tv_picture_light_sensor",
+            "front_sight_index",
+            "mt_game_dynamic_ft",
+            "mt_game_scope",
+            "mt_game_scope_night",
+            "monitor_menu_fps_counter",
+            "monitor_menu_stopwatch",
+            "monitor_menu_timer",
+            "mitv.tvplayer.hdmi.last.source",
+            "xiaomi_sound_output_device",
+            "atmosphere_light_switcher_pm2",
+            "atmosphere_light_illumination",
+            "atmosphere_light_color_temp",
+            "atmosphere_light_color_value"
+    };
+
+    private static final Object sWatchLock = new Object();
+    private static final List<SubscriberClient> sSubscribers = new ArrayList<>();
+    private static HandlerThread sWatchThread;
+    private static Handler sWatchHandler;
+    private static Object sTvWatchBridge;
+    private static Method sTvWatchBridgeClose;
+    private static FileObserver sSettingsFileObserver;
+    private static final Map<String, String> sLastWatchSnapshot = new HashMap<>();
+    private static volatile String sLastWatchDiag = "init";
+    private static volatile long sEventCount = 0;
+
+    private static final Runnable sDiffSnapshotTask = new Runnable() {
+        @Override
+        public void run() {
+            evaluateWatchedDiffs();
+        }
+    };
+
+    private static final class SubscriberClient {
+        final Socket socket;
+        final BufferedReader in;
+        final BufferedWriter out;
+        final Set<String> keys;
+        final Object lock = new Object();
+        final LinkedHashMap<String, String> pending = new LinkedHashMap<>();
+        boolean closed = false;
+
+        SubscriberClient(Socket socket, BufferedReader in, BufferedWriter out, Set<String> keys) {
+            this.socket = socket;
+            this.in = in;
+            this.out = out;
+            this.keys = keys;
+        }
+
+        void enqueue(String key, String value) {
+            if (!key.startsWith("jni:") && !keys.contains(key)) {
+                return;
+            }
+            synchronized (lock) {
+                if (closed) {
+                    return;
+                }
+                pending.put(key, value == null ? "null" : value);
+                lock.notifyAll();
+            }
+        }
+
+        void markClosed() {
+            synchronized (lock) {
+                if (closed) {
+                    return;
+                }
+                closed = true;
+                pending.clear();
+                lock.notifyAll();
+            }
+            try {
+                socket.close();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private static boolean canWatchEvents() {
+        return true;
+    }
+
+    private static void scheduleWatchDiff() {
+        sEventCount++;
+        Handler h;
+        synchronized (sWatchLock) {
+            if (sSubscribers.isEmpty() || sWatchHandler == null) {
+                return;
+            }
+            h = sWatchHandler;
+        }
+        h.removeCallbacks(sDiffSnapshotTask);
+        h.postDelayed(sDiffSnapshotTask, DIFF_DEBOUNCE_MS);
+    }
+
+    private static Map<String, String> captureWatchSnapshot(Set<String> keys) {
+        Map<String, String> snap = new LinkedHashMap<>();
+        if (keys != null && !keys.isEmpty()) {
+            try {
+                Map<String, String> bulk = getGlobalSettingsBulk(new ArrayList<>(keys));
+                snap.putAll(bulk);
+            } catch (Throwable ignored) {
+            }
+        }
+        try {
+            ensureTvNative();
+            for (String jk : WATCH_JNI_DIFF_KEYS) {
+                try {
+                    int jv = getJniValue(jk);
+                    snap.put("jni:" + jk, String.valueOf(jv));
+                } catch (Throwable ignoredJni) {
+                }
+            }
+        } catch (Throwable ignoredTv) {
+        }
+        return snap;
+    }
+
+    private static void evaluateWatchedDiffs() {
+        List<SubscriberClient> subsSnapshot;
+        Set<String> unionKeys = new LinkedHashSet<>();
+        synchronized (sWatchLock) {
+            if (sSubscribers.isEmpty()) {
+                return;
+            }
+            subsSnapshot = new ArrayList<>(sSubscribers);
+            for (SubscriberClient sub : subsSnapshot) {
+                unionKeys.addAll(sub.keys);
+            }
+        }
+        Map<String, String> current = captureWatchSnapshot(unionKeys);
+        if (current.isEmpty()) {
+            return;
+        }
+        Map<String, String> diffs = new LinkedHashMap<>();
+        synchronized (sWatchLock) {
+            for (Map.Entry<String, String> e : current.entrySet()) {
+                String k = e.getKey();
+                String v = e.getValue();
+                String prev = sLastWatchSnapshot.get(k);
+                if (prev != null && !prev.equals(v)) {
+                    diffs.put(k, v);
+                }
+                sLastWatchSnapshot.put(k, v);
+            }
+        }
+        if (diffs.isEmpty()) {
+            return;
+        }
+        for (SubscriberClient sub : subsSnapshot) {
+            for (Map.Entry<String, String> d : diffs.entrySet()) {
+                sub.enqueue(d.getKey(), d.getValue());
+            }
+        }
+    }
+
+    private static int activeWatcherCountLocked() {
+        int count = 0;
+        if (sTvWatchBridge != null) {
+            count++;
+        }
+        if (sSettingsFileObserver != null) {
+            count++;
+        }
+        return count;
+    }
+
+    @SuppressWarnings("deprecation")
+    private static void syncWatchRegistrationsLocked() {
+        if (sSubscribers.isEmpty()) {
+            if (sWatchHandler != null) {
+                sWatchHandler.removeCallbacks(sDiffSnapshotTask);
+            }
+            if (sTvWatchBridge != null && sTvWatchBridgeClose != null) {
+                try {
+                    sTvWatchBridgeClose.invoke(sTvWatchBridge);
+                } catch (Throwable ignored) {
+                }
+            }
+            sTvWatchBridge = null;
+            sTvWatchBridgeClose = null;
+            if (sSettingsFileObserver != null) {
+                try {
+                    sSettingsFileObserver.stopWatching();
+                } catch (Throwable ignored) {
+                }
+                sSettingsFileObserver = null;
+            }
+            sLastWatchSnapshot.clear();
+            return;
+        }
+
+        if (sWatchThread == null || !sWatchThread.isAlive()) {
+            sWatchThread = new HandlerThread("mtk-watch-looper");
+            sWatchThread.setDaemon(true);
+            sWatchThread.start();
+            sWatchHandler = new Handler(sWatchThread.getLooper());
+        }
+
+        StringBuilder diag = new StringBuilder();
+        if (sTvWatchBridge == null) {
+            try {
+                ClassLoader tvLoader = ensureTvClassLoader();
+                ClassLoader bridgeLoader = (ClassLoader) Class.forName("dalvik.system.PathClassLoader")
+                        .getConstructor(String.class, ClassLoader.class)
+                        .newInstance(SELF_JAR_PATH, tvLoader);
+                Class<?> bridgeClass = bridgeLoader.loadClass("MtkTvWatchBridge");
+                Runnable cb = new Runnable() {
+                    @Override
+                    public void run() {
+                        scheduleWatchDiff();
+                    }
+                };
+                sTvWatchBridge = bridgeClass.getConstructor(Runnable.class).newInstance(cb);
+                sTvWatchBridgeClose = bridgeClass.getMethod("close");
+                diag.append("hal=1");
+            } catch (Throwable t) {
+                Throwable root = (t instanceof java.lang.reflect.InvocationTargetException && t.getCause() != null)
+                        ? t.getCause()
+                        : t;
+                diag.append("halErr=").append(root.getClass().getSimpleName());
+            }
+        } else {
+            diag.append("hal=1");
+        }
+
+        if (sSettingsFileObserver == null) {
+            try {
+                File dir = new File(SETTINGS_GLOBAL_DIR);
+                if (dir.isDirectory() && dir.canRead()) {
+                    int mask = FileObserver.CLOSE_WRITE | FileObserver.MOVED_TO | FileObserver.MODIFY;
+                    FileObserver fo = new FileObserver(SETTINGS_GLOBAL_DIR, mask) {
+                        @Override
+                        public void onEvent(int event, String path) {
+                            if (path == null || path.contains("settings_global")) {
+                                scheduleWatchDiff();
+                            }
+                        }
+                    };
+                    fo.startWatching();
+                    sSettingsFileObserver = fo;
+                    diag.append(",fs=1");
+                } else {
+                    diag.append(",fs=noread");
+                }
+            } catch (Throwable t) {
+                diag.append(",fsErr=").append(t.getClass().getSimpleName());
+            }
+        } else {
+            diag.append(",fs=1");
+        }
+        sLastWatchDiag = diag.toString();
+
+        final Set<String> seedKeys = new LinkedHashSet<>();
+        for (SubscriberClient sub : sSubscribers) {
+            seedKeys.addAll(sub.keys);
+        }
+        sWatchHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                Map<String, String> initial = captureWatchSnapshot(seedKeys);
+                synchronized (sWatchLock) {
+                    for (Map.Entry<String, String> e : initial.entrySet()) {
+                        if (!sLastWatchSnapshot.containsKey(e.getKey())) {
+                            sLastWatchSnapshot.put(e.getKey(), e.getValue());
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    private static void removeSubscriber(SubscriberClient sub) {
+        if (sub == null) {
+            return;
+        }
+        sub.markClosed();
+        synchronized (sWatchLock) {
+            sSubscribers.remove(sub);
+            syncWatchRegistrationsLocked();
+        }
+    }
+
+    private static void closeAllSubscribers() {
+        List<SubscriberClient> snapshot;
+        synchronized (sWatchLock) {
+            snapshot = new ArrayList<>(sSubscribers);
+            sSubscribers.clear();
+            syncWatchRegistrationsLocked();
+        }
+        for (SubscriberClient sub : snapshot) {
+            sub.markClosed();
+        }
+    }
+
+    private static boolean handleSubscribe(Socket client, BufferedReader in, BufferedWriter out) throws Exception {
+        Set<String> requestedKeys = new LinkedHashSet<>();
+        boolean sawEnd = false;
+        String line;
+        while ((line = in.readLine()) != null) {
+            String trimmed = line.trim();
+            if ("END".equals(trimmed)) {
+                sawEnd = true;
+                break;
+            }
+            String[] parts = splitWhitespace(trimmed);
+            if (parts.length > 1 && "KEYS".equals(parts[0])) {
+                for (int i = 1; i < parts.length; i++) {
+                    if (parts[i].length() > 0) {
+                        requestedKeys.add(parts[i]);
+                    }
+                }
+            }
+        }
+        if (!sawEnd) {
+            out.write("ERR TRUNCATED_SUBSCRIBE\n");
+            out.write("END\n");
+            out.flush();
+            return false;
+        }
+        if (requestedKeys.isEmpty()) {
+            Collections.addAll(requestedKeys, DEFAULT_WATCH_KEYS);
+        }
+
+        client.setSoTimeout(0);
+        client.setKeepAlive(true);
+        final SubscriberClient sub = new SubscriberClient(client, in, out, requestedKeys);
+        SubscriberClient evicted = null;
+        int watcherCount;
+        synchronized (sWatchLock) {
+            if (sSubscribers.size() >= MAX_SUBSCRIBERS) {
+                evicted = sSubscribers.remove(0);
+            }
+            sSubscribers.add(sub);
+            syncWatchRegistrationsLocked();
+            watcherCount = activeWatcherCountLocked();
+        }
+        if (evicted != null) {
+            evicted.markClosed();
+        }
+        if (watcherCount == 0) {
+            removeSubscriber(sub);
+            out.write("ERR WATCH_REGISTER_FAILED " + sLastWatchDiag + "\n");
+            out.write("END\n");
+            out.flush();
+            return false;
+        }
+
+        out.write("OK SUBSCRIBED watchers=" + watcherCount + " keys=" + requestedKeys.size() + "\n");
+        out.flush();
+
+        Thread writer = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    while (true) {
+                        Map<String, String> batch = null;
+                        synchronized (sub.lock) {
+                            if (sub.closed) {
+                                break;
+                            }
+                            if (sub.pending.isEmpty()) {
+                                sub.lock.wait(HEARTBEAT_INTERVAL_MS);
+                            }
+                            if (sub.closed) {
+                                break;
+                            }
+                            if (!sub.pending.isEmpty()) {
+                                if (COALESCE_WINDOW_MS > 0) {
+                                    sub.lock.wait(COALESCE_WINDOW_MS);
+                                    if (sub.closed) {
+                                        break;
+                                    }
+                                }
+                                batch = new LinkedHashMap<>(sub.pending);
+                                sub.pending.clear();
+                            }
+                        }
+                        if (batch == null || batch.isEmpty()) {
+                            sub.out.write("HEARTBEAT\n");
+                            sub.out.flush();
+                        } else {
+                            for (Map.Entry<String, String> entry : batch.entrySet()) {
+                                sub.out.write("EVENT " + entry.getKey() + "=" + entry.getValue() + "\n");
+                            }
+                            sub.out.flush();
+                        }
+                    }
+                } catch (Throwable ignored) {
+                } finally {
+                    removeSubscriber(sub);
+                }
+            }
+        }, "mtk-sub-writer");
+        writer.setDaemon(true);
+
+        Thread reader = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    String cmdLine;
+                    while ((cmdLine = sub.in.readLine()) != null) {
+                        String trimmedCmd = cmdLine.trim();
+                        if ("UNSUBSCRIBE".equals(trimmedCmd) || "QUIT".equals(trimmedCmd)) {
+                            break;
+                        }
+                    }
+                } catch (Throwable ignored) {
+                } finally {
+                    removeSubscriber(sub);
+                }
+            }
+        }, "mtk-sub-reader");
+        reader.setDaemon(true);
+
+        writer.start();
+        reader.start();
+        return true;
+    }
+
     private static void runDaemon(int port) throws Exception {
         ensureTvNative();
         ensureContext();
@@ -1377,18 +1876,36 @@ public class MtkDirectTool {
                 if ("PING".equals(cmd)) {
                     ensureContext();
                     String putCap = (sResolver != null && !sResolverPutBroken) ? "1" : "0";
-                    out.write("OK MtkDirectTool " + VERSION + " pid=" + pid + " uid=" + uid + " put=" + putCap + "\n");
+                    String watchCap = canWatchEvents() ? "1" : "0";
+                    int subCount;
+                    int obsCount;
+                    synchronized (sWatchLock) {
+                        subCount = sSubscribers.size();
+                        obsCount = activeWatcherCountLocked();
+                    }
+                    out.write("OK MtkDirectTool " + VERSION + " pid=" + pid + " uid=" + uid
+                            + " put=" + putCap + " watch=" + watchCap
+                            + " subs=" + subCount + " obs=" + obsCount + " ev=" + sEventCount
+                            + " diag=" + sLastWatchDiag + "\n");
                     out.write("END\n");
                     out.flush();
                 } else if ("QUIT".equals(cmd)) {
+                    running = false;
+                    try {
+                        server.close();
+                    } catch (Throwable ignoredClose) {
+                    }
                     out.write("OK BYE\n");
                     out.write("END\n");
                     out.flush();
-                    running = false;
                 } else if ("QUERY".equals(cmd)) {
                     handleQuery(in, out);
                 } else if ("BATCH".equals(cmd)) {
                     handleBatch(in, out);
+                } else if ("SUBSCRIBE".equals(cmd)) {
+                    if (handleSubscribe(client, in, out)) {
+                        client = null;
+                    }
                 } else {
                     out.write("ERR UNKNOWN_CMD " + sanitizeSingleLine(cmd) + "\n");
                     out.write("END\n");
@@ -1405,6 +1922,7 @@ public class MtkDirectTool {
                 }
             }
         }
+        closeAllSubscribers();
         try {
             server.close();
         } catch (Throwable ignored) {

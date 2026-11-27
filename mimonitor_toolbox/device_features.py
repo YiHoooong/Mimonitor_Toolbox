@@ -261,12 +261,17 @@ def apply_picture_jni_overrides(settings_vals, jni_batch_vals):
             settings_vals["tv_picture_video_color_space"] = gamut_val
         except (TypeError, ValueError): pass
 
-    # 色温：MTK 枚举需转成小米枚举
+    # 色温：Settings.Global 与 JNI 均存 MTK 枚举，按固件 PictureSettingsManagerImpl.convertColorTempToXiaoMi
+    # 规则统一转成 UI 枚举（未知值兜底 0=冷色，与小米 OSD 保持一致）
     if "g_video__clr_temp" in jni_batch_vals:
         try:
             clr_val = int(jni_batch_vals["g_video__clr_temp"])
-            if clr_val in MTK_TO_XIAOMI_COLOR_TEMP:
-                settings_vals["picture_color_temperature"] = MTK_TO_XIAOMI_COLOR_TEMP[clr_val]
+            settings_vals["picture_color_temperature"] = MTK_TO_XIAOMI_COLOR_TEMP.get(clr_val, 0)
+        except (TypeError, ValueError): pass
+    elif "picture_color_temperature" in settings_vals:
+        try:
+            clr_val = int(settings_vals["picture_color_temperature"])
+            settings_vals["picture_color_temperature"] = MTK_TO_XIAOMI_COLOR_TEMP.get(clr_val, 0)
         except (TypeError, ValueError): pass
 
     # 精密控光：覆盖官方主键和旧 OSD 键
@@ -421,6 +426,9 @@ class DeviceFeaturesMixin:
             self.adb.set_connection_mode(conn_mode)
         else:
             self.adb.connection_mode = conn_mode
+        if hasattr(self.adb, "set_daemon_event_callback"):
+            self.adb.set_daemon_event_callback(self._emit_daemon_watch_event)
+        self._pending_watch_pages = set()
         self._source_names = {
             23: "HDMI 1", 24: "HDMI 2", 29: "DP", 30: "USBC",
             "23": "HDMI 1", "24": "HDMI 2", "29": "DP", "30": "USBC",
@@ -702,6 +710,10 @@ class DeviceFeaturesMixin:
         self.log(f"连接模式已切换为: {format_connection_mode_label(normalized)}")
         if normalized == CONNECTION_MODE_DAEMON and getattr(self, "adb_connected", False):
             self._warm_daemon_async(reason="模式切换")
+        elif normalized != CONNECTION_MODE_DAEMON:
+            stop_watch = getattr(self.adb, "stop_daemon_watch", None)
+            if callable(stop_watch):
+                stop_watch()
 
     def _finish_resume_reconnect_attempt(self, generation, attempt, ok, detail):
         if generation != getattr(self, "_resume_reconnect_generation", -1):
@@ -1083,13 +1095,15 @@ class DeviceFeaturesMixin:
                             "显示器休眠或临时断连",
                         )
                         return
-                    if (
-                        _is_daemon_adb(self.adb)
-                        and getattr(self.adb, "_daemon_ready", True) is False
-                    ):
-                        _warm_daemon_for_adb(self.adb, getattr(self, "log", None), reason="保活")
-                        if not self._connection_intent_is_current(intent_generation, ip):
-                            return
+                    if _is_daemon_adb(self.adb):
+                        if getattr(self.adb, "_daemon_ready", True) is False:
+                            _warm_daemon_for_adb(self.adb, getattr(self, "log", None), reason="保活")
+                            if not self._connection_intent_is_current(intent_generation, ip):
+                                return
+                        else:
+                            start_watch = getattr(self.adb, "start_daemon_watch", None)
+                            if callable(start_watch):
+                                start_watch()
                     cancel_resume = getattr(self, "_cancel_resume_reconnect", None)
                     if callable(cancel_resume):
                         cancel_resume()
@@ -2106,7 +2120,7 @@ class DeviceFeaturesMixin:
             )
         return values
 
-    def _refresh_page_data(self, page_name):
+    def _refresh_page_data(self, page_name, silent=False):
         if not getattr(self, "adb_connected", False):
             return
         if page_name in self._page_loading:
@@ -2117,7 +2131,8 @@ class DeviceFeaturesMixin:
         self._page_loading.add(page_name)
         self._page_loading_busy_deadline = time.monotonic() + 4.0
         self._mark_adb_busy(4.0)
-        self._show_loading_overlay(page_name)
+        if not silent:
+            self._show_loading_overlay(page_name)
         emit_detail_log(self, f"正在刷新「{page_label}」数据...")
 
         def do():
@@ -2322,11 +2337,11 @@ class DeviceFeaturesMixin:
                 child.hide()
                 child.deleteLater()
 
-    def _force_refresh_page(self, page_name):
+    def _force_refresh_page(self, page_name, silent=False):
         self._page_loaded.discard(page_name)
-        self._refresh_page_data(page_name)
+        self._refresh_page_data(page_name, silent=silent)
 
-    def _refresh_pages(self, page_names, delay_ms=0, force=False):
+    def _refresh_pages(self, page_names, delay_ms=0, force=False, silent=False):
         """刷新多个页面数据。
 
         force=True：立即清缓存并强制回读（用于设置改动后同步真实值，
@@ -2343,11 +2358,92 @@ class DeviceFeaturesMixin:
                 return
             for page_name in page_names:
                 if force:
-                    self._force_refresh_page(page_name)
+                    self._force_refresh_page(page_name, silent=silent)
                 elif page_name not in self._page_loaded and page_name not in self._page_loading:
-                    self._refresh_page_data(page_name)
+                    self._refresh_page_data(page_name, silent=silent)
 
         if delay_ms > 0:
             QTimer.singleShot(delay_ms, do_refresh)
         else:
             do_refresh()
+
+    def _emit_daemon_watch_event(self, ip, key, value):
+        if getattr(self, "_cleanup_done", False):
+            return
+        sig = getattr(self, "daemon_event_signal", None)
+        if sig is not None:
+            try:
+                sig.emit(str(ip or ""), str(key or ""), str(value or ""))
+            except RuntimeError:
+                pass
+
+    def _has_active_slider_drag(self):
+        for pair in getattr(self, "sliders", {}).values():
+            try:
+                slider = pair[0]
+                if slider is not None and slider.isSliderDown():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _on_daemon_watch_event(self, ip, key, value):
+        if getattr(self, "_cleanup_done", False) or not getattr(self, "adb_connected", False):
+            return
+        current_ip = str(getattr(getattr(self, "adb", None), "ip", "") or "").strip()
+        if not current_ip or current_ip != str(ip or "").strip():
+            return
+        # 自写回声抑制：本机刚发起写操作后的 1.6s 内忽略设备侧回报，避免重复刷新或打断连按/渐变
+        last_write = float(getattr(getattr(self, "adb", None), "last_write_monotonic", 0.0) or 0.0)
+        if (time.monotonic() - last_write) < 1.6:
+            return
+        if self._has_active_slider_drag():
+            return
+        # 若单值 settings 与缓存完全一致且非模式/场景/息屏/色温联动键，无需整页重刷
+        if (
+            not str(key).startswith("jni:")
+            and key not in ("picture_mode", "picture_preset_scenario", "power_picture_off", "picture_color_temperature")
+            and key in getattr(self, "current_vals", {})
+            and str(self.current_vals.get(key)) == str(value)
+        ):
+            return
+        from .core import classify_watched_key_pages
+        pages = classify_watched_key_pages(key)
+        if not pages:
+            return
+        pending = getattr(self, "_pending_watch_pages", None)
+        if pending is None:
+            pending = set()
+            self._pending_watch_pages = pending
+        pending.update(pages)
+        timer = getattr(self, "_daemon_watch_debounce_timer", None)
+        if timer is not None:
+            timer.start(300)
+        else:
+            self._flush_watched_page_refreshes()
+
+    def _flush_watched_page_refreshes(self):
+        pending = getattr(self, "_pending_watch_pages", None)
+        if not pending:
+            return
+        pages = list(pending)
+        pending.clear()
+        if getattr(self, "_cleanup_done", False) or not getattr(self, "adb_connected", False):
+            return
+        last_write = float(getattr(getattr(self, "adb", None), "last_write_monotonic", 0.0) or 0.0)
+        if (time.monotonic() - last_write) < 1.6 or self._has_active_slider_drag():
+            return
+        # 当前可见页面优先刷新，其余受影响页面一并静默同步
+        current_page_name = None
+        stacked = getattr(self, "stackedWidget", None)
+        if stacked is not None and stacked.currentWidget() is not None:
+            current_page_name = stacked.currentWidget().objectName()
+        ordered = []
+        if current_page_name and current_page_name in pages:
+            ordered.append(current_page_name)
+        for p in ("picturePage", "gamePage", "sourcePage", "lightPage"):
+            if p in pages and p not in ordered:
+                ordered.append(p)
+        if ordered:
+            emit_detail_log(self, f"检测到显示器侧变更，自动同步: {', '.join(ordered)}")
+            self._refresh_pages(ordered, delay_ms=0, force=True, silent=True)

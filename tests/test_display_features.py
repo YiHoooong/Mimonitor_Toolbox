@@ -3181,6 +3181,135 @@ class DisplayFeatureRegressionFixTests(unittest.TestCase):
         self.assertEqual(ph.current_vals["picture_backlight"], 44)
         ph.picture_mode_hint_label.setText.assert_called_with("当前场景：标准（14）")
 
+    def test_daemon_watch_page_classification_echo_guard_and_silent_refresh(self):
+        import socket
+        import threading
+        import time
+        import types
+        from mimonitor_toolbox import core
+        from mimonitor_toolbox.adb import Adb
+        from mimonitor_toolbox.device_features import DeviceFeaturesMixin
+
+        self.assertEqual(core.classify_watched_key_pages("picture_mode"), ("picturePage", "gamePage"))
+        self.assertEqual(core.classify_watched_key_pages("picture_preset_scenario"), ("picturePage", "gamePage"))
+        self.assertEqual(core.classify_watched_key_pages("power_picture_off"), ("picturePage", "gamePage"))
+        self.assertEqual(core.classify_watched_key_pages("jni:g_disp__disp_back_light"), ("picturePage",))
+        self.assertEqual(core.classify_watched_key_pages("front_sight_index"), ("gamePage",))
+        self.assertEqual(core.classify_watched_key_pages("mitv.tvplayer.hdmi.last.source"), ("sourcePage", "gamePage", "picturePage"))
+        self.assertEqual(core.classify_watched_key_pages("atmosphere_light_color_value"), ("lightPage",))
+        self.assertEqual(core.classify_watched_key_pages("unrelated_key"), ())
+
+        # 1) 验证 DeviceFeaturesMixin 端的自写回声抑制与外部变更静默刷新
+        class WatchHost(DeviceFeaturesMixin):
+            pass
+
+        refreshed = []
+        wh = WatchHost()
+        wh.adb_connected = True
+        wh._cleanup_done = False
+        wh.adb = types.SimpleNamespace(ip="192.168.5.205", last_write_monotonic=time.monotonic())
+        wh.current_vals = {"picture_mode": 14, "picture_backlight": 44}
+        wh.sliders = {}
+        wh._pending_watch_pages = set()
+        wh._daemon_watch_debounce_timer = None
+        wh._refresh_pages = lambda pages, delay_ms=0, force=False, silent=False: refreshed.append((tuple(pages), delay_ms, force, silent))
+
+        # 刚发生本机写入（<1.6s）时抑制回声
+        wh._on_daemon_watch_event("192.168.5.205", "picture_mode", "73")
+        self.assertEqual(refreshed, [])
+
+        # 超过自写抑制窗口后，外部 OSD 切换子场景立刻触发静默刷新
+        wh.adb.last_write_monotonic = time.monotonic() - 5.0
+        wh._on_daemon_watch_event("192.168.5.205", "picture_mode", "73")
+        self.assertEqual(refreshed, [(("picturePage", "gamePage"), 0, True, True)])
+
+        # 与缓存一致的非联动单值跳过刷新
+        refreshed.clear()
+        wh._on_daemon_watch_event("192.168.5.205", "picture_backlight", "44")
+        self.assertEqual(refreshed, [])
+
+        # 2) 验证 Adb.start_daemon_watch / stop_daemon_watch 真实回环 TCP 订阅协议
+        received = []
+        got_event = threading.Event()
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        port = srv.getsockname()[1]
+        srv.listen(2)
+
+        def server_worker():
+            try:
+                conn, _ = srv.accept()
+                with conn:
+                    r = conn.makefile("r", encoding="utf-8")
+                    while True:
+                        line = r.readline()
+                        if not line or line.strip() == "END":
+                            break
+                    conn.sendall(b"OK SUBSCRIBED watchers=2 keys=2\nHEARTBEAT\nEVENT picture_mode=73\n")
+                    got_event.wait(2.0)
+            except OSError:
+                pass
+
+        t = threading.Thread(target=server_worker, daemon=True)
+        t.start()
+        try:
+            adb = Adb("192.168.5.205", connection_mode="daemon")
+            adb._daemon_ready = True
+            adb._daemon_ip = "192.168.5.205"
+            adb._daemon_forward_port = port
+            adb._daemon_watch_supported = True
+
+            def on_evt(ip, k, v):
+                received.append((ip, k, v))
+                got_event.set()
+
+            adb.set_daemon_event_callback(on_evt)
+            self.assertTrue(adb.start_daemon_watch(keys=("picture_mode", "picture_backlight")))
+            self.assertTrue(got_event.wait(3.0))
+            self.assertEqual(received, [("192.168.5.205", "picture_mode", "73")])
+            adb.stop_daemon_watch()
+        finally:
+            srv.close()
+
+    def test_color_temp_writes_mtk_enum_to_settings_and_maps_unknown_to_cool(self):
+        from mimonitor_toolbox.device_features import apply_picture_jni_overrides
+
+        host, calls, logs, *_ = self._make_control_host(extra_vals={"picture_color_temperature": 1})
+        # 点「原色」(MTK=6, UI=8)：Settings.Global 也必须写 MTK 值 6，防止 TVMenuSettingsService 反手把硬件写成 8
+        host._set_color_temp(6, 8, "色温: 原色")
+        self.assertIn(("jni_set", "g_video__clr_temp", 6, 3, True), calls)
+        self.assertIn(("put", "picture_color_temperature", "6", True), calls)
+        self.assertEqual(host.current_vals["picture_color_temperature"], 8)
+
+        # 回读时：6 -> 8(原色)，1 -> 0(冷色)，未知硬件槽位 8 -> 0(冷色，与固件 convertColorTempToXiaoMi 一致)
+        s1 = {"picture_color_temperature": 6}
+        apply_picture_jni_overrides(s1, {"g_video__clr_temp": 6})
+        self.assertEqual(s1["picture_color_temperature"], 8)
+
+        s2 = {"picture_color_temperature": 8}
+        apply_picture_jni_overrides(s2, {"g_video__clr_temp": 8})
+        self.assertEqual(s2["picture_color_temperature"], 0)
+
+        s3 = {"picture_color_temperature": 1}
+        apply_picture_jni_overrides(s3, {})
+        self.assertEqual(s3["picture_color_temperature"], 0)
+
+    def test_reset_current_mode_preserves_sub_scenario_slot(self):
+        from mimonitor_toolbox import display_features
+
+        host, calls, logs, *_ = self._make_control_host(extra_vals={"picture_mode": 70, "picture_preset_scenario": 70})
+        fake_box = mock.Mock()
+        fake_box.exec.return_value = True
+        with mock.patch.object(display_features, "MessageBox", return_value=fake_box), \
+             mock.patch.object(display_features.QTimer, "singleShot"), \
+             mock.patch.object(display_features.time, "sleep"):
+            host._reset_current_mode()
+        self.assertIn(("jni_set", "g_fusion_picture__pic_reset_def_bypicmode", 0, 3, True), calls)
+        self.assertIn(("put", "picture_mode", "70", True), calls)
+        self.assertIn(("put", "picture_preset_scenario", "70", True), calls)
+        self.assertTrue(any("SDR PC DCI-P3" in line for line in logs))
+
 
 if __name__ == "__main__":
     unittest.main()

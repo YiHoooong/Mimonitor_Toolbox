@@ -228,6 +228,8 @@ final class AppState: ObservableObject {
     private var lastMonitorFailState = ""
     /// 切页时刻，用于统计刷新耗时
     private var pageAppearTimes: [String: Date] = [:]
+    private var pendingWatchPages: Set<String> = []
+    private var daemonWatchDebounceWork: DispatchWorkItem?
 
     private static let timeFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -244,6 +246,11 @@ final class AppState: ObservableObject {
     init() {
         AudioOutputMonitor.startObservingDefaultOutput()
         adb.connectionMode = connectionMode
+        adb.setDaemonEventCallback { [weak self] ip, key, value in
+            DispatchQueue.main.async {
+                self?.handleDaemonWatchEvent(ip: ip, key: key, value: value)
+            }
+        }
         if !ipInput.isEmpty, KnownDeviceStore.device(in: knownDevices, matchingIP: ipInput) != nil {
             selectedDevice = ipInput
         }
@@ -335,6 +342,9 @@ final class AppState: ObservableObject {
         startupConnectWork = nil
         pendingRefreshWork?.cancel()
         pendingRefreshWork = nil
+        daemonWatchDebounceWork?.cancel()
+        daemonWatchDebounceWork = nil
+        pendingWatchPages.removeAll()
         for item in cyclePending.values { item.work.cancel() }
         cyclePending.removeAll()
         for item in adjustPendingWork.values { item.cancel() }
@@ -374,6 +384,7 @@ final class AppState: ObservableObject {
         presetTimer = nil
         try? logFileHandle?.close()
         logFileHandle = nil
+        adb.stopDaemonWatch()
         adb.killServer()
     }
 
@@ -426,6 +437,43 @@ final class AppState: ObservableObject {
                   self.adb.ip == targetIp,
                   self.connectionMode == .daemon else { return }
             self.log(ready ? "混合加速 Daemon 就绪（\(reason)）" : "混合加速 Daemon 暂未就绪，已保留标准 ADB 回退")
+        }
+    }
+
+    private func handleDaemonWatchEvent(ip: String, key: String, value: String) {
+        guard !shuttingDown, isConnected, !isPresetBusy else { return }
+        guard !adb.ip.isEmpty, adb.ip == ip else { return }
+        let sinceWrite = ProcessInfo.processInfo.systemUptime - adb.lastLocalWriteUptime
+        if sinceWrite < 1.6 { return }
+        if !key.hasPrefix("jni:")
+            && key != "picture_mode"
+            && key != "picture_preset_scenario"
+            && key != "power_picture_off"
+            && key != "picture_color_temperature"
+            && currentValues[key] == value {
+            return
+        }
+        let pages = RegisterMap.classifyWatchedKeyPages(key)
+        guard !pages.isEmpty else { return }
+        pendingWatchPages.formUnion(pages)
+        daemonWatchDebounceWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.flushWatchedPageRefreshes()
+        }
+        daemonWatchDebounceWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+    }
+
+    private func flushWatchedPageRefreshes() {
+        let pages = pendingWatchPages
+        pendingWatchPages.removeAll()
+        daemonWatchDebounceWork = nil
+        guard !pages.isEmpty, !shuttingDown, isConnected, !isPresetBusy else { return }
+        let sinceWrite = ProcessInfo.processInfo.systemUptime - adb.lastLocalWriteUptime
+        if sinceWrite < 1.6 { return }
+        for page in ["picture", "game", "source", "light"] where pages.contains(page) {
+            loadedPages.remove(page)
+            refreshPage(page)
         }
     }
 
@@ -1052,10 +1100,11 @@ final class AppState: ObservableObject {
             values["tv_picture_advanced_video_color_space"] = String(v)
             values["tv_picture_video_color_space"] = String(v)
         }
-        // 色温：MTK 枚举与小米枚举不同，需要反查
-        if let raw = values["g_video__clr_temp"], let v = Int(raw),
-           let ui = RegisterMap.mtkToColorTemp[v] {
-            values["picture_color_temperature"] = String(ui)
+        // 色温：Settings.Global 与 JNI 均存 MTK 枚举，按固件 convertColorTempToXiaoMi（含 default->0）反查为 UI 枚举
+        if let raw = values["g_video__clr_temp"], let v = Int(raw) {
+            values["picture_color_temperature"] = String(RegisterMap.mtkToColorTemp[v] ?? 0)
+        } else if let raw = values["picture_color_temperature"], let v = Int(raw) {
+            values["picture_color_temperature"] = String(RegisterMap.mtkToColorTemp[v] ?? 0)
         }
         // 精密控光：覆盖官方主键和旧 OSD 键
         if let raw = values["g_video__vid_local_dimming"], let v = Int(raw) {
@@ -1399,12 +1448,16 @@ final class AppState: ObservableObject {
         let resolvedName = RegisterMap.sceneNames[mode] ?? RegisterMap.modeNames[mode] ?? RegisterMap.pictureModeGroupName(mode)
         guard mode >= 0, let name = resolvedName else { log("无法获取当前模式"); return }
         let request = connectionIntent.generation
+        let restoreSubScenario = RegisterMap.presetSubScenarioModes.contains(mode)
         log("恢复 \(name) 模式默认设置...")
         runPictureChange(delay: 3.2) {
-            try? self.adb.batchWrites {
-                self.adb.jniSet(key: "g_fusion_picture__pic_reset_def_bypicmode", value: "0")
-                self.adb.refreshPq()
+            self.adb.jniSet(key: "g_fusion_picture__pic_reset_def_bypicmode", value: "0")
+            if restoreSubScenario {
+                Thread.sleep(forTimeInterval: 0.35)
+                self.adb.settingsPut("picture_mode", String(mode))
+                self.adb.settingsPut("picture_preset_scenario", String(mode))
             }
+            self.adb.refreshPq()
             DispatchQueue.main.async {
                 guard self.isConnected, self.connectionIntent.isCurrent(request) else { return }
                 self.scheduleCoalescedRefresh(delay: 3, pages: ["picture"])
@@ -1468,7 +1521,7 @@ final class AppState: ObservableObject {
         runPictureChange {
             try? self.adb.batchWrites {
                 self.adb.jniSet(key: "g_video__clr_temp", value: String(jv))
-                self.adb.settingsPut("picture_color_temperature", String(sv))
+                self.adb.settingsPut("picture_color_temperature", String(jv))
                 self.adb.refreshPq()
             }
         }
@@ -1492,9 +1545,10 @@ final class AppState: ObservableObject {
         log("\(title): \(value)")
 
         runPictureChange {
+            let customMtk = String(RegisterMap.colorTempToMtk[3] ?? 0)
             try? self.adb.batchWrites {
-                self.adb.jniSet(key: "g_video__clr_temp", value: String(RegisterMap.colorTempToMtk[3] ?? 0))
-                self.adb.settingsPut("picture_color_temperature", "3")
+                self.adb.jniSet(key: "g_video__clr_temp", value: customMtk)
+                self.adb.settingsPut("picture_color_temperature", customMtk)
                 self.adb.setColorGains(red: String(red), green: String(green), blue: String(blue))
                 self.adb.settingsPut("picture_red_gain", String(red))
                 self.adb.settingsPut("picture_green_gain", String(green))

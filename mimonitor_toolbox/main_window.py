@@ -137,6 +137,7 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
     connection_recovery_requested = pyqtSignal(int, str, str)
     reconnect_target_probe_finished = pyqtSignal(int, bool)
     resume_discovery_finished = pyqtSignal(int, list, str)
+    daemon_event_signal = pyqtSignal(str, str, str)
 
     def __init__(self):
         super().__init__()
@@ -188,6 +189,7 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
         self.connection_recovery_requested.connect(self._handle_connection_recovery_request)
         self.reconnect_target_probe_finished.connect(self._finish_reconnect_target_probe)
         self.resume_discovery_finished.connect(self._finish_resume_discovery)
+        self.daemon_event_signal.connect(self._on_daemon_watch_event)
         set_async_error_handler(self._report_background_error)
 
         # Setup layout and components
@@ -213,6 +215,10 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
         self.hdr_memory_timer.setInterval(3000)
         self.hdr_memory_timer.timeout.connect(lambda: self._poll_hdr_memory_state("timer"))
         self.hdr_memory_timer.start()
+        self._daemon_watch_debounce_timer = QTimer(self)
+        self._daemon_watch_debounce_timer.setSingleShot(True)
+        self._daemon_watch_debounce_timer.setInterval(300)
+        self._daemon_watch_debounce_timer.timeout.connect(self._flush_watched_page_refreshes)
         self.initialize_preset_features()
         self._preset_sync()
         # 顶部指示条：显示当前使用的预设（无按钮）
@@ -682,6 +688,11 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
                 self.adb_keepalive_timer.stop()
             if hasattr(self, "adb_server_monitor_timer"):
                 self.adb_server_monitor_timer.stop()
+            if hasattr(self, "_daemon_watch_debounce_timer"):
+                self._daemon_watch_debounce_timer.stop()
+            stop_watch = getattr(getattr(self, "adb", None), "stop_daemon_watch", None)
+            if callable(stop_watch):
+                stop_watch()
             for timer in getattr(self, "_slider_debounce_timers", {}).values():
                 timer.stop()
         except Exception:
@@ -1090,6 +1101,13 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
             # 连接状态变化时清除页面缓存
             if was_connected and not self.adb_connected:
                 self._stop_source_polling()
+                if hasattr(self, "_daemon_watch_debounce_timer"):
+                    self._daemon_watch_debounce_timer.stop()
+                if hasattr(self, "_pending_watch_pages"):
+                    self._pending_watch_pages.clear()
+                stop_watch = getattr(getattr(self, "adb", None), "stop_daemon_watch", None)
+                if callable(stop_watch):
+                    stop_watch()
                 self._page_loaded.clear()
                 self._hdr_last_state = None
                 self._hdr_state_source = None
