@@ -3122,31 +3122,32 @@ class DisplayFeatureRegressionFixTests(unittest.TestCase):
 
         # 1) SDR 下点「标准/游戏/电影」仍写 14/10/9；HDR 下自动写 18/16/17
         host, calls, logs, *_ = self._make_control_host(extra_vals={"picture_mode": 14})
-        host._set_mode(14, "标准")
-        self.assertEqual(calls[-1], ("put", "picture_mode", "14", True))
+        with mock.patch.object(display_features.QTimer, "singleShot"):
+            host._set_mode(14, "标准")
+            self.assertEqual(calls[-1], ("put", "picture_mode", "14", True))
 
-        host._hdr_windows_state = True
-        host._set_mode(14, "标准")
-        self.assertEqual(calls[-1], ("put", "picture_mode", "18", True))
-        self.assertEqual(host.current_vals["picture_mode"], 18)
-        host._set_mode(10, "游戏")
-        self.assertEqual(calls[-1], ("put", "picture_mode", "16", True))
-        host._set_mode(9, "电影")
-        self.assertEqual(calls[-1], ("put", "picture_mode", "17", True))
+            host._hdr_windows_state = True
+            host._set_mode(14, "标准")
+            self.assertEqual(calls[-1], ("put", "picture_mode", "18", True))
+            self.assertEqual(host.current_vals["picture_mode"], 18)
+            host._set_mode(10, "游戏")
+            self.assertEqual(calls[-1], ("put", "picture_mode", "16", True))
+            host._set_mode(9, "电影")
+            self.assertEqual(calls[-1], ("put", "picture_mode", "17", True))
 
-        # 2) 托盘当前值在子模式与 HDR 模式下都能归并到 14/10/9
-        for raw, expected in ((73, 14), (18, 14), (64, 10), (16, 10), (13, 10), (17, 9)):
-            host.current_vals["picture_mode"] = raw
-            self.assertEqual(host.tray_entry_value("picture_mode"), expected)
+            # 2) 托盘当前值在子模式与 HDR 模式下都能归并到 14/10/9
+            for raw, expected in ((73, 14), (18, 14), (64, 10), (16, 10), (13, 10), (17, 9)):
+                host.current_vals["picture_mode"] = raw
+                self.assertEqual(host.tray_entry_value("picture_mode"), expected)
 
-        # 3) HDR 模式下点「恢复默认」不再报「无法获取当前模式」
-        host.current_vals = {"picture_mode": 18, "picture_preset_scenario": 18}
-        fake_box = mock.Mock()
-        fake_box.exec.return_value = True
-        with mock.patch.object(display_features, "MessageBox", return_value=fake_box):
-            host._reset_current_mode()
-        self.assertIn(("jni_set", "g_fusion_picture__pic_reset_def_bypicmode", 0, 3, True), calls)
-        self.assertTrue(any("HDR 标准" in line for line in logs))
+            # 3) HDR 模式下点「恢复默认」不再报「无法获取当前模式」
+            host.current_vals = {"picture_mode": 18, "picture_preset_scenario": 18}
+            fake_box = mock.Mock()
+            fake_box.exec.return_value = True
+            with mock.patch.object(display_features, "MessageBox", return_value=fake_box):
+                host._reset_current_mode()
+            self.assertIn(("jni_set", "g_fusion_picture__pic_reset_def_bypicmode", 0, 3, True), calls)
+            self.assertTrue(any("HDR 标准" in line for line in logs))
 
         # 4) power_picture_off == 1（息屏但 ADB 在线）时跳过回读覆盖与 HDR 记忆轮询
         self.assertTrue(core.is_screen_off_online({"power_picture_off": "1"}))
