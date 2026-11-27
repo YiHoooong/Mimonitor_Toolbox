@@ -67,7 +67,6 @@ class TrayTestBase(unittest.TestCase):
             timer.stop()
         window.hide()
         window.deleteLater()
-        _qt_application.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         _qt_application.processEvents()
 
     def _settings_patches(self, settings):
@@ -230,7 +229,6 @@ class PageContractTests(unittest.TestCase):
 
         window._cleanup_done = True
         window.deleteLater()
-        _qt_application.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         _qt_application.processEvents()
 
     def test_crosshair_toggle_lives_in_tools_page_and_defaults_on(self):
@@ -322,7 +320,6 @@ class CountdownSettingsUiTests(TrayTestBase):
             timer.stop()
         window.hide()
         window.deleteLater()
-        _qt_application.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         _qt_application.processEvents()
 
     def test_duration_slider_range_matches_macos(self):

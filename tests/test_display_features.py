@@ -3145,7 +3145,7 @@ class DisplayFeatureRegressionFixTests(unittest.TestCase):
         fake_box.exec.return_value = True
         with mock.patch.object(display_features, "MessageBox", return_value=fake_box):
             host._reset_current_mode()
-        self.assertIn(("jni_set", "g_fusion_picture__pic_reset_def_bypicmode", 0, True), calls)
+        self.assertIn(("jni_set", "g_fusion_picture__pic_reset_def_bypicmode", 0, 3, True), calls)
         self.assertTrue(any("HDR 标准" in line for line in logs))
 
         # 4) power_picture_off == 1（息屏但 ADB 在线）时跳过回读覆盖与 HDR 记忆轮询
