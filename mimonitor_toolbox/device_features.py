@@ -426,8 +426,9 @@ class DeviceFeaturesMixin:
             self.adb.set_connection_mode(conn_mode)
         else:
             self.adb.connection_mode = conn_mode
-        if hasattr(self.adb, "set_daemon_event_callback"):
-            self.adb.set_daemon_event_callback(self._emit_daemon_watch_event)
+        emit_watch_cb = getattr(self, "_emit_daemon_watch_event", None)
+        if hasattr(self.adb, "set_daemon_event_callback") and callable(emit_watch_cb):
+            self.adb.set_daemon_event_callback(emit_watch_cb)
         self._pending_watch_pages = set()
         self._source_names = {
             23: "HDMI 1", 24: "HDMI 2", 29: "DP", 30: "USBC",
