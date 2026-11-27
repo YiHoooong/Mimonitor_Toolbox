@@ -210,15 +210,27 @@ class PageContractTests(unittest.TestCase):
 
         window._apply_polled_values({
             "picture_preset_scenario": 0,
-            "picture_mode": 13,
+            "picture_mode": 61,
         })
 
-        self.assertEqual(window.picture_mode_hint_label.text(), "当前场景：Dolby Vision 自定义")
+        self.assertEqual(window.picture_mode_hint_label.text(), "当前场景：Dolby Vision 自定义（61）")
         self.assertIn("FluentLabelBase", window.picture_mode_hint_label.styleSheet())
         self.assertTrue(all(not button.isChecked() for button in window.mode_btns.values()))
         self.assertFalse(window.hdr_tone_mapping_card.isHidden())
+
+        # HDR 标准（18）与 HDR 游戏（16）应分别点亮「标准」「游戏」按钮并展示真实场景名
+        window._apply_polled_values({"picture_preset_scenario": 18, "picture_mode": 18})
+        self.assertEqual(window.picture_mode_hint_label.text(), "当前场景：HDR 标准（18）")
+        self.assertTrue(window.mode_btns[14].isChecked())
+
+        window._apply_polled_values({"picture_preset_scenario": 16, "picture_mode": 16})
+        self.assertEqual(window.picture_mode_hint_label.text(), "当前场景：HDR 游戏（16）")
+        self.assertTrue(window.mode_btns[10].isChecked())
+        self.assertIn("当前生效值", window.game_mode_hint_label.text())
+
         window._cleanup_done = True
         window.deleteLater()
+        _qt_application.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         _qt_application.processEvents()
 
     def test_crosshair_toggle_lives_in_tools_page_and_defaults_on(self):

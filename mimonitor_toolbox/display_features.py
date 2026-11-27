@@ -33,13 +33,16 @@ from .core import (
     hdmi_edid_for,
     is_game_picture_mode,
     is_hdr_tone_mapping_picture_mode,
+    is_screen_off_online,
     load_settings,
     memc_jni_key_for_mode,
     normalize_sound_output_value,
     parse_hdmi_edid_flags,
     parse_hdmi_edid_int,
     parse_sound_output_value,
+    primary_picture_mode,
     read_hdmi_edid_and_freesync,
+    resolve_target_picture_mode,
     update_settings,
     write_memc_value,
     write_screen_light_values,
@@ -315,6 +318,9 @@ class DisplayFeaturesMixin:
             val = int(raw)
         except (TypeError, ValueError):
             return None
+        if entry_id == "picture_mode":
+            primary = primary_picture_mode(val)
+            return primary if primary is not None else val
         if cfg is not None:
             if cfg.get("ui_offset"):
                 val += int(cfg["ui_offset"])
@@ -1231,7 +1237,7 @@ class DisplayFeaturesMixin:
         if getattr(self, "_hdr_windows_state", None) is True:
             return True
         return is_hdr_tone_mapping_picture_mode(
-            getattr(self, "current_vals", {}).get("picture_mode"))
+            DisplayFeaturesMixin._active_picture_scene_mode(self))
 
     def _start_auto_task(self, task, previous_task_id=None):
         preset_id = task.get("preset_id")
@@ -1617,10 +1623,10 @@ class DisplayFeaturesMixin:
             mode_int = int(mode)
         except (TypeError, ValueError):
             return str(mode)
-        group_name = self._picture_mode_group_name(mode_int)
-        if group_name:
-            return f"{group_name}（{mode_int}）"
-        return f"{PICTURE_SCENE_NAMES.get(mode_int, '未知场景')}（{mode_int}）"
+        scene_name = PICTURE_SCENE_NAMES.get(mode_int) or self._picture_mode_group_name(mode_int)
+        if scene_name:
+            return f"{scene_name}（{mode_int}）"
+        return f"未知场景（{mode_int}）"
 
     def _get_freesync_memory_mode(self):
         try:
@@ -1876,6 +1882,10 @@ class DisplayFeaturesMixin:
                 self._update_hdr_memory_status_label("Windows HDR 状态未知")
             else:
                 self._update_hdr_memory_status_label("等待连接显示器")
+            return
+
+        if is_screen_off_online(getattr(self, "current_vals", {})):
+            self._update_hdr_memory_status_label("显示器息屏中（暂停联动）")
             return
 
         win_state = self._query_windows_hdr_state()
@@ -2269,6 +2279,11 @@ class DisplayFeaturesMixin:
             return
         self._last_picture_mode_hint_value = mode
 
+        if is_screen_off_online(getattr(self, "current_vals", {})):
+            label.setText("当前场景：息屏中（已暂停同步）")
+            label.setStyleSheet(warning_hint_style())
+            return
+
         try:
             mode_int = int(mode)
         except Exception:
@@ -2281,13 +2296,14 @@ class DisplayFeaturesMixin:
 
         group_name = self._picture_mode_group_name(mode_int)
         if group_name:
-            label.setText(f"当前场景：{group_name}（{mode_int}）")
+            detail_name = PICTURE_SCENE_NAMES.get(mode_int, group_name)
+            label.setText(f"当前场景：{detail_name}（{mode_int}）")
             FluentStyleSheet.LABEL.apply(label)
             return
 
         scene_name = PICTURE_SCENE_NAMES.get(mode_int)
         if scene_name:
-            label.setText(f"当前场景：{scene_name}")
+            label.setText(f"当前场景：{scene_name}（{mode_int}）")
             FluentStyleSheet.LABEL.apply(label)
         else:
             label.setText(f"当前场景：未知场景（{mode_int}），不匹配上方模式按钮")
@@ -2295,22 +2311,25 @@ class DisplayFeaturesMixin:
 
     def _set_mode(self, val, name):
         if not self.check_connection(): return
+        target_val = resolve_target_picture_mode(val, is_hdr=DisplayFeaturesMixin._scene_is_hdr(self))
+        target_label = PICTURE_SCENE_NAMES.get(target_val, name)
         self._mark_adb_busy(3.0)
         self._picture_mode_switch_seq += 1
         seq = self._picture_mode_switch_seq
         previous = self._take_control_previous("picture_mode")
 
         def operation():
-            self.adb.put("picture_mode", str(val), check=True)
+            self.adb.put("picture_mode", str(target_val), check=True)
 
         def success():
             self._note_picture_change()
-            self.current_vals["picture_mode"] = val
-            self._highlight_mode(val)
-            self.log(f"模式: {name}")
+            self.current_vals["picture_mode"] = target_val
+            self.current_vals.pop("picture_preset_scenario", None)
+            self._highlight_mode(target_val)
+            self.log(f"模式: {target_label}")
             self._page_loaded.discard("picturePage")
             self._reconcile_crosshair_mode_state()
-            QTimer.singleShot(1200, lambda seq=seq, val=val: self._refresh_picture_page_after_mode_switch(seq, val))
+            QTimer.singleShot(1200, lambda seq=seq, val=target_val: self._refresh_picture_page_after_mode_switch(seq, val))
 
         def failure():
             self._restore_control_state("picture_mode", previous)
@@ -2332,11 +2351,19 @@ class DisplayFeaturesMixin:
 
     def _reset_current_mode(self):
         if not self.check_connection(): return
-        cur = self.current_vals.get("picture_mode")
-        if cur not in self._MODE_NAMES:
+        cur = DisplayFeaturesMixin._active_picture_scene_mode(self)
+        if cur is None:
+            cur = self.current_vals.get("picture_mode")
+        try:
+            cur_int = int(cur)
+        except (TypeError, ValueError):
+            cur_int = None
+        mode_name = None
+        if cur_int is not None:
+            mode_name = PICTURE_SCENE_NAMES.get(cur_int) or getattr(self, "_MODE_NAMES", {}).get(cur_int) or self._picture_mode_group_name(cur_int)
+        if not mode_name:
             self.log("无法获取当前模式")
             return
-        mode_name = self._MODE_NAMES[cur]
         w = MessageBox("恢复默认设置", f"你确定要恢复当前模式：{mode_name} 的默认设置吗？", self)
         accepted = w.exec()
         w.deleteLater()
@@ -2608,6 +2635,10 @@ class DisplayFeaturesMixin:
                 updates[dependency_key] = dependency_value
         updates[key] = value
 
+        target_game_mode = resolve_target_picture_mode(
+            10, is_hdr=DisplayFeaturesMixin._scene_is_hdr(self)
+        )
+        bounce_std_mode = 18 if is_hdr_tone_mapping_picture_mode(restore_game_mode) else 14
         self._mark_adb_busy(3.0 if switch_to_game else 2.5)
         if switch_to_game:
             self._picture_mode_switch_seq = getattr(self, "_picture_mode_switch_seq", 0) + 1
@@ -2617,9 +2648,9 @@ class DisplayFeaturesMixin:
                 for setting, setting_value in updates.items():
                     self.adb.put(setting, str(setting_value), check=True)
                 if switch_to_game:
-                    self.adb.put("picture_mode", "10", check=True)
+                    self.adb.put("picture_mode", str(target_game_mode), check=True)
                 elif retrigger_game_mode and game_mode_active:
-                    self.adb.put("picture_mode", "14", check=True)
+                    self.adb.put("picture_mode", str(bounce_std_mode), check=True)
                     if _is_daemon_adb(self.adb) and callable(getattr(self.adb, "batch_sleep", None)):
                         self.adb.batch_sleep(500)
                     else:
@@ -2638,10 +2669,11 @@ class DisplayFeaturesMixin:
                 self._note_picture_change()
             self.log(message)
             if switch_to_game:
-                self.current_vals["picture_mode"] = 10
-                self._highlight_mode(10)
+                self.current_vals["picture_mode"] = target_game_mode
+                self.current_vals.pop("picture_preset_scenario", None)
+                self._highlight_mode(target_game_mode)
                 self._update_game_mode_hint()
-                self.log("已切换到游戏模式")
+                self.log(f"已切换到{PICTURE_SCENE_NAMES.get(target_game_mode, '游戏')}模式")
                 self._refresh_pages(("picturePage", "gamePage"), delay_ms=1200, force=True)
 
         def failure():
@@ -2778,22 +2810,27 @@ class DisplayFeaturesMixin:
             return
         target_val = int(target_val)
         target_name = format_memc_label(target_val)
+        cinema_mode = resolve_target_picture_mode(
+            9, is_hdr=DisplayFeaturesMixin._scene_is_hdr(self)
+        )
+        cinema_label = PICTURE_SCENE_NAMES.get(cinema_mode, "电影")
         self._mark_adb_busy(3.5)
         self._picture_mode_switch_seq = getattr(self, "_picture_mode_switch_seq", 0) + 1
 
         def operation():
             with self.adb.transaction():
-                self.adb.put("picture_mode", "9", check=True)
+                self.adb.put("picture_mode", str(cinema_mode), check=True)
                 time.sleep(1.2)
-                write_memc_value(self.adb, 9, target_val)
+                write_memc_value(self.adb, cinema_mode, target_val)
 
         def success():
             self._note_picture_change()
-            self.current_vals["picture_mode"] = 9
+            self.current_vals["picture_mode"] = cinema_mode
+            self.current_vals.pop("picture_preset_scenario", None)
             self.current_vals[MEMC_SETTINGS_KEY] = target_val
-            self._highlight_mode(9)
+            self._highlight_mode(cinema_mode)
             self._optimistic_highlight(MEMC_SETTINGS_KEY, target_val)
-            self.log(f"已切至电影模式并开启运动补偿: {target_name}")
+            self.log(f"已切至{cinema_label}模式并开启运动补偿: {target_name}")
             if hasattr(self, "_refresh_pages"):
                 self._refresh_pages(("picturePage",), delay_ms=600, force=True)
 

@@ -22,9 +22,12 @@ class DisplayFeatureTests(unittest.TestCase):
         from mimonitor_toolbox.display_features import DisplayFeaturesMixin
 
         host = object()
-        self.assertEqual(DisplayFeaturesMixin._picture_mode_group_name(host, 64), "标准")
-        self.assertEqual(DisplayFeaturesMixin._picture_mode_group_name(host, 25), "游戏")
-        self.assertEqual(DisplayFeaturesMixin._picture_mode_group_name(host, 9), "电影")
+        for mode in (14, 69, 73, 18, 30, 34):
+            self.assertEqual(DisplayFeaturesMixin._picture_mode_group_name(host, mode), "标准")
+        for mode in (10, 64, 68, 16, 25, 29, 13):
+            self.assertEqual(DisplayFeaturesMixin._picture_mode_group_name(host, mode), "游戏")
+        for mode in (9, 17):
+            self.assertEqual(DisplayFeaturesMixin._picture_mode_group_name(host, mode), "电影")
 
     def test_zero_scenario_uses_picture_mode_without_overriding_valid_scenarios(self):
         from mimonitor_toolbox.display_features import DisplayFeaturesMixin
@@ -3112,6 +3115,56 @@ class DisplayFeatureRegressionFixTests(unittest.TestCase):
         with mock.patch.object(display_features, "load_settings", return_value={"hotkey_countdown_enabled": False}):
             host.trigger_hotkey_action("input_source_usbc")
         self.assertEqual(set_source_calls[-1], (30, True))
+
+    def test_hdr_mode_routing_tray_primary_mapping_and_screen_off_guard(self):
+        from mimonitor_toolbox import core, display_features
+        from mimonitor_toolbox.device_features import DeviceFeaturesMixin
+
+        # 1) SDR 下点「标准/游戏/电影」仍写 14/10/9；HDR 下自动写 18/16/17
+        host, calls, logs, *_ = self._make_control_host(extra_vals={"picture_mode": 14})
+        host._set_mode(14, "标准")
+        self.assertEqual(calls[-1], ("put", "picture_mode", "14", True))
+
+        host._hdr_windows_state = True
+        host._set_mode(14, "标准")
+        self.assertEqual(calls[-1], ("put", "picture_mode", "18", True))
+        self.assertEqual(host.current_vals["picture_mode"], 18)
+        host._set_mode(10, "游戏")
+        self.assertEqual(calls[-1], ("put", "picture_mode", "16", True))
+        host._set_mode(9, "电影")
+        self.assertEqual(calls[-1], ("put", "picture_mode", "17", True))
+
+        # 2) 托盘当前值在子模式与 HDR 模式下都能归并到 14/10/9
+        for raw, expected in ((73, 14), (18, 14), (64, 10), (16, 10), (13, 10), (17, 9)):
+            host.current_vals["picture_mode"] = raw
+            self.assertEqual(host.tray_entry_value("picture_mode"), expected)
+
+        # 3) HDR 模式下点「恢复默认」不再报「无法获取当前模式」
+        host.current_vals = {"picture_mode": 18, "picture_preset_scenario": 18}
+        fake_box = mock.Mock()
+        fake_box.exec.return_value = True
+        with mock.patch.object(display_features, "MessageBox", return_value=fake_box):
+            host._reset_current_mode()
+        self.assertIn(("jni_set", "g_fusion_picture__pic_reset_def_bypicmode", 0, True), calls)
+        self.assertTrue(any("HDR 标准" in line for line in logs))
+
+        # 4) power_picture_off == 1（息屏但 ADB 在线）时跳过回读覆盖与 HDR 记忆轮询
+        self.assertTrue(core.is_screen_off_online({"power_picture_off": "1"}))
+        self.assertFalse(core.is_screen_off_online({"power_picture_off": "0"}))
+
+        class PollHost(DeviceFeaturesMixin, display_features.DisplayFeaturesMixin):
+            pass
+
+        ph = PollHost()
+        ph.current_vals = {"picture_mode": 18, "picture_backlight": 80}
+        ph.sliders = {}
+        ph.state_buttons = {}
+        ph.picture_mode_hint_label = mock.Mock()
+        ph._apply_polled_values({"power_picture_off": 1, "picture_mode": 0, "picture_backlight": 1})
+        self.assertEqual(ph.current_vals["picture_mode"], 18)
+        self.assertEqual(ph.current_vals["picture_backlight"], 80)
+        self.assertEqual(ph.current_vals["power_picture_off"], 1)
+        ph.picture_mode_hint_label.setText.assert_called_with("当前场景：息屏中（已暂停同步）")
 
 
 if __name__ == "__main__":

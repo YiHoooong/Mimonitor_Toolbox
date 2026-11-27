@@ -12,7 +12,7 @@ import CoreGraphics
 ///    仍然是 1.0，实测开/关都一样。
 ///
 /// 2. **显示器侧**：收到 HDR 信号时显示器会自动切到 HDR 画面模式
-///    （实测 macOS 开启 HDR 后 picture_mode 从 14「标准」跳到 18「Dolby Vision IQ」）。
+///    （实测 macOS 开启 HDR 后 picture_mode 从 14「标准」跳到 18「HDR 标准」）。
 ///
 /// 两者取或：只用主机侧会在显示器切换到别的信号源（游戏机等）时失效；
 /// 只用显示器侧则可能被手动选的 HDR 模式误触发。

@@ -432,7 +432,8 @@ class DeviceFeaturesMixin:
             "picturePage": {
                 "settings": [
                     "picture_mode", "picture_backlight", "xiaomi_picture_backlight",
-                    "picture_preset_scenario", "picture_brightness", "picture_contrast",
+                    "picture_preset_scenario", "power_picture_off",
+                    "picture_brightness", "picture_contrast",
                     "picture_saturation", "picture_hue", "picture_sharpness",
                     "picture_color_temperature", "picture_red_gain", "picture_green_gain",
                     "picture_blue_gain", "picture_local_dimming",
@@ -451,7 +452,7 @@ class DeviceFeaturesMixin:
             },
             "gamePage": {
                 "settings": [
-                    "picture_mode", "picture_preset_scenario",
+                    "picture_mode", "picture_preset_scenario", "power_picture_off",
                     "front_sight_index", "mt_game_dynamic_ft", "mt_game_scope",
                     "mt_game_scope_night", "monitor_menu_fps_counter",
                     "monitor_menu_stopwatch", "monitor_menu_timer",
@@ -1869,6 +1870,16 @@ class DeviceFeaturesMixin:
         QTimer.singleShot(80, lambda s=slider: self._force_slider_handle_update(s))
 
     def _apply_polled_values(self, vals):
+        from .core import is_screen_off_online
+        if is_screen_off_online(vals):
+            self.current_vals["power_picture_off"] = 1
+            update_hint = getattr(self, "_update_picture_mode_hint", None)
+            active_scene = getattr(self, "_active_picture_scene_mode", None)
+            if callable(update_hint):
+                update_hint(active_scene() if callable(active_scene) else None)
+            return
+        if "power_picture_off" in vals:
+            self.current_vals["power_picture_off"] = 0
         # settings 中的 picture_color_temperature 已经是小米层枚举值；
         # 只有 JNI 的 g_video__clr_temp 读数才需要从 MTK 枚举转换。
         if SOUND_OUTPUT_SETTINGS_KEY in vals:

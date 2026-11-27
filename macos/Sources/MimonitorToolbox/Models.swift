@@ -15,14 +15,9 @@ enum RegisterMap {
     /// MTK 值 -> UI 值（反查表）
     static let hdrToneMappingMtkToUI: [Int: Int] = [5: 0, 0: 1, 2: 2, 1: 3]
 
-    /// 只有这些画面模式下才存在 HDR 色调映射这个选项（移植自 core.py）。
+    /// 只有这些画面模式下才存在 HDR 色调映射这个选项（移植自 core.py MTK 枚举）。
     /// 标准/电影/游戏等 SDR 模式下该项无意义，原版会直接隐藏控件。
-    static let hdrToneMappingPictureModes: Set<Int> = [
-        11, 12, 13, 15, 16, 17, 18, 19,
-        22, 23,
-        29, 30, 31, 32, 33,
-        39, 40, 41, 42, 43, 44,
-    ]
+    static let hdrToneMappingPictureModes: Set<Int> = PicturePresetPlan.hdrModes
 
     static func isHdrToneMappingPictureMode(_ value: String?) -> Bool {
         guard let value,
@@ -49,23 +44,43 @@ enum RegisterMap {
         PicturePresetPlan.normalizeSoundOutput(raw)
     }
     /// 游戏画面模式集合（用于判断是否处于游戏模式）
-    /// 模式分组（移植自 core.py PICTURE_MODE_GROUPS）：同一组内的模式在 UI 上算同一类。
+    /// 模式分组（移植自 core.py PICTURE_MODE_GROUPS，对齐固件 MTK 枚举）：同一组内的模式在 UI 上算同一类。
     static let pictureModeGroups: [Int: Set<Int>] = [
-        14: [14, 64, 65, 66, 67, 68],
-        10: [10, 25, 26, 27, 28, 29],
-        9: [9],
+        14: [14, 69, 70, 71, 72, 73, 18, 30, 31, 32, 33, 34],
+        10: [10, 64, 65, 66, 67, 68, 16, 25, 26, 27, 28, 29, 13],
+        9: [9, 17],
     ]
 
-    /// 组名（移植自 _picture_mode_group_name）
-    static func pictureModeGroupName(_ mode: Int) -> String? {
-        for (primary, name) in [(14, "标准"), (10, "游戏"), (9, "电影")] {
-            if pictureModeGroups[primary]?.contains(mode) ?? false { return name }
+    static let sdrPrimaryPictureModes: [Int: Int] = [14: 14, 10: 10, 9: 9]
+    static let hdrPrimaryPictureModes: [Int: Int] = [14: 18, 10: 16, 9: 17]
+
+    /// 归并到 UI 三个主按钮键（14 标准 / 10 游戏 / 9 电影），不匹配返回 nil
+    static func primaryPictureMode(for mode: Int) -> Int? {
+        for primary in [14, 10, 9] {
+            if pictureModeGroups[primary]?.contains(mode) ?? false { return primary }
         }
         return nil
     }
 
-    /// GAME_PICTURE_MODES = 组10 ∪ {4, 15, 19}
-    static let gamePictureModes: Set<Int> = [10, 25, 26, 27, 28, 29, 4, 15, 19]
+    /// 将 UI 主按钮（14/10/9）解析为当前 SDR/HDR 信号池对应的 MTK 模式值
+    static func resolveTargetPictureMode(_ primary: Int, isHDR: Bool) -> Int {
+        let table = isHDR ? hdrPrimaryPictureModes : sdrPrimaryPictureModes
+        return table[primary] ?? primary
+    }
+
+    /// 是否处于「仅关闭画面 / 音响模式」（power_picture_off == 1，ADB 仍在线）
+    static func isScreenOffOnline(_ values: [String: String]) -> Bool {
+        values["power_picture_off"]?.trimmingCharacters(in: .whitespacesAndNewlines) == "1"
+    }
+
+    /// 组名（移植自 _picture_mode_group_name）
+    static func pictureModeGroupName(_ mode: Int) -> String? {
+        guard let primary = primaryPictureMode(for: mode) else { return nil }
+        return modeNames[primary]
+    }
+
+    /// GAME_PICTURE_MODES = 组10（含 SDR/HDR 游戏子模式与 Dolby Vision 游戏）
+    static let gamePictureModes: Set<Int> = pictureModeGroups[10]!
 
     /// 移植自 is_game_picture_mode：容忍 nil / 空串 / 非法值
     static func isGamePictureMode(_ value: String?) -> Bool {
@@ -74,18 +89,22 @@ enum RegisterMap {
         return gamePictureModes.contains(n)
     }
 
-    /// 完整场景名称表（移植自 core.py PICTURE_SCENE_NAMES）
+    /// 完整 MTK 场景名称表（移植自 core.py PICTURE_SCENE_NAMES，对齐固件 PictureSettingsManagerImpl）
     static let sceneNames: [Int: String] = [
-        9: "电影", 10: "游戏", 11: "Dolby Vision 明亮", 12: "Dolby Vision 暗场",
-        13: "Dolby Vision 自定义", 14: "标准", 15: "HDR 游戏", 16: "HDR 图片",
-        17: "HDR 电影", 18: "Dolby Vision IQ", 19: "Dolby Vision 游戏",
-        21: "Filmmaker", 22: "HDR 显示器", 23: "HDR Filmmaker", 24: "SDR 游戏 FPS",
-        25: "SDR 游戏 RPG", 26: "SDR 游戏 RTS", 27: "SDR 游戏 MOBA", 28: "SDR 游戏 SPT",
-        29: "HDR 游戏 FPS", 30: "HDR 游戏 RPG", 31: "HDR 游戏 RTS", 32: "HDR 游戏 MOBA",
-        33: "HDR 游戏 SPT", 34: "SDR PC AdobeRGB", 35: "SDR PC DCI-P3", 36: "SDR PC CG",
-        37: "SDR PC 暗房", 38: "SDR PC sRGB", 39: "HDR PC AdobeRGB", 40: "HDR PC DCI-P3",
-        41: "HDR PC CG", 42: "HDR PC 暗房", 43: "HDR PC sRGB", 44: "HDR Vivid",
-        64: "标准预设", 65: "标准预设", 66: "标准预设", 67: "标准预设", 68: "标准预设",
+        0: "自定义", 2: "体育", 3: "图片", 4: "Dolby Vision Filmmaker",
+        5: "Dolby Vision IQ", 6: "Dolby Vision 暗场", 9: "电影", 10: "游戏",
+        13: "Dolby Vision 游戏", 14: "标准", 15: "HDR", 16: "HDR 游戏",
+        17: "HDR 电影", 18: "HDR 标准", 19: "HDR 图片", 22: "IMAX",
+        25: "HDR 游戏 FPS", 26: "HDR 游戏 RPG", 27: "HDR 游戏 RTS",
+        28: "HDR 游戏 MOBA", 29: "HDR 游戏 SPT",
+        30: "HDR PC AdobeRGB", 31: "HDR PC DCI-P3", 32: "HDR PC CG",
+        33: "HDR PC 暗房", 34: "HDR PC sRGB", 35: "HDR10+",
+        55: "HLG", 59: "Dolby Vision 明亮", 61: "Dolby Vision 自定义",
+        64: "SDR 游戏 FPS", 65: "SDR 游戏 RPG", 66: "SDR 游戏 RTS",
+        67: "SDR 游戏 MOBA", 68: "SDR 游戏 SPT",
+        69: "SDR PC AdobeRGB", 70: "SDR PC DCI-P3", 71: "SDR PC CG",
+        72: "SDR PC 暗房", 73: "SDR PC sRGB",
+        75: "Filmmaker", 76: "HDR Filmmaker",
     ]
 
     static let lightModeNames: [Int: String] = [4: "关闭", 0: "照明", 2: "纯色", 1: "屏幕同色", 3: "七彩梦境"]
@@ -107,7 +126,8 @@ enum RegisterMap {
 enum PageDataKeys {
     static let pictureSettings = [
         "picture_mode", "picture_backlight", "xiaomi_picture_backlight",
-        "picture_preset_scenario", "picture_brightness", "picture_contrast",
+        "picture_preset_scenario", "power_picture_off",
+        "picture_brightness", "picture_contrast",
         "picture_saturation", "picture_hue", "picture_sharpness",
         "picture_color_temperature", "picture_red_gain", "picture_green_gain",
         "picture_blue_gain", "picture_local_dimming",
@@ -133,7 +153,7 @@ enum PageDataKeys {
         "g_video__dlg_vrr_switch", "g_video__vid_content_adaptive",
     ]
     static let gameSettings = [
-        "picture_mode", "picture_preset_scenario", "front_sight_index",
+        "picture_mode", "picture_preset_scenario", "power_picture_off", "front_sight_index",
         "mt_game_dynamic_ft", "mt_game_scope", "mt_game_scope_night",
         "monitor_menu_fps_counter", "monitor_menu_stopwatch", "monitor_menu_timer",
         "mitv.tvplayer.hdmi.last.source",

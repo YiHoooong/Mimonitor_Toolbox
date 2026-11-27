@@ -573,16 +573,46 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// 当前生效的 MTK 画面场景（非 0 的 picture_preset_scenario 优先，否则退回 picture_mode）
+    var activePictureSceneMode: Int? {
+        if let rawScenario = currentValues["picture_preset_scenario"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let scenario = Int(rawScenario), scenario != 0 {
+            return scenario
+        }
+        guard let rawMode = currentValues["picture_mode"]?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+            return nil
+        }
+        return Int(rawMode)
+    }
+
+    /// 供「标准 / 游戏 / 电影」三键选择器使用的高亮键值（子模式与 HDR 同组归并到 14/10/9）
+    var selectedModeButtonValue: Int {
+        guard let mode = activePictureSceneMode else { return -1 }
+        return RegisterMap.primaryPictureMode(for: mode) ?? mode
+    }
+
+    /// 当前是否处于 HDR / Dolby Vision 场景
+    var currentSceneIsHDR: Bool {
+        let modeText = activePictureSceneMode.map(String.init) ?? currentValues["picture_mode"]
+        return HDRDetector.isHDR(pictureMode: modeText)
+    }
+
     var pictureModeHint: String {
-        let raw = currentValues["picture_mode"]?.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let raw, let mode = Int(raw) else {
+        if RegisterMap.isScreenOffOnline(currentValues) {
+            return "当前场景：息屏中（已暂停同步）"
+        }
+        guard let mode = activePictureSceneMode else {
+            let raw = currentValues["picture_mode"]?.trimmingCharacters(in: .whitespacesAndNewlines)
             return "当前场景：未知（\(raw ?? "无")）"
         }
         if let group = RegisterMap.pictureModeGroupName(mode) {
-            return "当前场景：\(group)（\(mode)）"
+            let detail = RegisterMap.sceneNames[mode] ?? group
+            return "当前场景：\(detail)（\(mode)）"
         }
-        let scene = RegisterMap.sceneNames[mode] ?? "未知场景"
-        return "当前场景：\(scene)（\(mode)），不匹配上方模式按钮"
+        if let scene = RegisterMap.sceneNames[mode] {
+            return "当前场景：\(scene)（\(mode)）"
+        }
+        return "当前场景：未知场景（\(mode)），不匹配上方模式按钮"
     }
 
     /// 游戏模式提示的三态（移植自 _update_game_mode_hint）
@@ -1084,7 +1114,8 @@ final class AppState: ObservableObject {
 
     /// HDR 色调映射只在部分画面模式下存在（原版会据此隐藏控件）
     var showHdrToneMapping: Bool {
-        RegisterMap.isHdrToneMappingPictureMode(currentValues["picture_mode"])
+        guard let mode = activePictureSceneMode else { return false }
+        return RegisterMap.hdrToneMappingPictureModes.contains(mode)
     }
 
     /// 有数据可刷的页面（对应原版 _page_data_keys）。主页/工具页没有可读寄存器。
@@ -1182,12 +1213,19 @@ final class AppState: ObservableObject {
                 }
             }
 
+            let screenOffOnline = (page == "picture" || page == "game")
+                && RegisterMap.isScreenOffOnline(settingsVals)
+
             if !daemonQueryUsed && !settingsVals.isEmpty {
                 DispatchQueue.main.async {
                     guard self.isConnected,
                           self.connectionIntent.isCurrent(connectionRequest),
                           self.pageRefreshIntent.isCurrent(page, pageRequest) else { return }
-                    self.mergeValues(settingsVals)
+                    if screenOffOnline {
+                        self.mergeValues(["power_picture_off": "1"])
+                    } else {
+                        self.mergeValues(settingsVals)
+                    }
                     self.loadingPages.remove(page)
                     if let t0 = self.pageAppearTimes[page] {
                         let ms = Int(Date().timeIntervalSince(t0) * 1000)
@@ -1197,23 +1235,27 @@ final class AppState: ObservableObject {
             }
 
             // ── 第二阶段：JNI 回读（标准模式单独走 app_process；Daemon 模式已在上面拿到）──
-            if !daemonQueryUsed && !jniKeys.isEmpty {
+            if !daemonQueryUsed && !jniKeys.isEmpty && !screenOffOnline {
                 jniVals = self.adb.jniBatchGet(keys: jniKeys)
             }
 
             var merged = settingsVals
-            for (k, v) in jniVals { merged[k] = v }
-            self.applyJniOverrides(&merged)
-            if page == "game" {
-                if daemonQueryUsed {
-                    Self.deriveGameJniMode(&merged, from: jniVals)
-                } else {
-                    self.applyGameJniMode(&merged)
+            if !screenOffOnline {
+                for (k, v) in jniVals { merged[k] = v }
+                self.applyJniOverrides(&merged)
+                if page == "game" {
+                    if daemonQueryUsed {
+                        Self.deriveGameJniMode(&merged, from: jniVals)
+                    } else {
+                        self.applyGameJniMode(&merged)
+                    }
                 }
             }
 
             var corrections: [String: String] = [:]
-            if daemonQueryUsed {
+            if screenOffOnline {
+                corrections = ["power_picture_off": "1"]
+            } else if daemonQueryUsed {
                 corrections = merged
             } else {
                 for (k, v) in merged where settingsVals[k] != v {
@@ -1237,7 +1279,7 @@ final class AppState: ObservableObject {
                 }
                 if !corrections.isEmpty { self.mergeValues(corrections) }
 
-                if page == "picture" || page == "game" {
+                if (page == "picture" || page == "game") && !screenOffOnline {
                     self.reconcileCrosshairModeState()
                 }
 
@@ -1335,12 +1377,14 @@ final class AppState: ObservableObject {
         guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
         guard isConnected else { return log("未连接") }
         let request = connectionIntent.generation
-        let name = RegisterMap.modeNames[value] ?? "\(value)"
-        currentValues["picture_mode"] = String(value)
+        let target = RegisterMap.resolveTargetPictureMode(value, isHDR: currentSceneIsHDR)
+        let name = RegisterMap.sceneNames[target] ?? RegisterMap.modeNames[value] ?? "\(target)"
+        currentValues["picture_mode"] = String(target)
+        currentValues.removeValue(forKey: "picture_preset_scenario")
         log("模式: \(name)")
         reconcileCrosshairModeState()
         runPictureChange(delay: 1.5) {
-            self.adb.settingsPut("picture_mode", String(value))
+            self.adb.settingsPut("picture_mode", String(target))
             DispatchQueue.main.async {
                 guard self.isConnected, self.connectionIntent.isCurrent(request) else { return }
                 self.scheduleCoalescedRefresh(delay: 1.2, pages: ["picture"])
@@ -1351,8 +1395,9 @@ final class AppState: ObservableObject {
     func resetCurrentMode() {
         guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
         guard isConnected else { return log("未连接") }
-        let mode = intValue("picture_mode", default: -1)
-        guard let name = RegisterMap.modeNames[mode] else { log("无法获取当前模式"); return }
+        let mode = activePictureSceneMode ?? intValue("picture_mode", default: -1)
+        let resolvedName = RegisterMap.sceneNames[mode] ?? RegisterMap.modeNames[mode] ?? RegisterMap.pictureModeGroupName(mode)
+        guard mode >= 0, let name = resolvedName else { log("无法获取当前模式"); return }
         let request = connectionIntent.generation
         log("恢复 \(name) 模式默认设置...")
         runPictureChange(delay: 3.2) {
@@ -1645,14 +1690,17 @@ final class AppState: ObservableObject {
         guard isConnected else { return log("未连接") }
         guard (1...3).contains(value) else { return }
         let request = connectionIntent.generation
-        currentValues["picture_mode"] = "9"
+        let cinemaMode = RegisterMap.resolveTargetPictureMode(9, isHDR: currentSceneIsHDR)
+        let cinemaName = RegisterMap.sceneNames[cinemaMode] ?? "电影"
+        currentValues["picture_mode"] = String(cinemaMode)
+        currentValues.removeValue(forKey: "picture_preset_scenario")
         currentValues[MemcSupport.primarySettingKey] = String(value)
-        log("运动补偿: 已切至电影模式并设为 \(MemcSupport.levelLabel(value))")
+        log("运动补偿: 已切至\(cinemaName)模式并设为 \(MemcSupport.levelLabel(value))")
         runPictureChange(delay: 1.5) {
             try? self.adb.batchWrites {
-                self.adb.settingsPut("picture_mode", "9")
+                self.adb.settingsPut("picture_mode", String(cinemaMode))
                 self.adb.batchSleep(300)
-                self.executeMemcCommands(MemcSupport.writeCommands(value: value, pictureMode: 9))
+                self.executeMemcCommands(MemcSupport.writeCommands(value: value, pictureMode: cinemaMode))
             }
             DispatchQueue.main.async {
                 guard self.isConnected, self.connectionIntent.isCurrent(request) else { return }
@@ -1731,7 +1779,7 @@ final class AppState: ObservableObject {
                 self.adb.settingsPut("front_sight_index", String(value))
                 // 游戏模式下重触发让准星生效，同时保留当前游戏模式/HDR子模式值
                 if RegisterMap.isGamePictureMode(mode), !mode.isEmpty {
-                    let bounceMode = (mode == "14") ? "10" : "14"
+                    let bounceMode = RegisterMap.isHdrToneMappingPictureMode(mode) ? "18" : "14"
                     self.adb.settingsPut("picture_mode", bounceMode)
                     self.adb.batchSleep(500)
                     self.adb.settingsPut("picture_mode", mode)
@@ -1855,22 +1903,22 @@ final class AppState: ObservableObject {
                 if on && !wasOn {
                     let mode = Int(self.adb.settingsGet("picture_mode")
                         .trimmingCharacters(in: .whitespacesAndNewlines)) ?? -1
-                    if RegisterMap.modeNames[mode] != nil {
+                    if mode > 0 && !RegisterMap.gamePictureModes.contains(mode) && RegisterMap.sceneNames[mode] != nil {
                         UserDefaults.standard.set(mode, forKey: "freesync_previous_mode")
                         DispatchQueue.main.async {
                             guard self.isConnected, self.connectionIntent.isCurrent(request) else { return }
-                            self.log("FreeSync 模式记忆: 记录开启前模式 \(RegisterMap.modeNames[mode] ?? "\(mode)")")
+                            self.log("FreeSync 模式记忆: 记录开启前模式 \(RegisterMap.sceneNames[mode] ?? "\(mode)")")
                         }
                     } else {
                         UserDefaults.standard.removeObject(forKey: "freesync_previous_mode")
                         DispatchQueue.main.async {
                             guard self.isConnected, self.connectionIntent.isCurrent(request) else { return }
-                            self.log("FreeSync 模式记忆: 当前是 \(RegisterMap.sceneNames[mode] ?? "未知模式")，非标准模式不记录")
+                            self.log("FreeSync 模式记忆: 当前是 \(RegisterMap.sceneNames[mode] ?? "未知模式")，游戏/未知模式不记录")
                         }
                     }
                 } else if !on && wasOn {
                     let saved = UserDefaults.standard.integer(forKey: "freesync_previous_mode")
-                    restoreMode = RegisterMap.modeNames[saved] != nil ? saved : nil
+                    restoreMode = (saved > 0 && RegisterMap.sceneNames[saved] != nil) ? saved : nil
                 }
             }
 
@@ -2608,8 +2656,12 @@ final class AppState: ObservableObject {
     private(set) var hdrStateSource = ""
 
     func pollHdrState(force: Bool = false) {
+        if RegisterMap.isScreenOffOnline(currentValues) {
+            return
+        }
         let host = HDRDetector.hostSideHDR()
-        let monitor = HDRDetector.monitorSideHDR(pictureMode: currentValues["picture_mode"])
+        let modeText = activePictureSceneMode.map(String.init) ?? currentValues["picture_mode"]
+        let monitor = HDRDetector.monitorSideHDR(pictureMode: modeText)
         let state = host || monitor
         hdrStateSource = host && monitor ? "主机+显示器"
             : (host ? "主机 EDR" : (monitor ? "显示器模式" : ""))
@@ -2848,7 +2900,7 @@ final class AppState: ObservableObject {
     /// 该条目对应的当前值，用于在菜单里给选项打勾
     func menuBarValue(for id: String) -> Int? {
         switch id {
-        case "picture_mode":        return intValue("picture_mode", default: -1)
+        case "picture_mode":        return selectedModeButtonValue
         case "local_dimming":       return intValue("picture_local_dimming", default: -1)
         case "gamut":               return intValue("tv_picture_advanced_video_color_space", default: -1)
         case "color_temp":          return intValue("picture_color_temperature", default: -1)
@@ -3115,9 +3167,22 @@ final class AppState: ObservableObject {
     }
 
     private func cyclePictureMode() {
-        cycleStep(actionId: "picture_mode_cycle", label: "画面模式", order: [14, 10, 9],
-                  valueKey: "picture_mode",
-                  nameFor: { RegisterMap.sceneNames[$0] ?? "\($0)" }) { [weak self] v in
+        guard isConnected else { return log("未连接") }
+        let order = [14, 10, 9]
+        let baseRaw = cyclePending["picture_mode_cycle"]?.value ?? selectedModeButtonValue
+        let base = RegisterMap.primaryPictureMode(for: baseRaw) ?? baseRaw
+        let index = order.firstIndex(of: base).map { ($0 + 1) % order.count } ?? 0
+        let nextPrimary = order[index]
+        let nextResolved = RegisterMap.resolveTargetPictureMode(nextPrimary, isHDR: currentSceneIsHDR)
+        let label = RegisterMap.sceneNames[nextResolved] ?? RegisterMap.modeNames[nextPrimary] ?? "\(nextPrimary)"
+        currentValues["picture_mode"] = String(nextResolved)
+        currentValues.removeValue(forKey: "picture_preset_scenario")
+        scheduleStagedHotkey(
+            groupKey: "picture_mode_cycle",
+            label: "画面模式",
+            value: nextPrimary,
+            displayValue: label
+        ) { [weak self] v in
             self?.setMode(v)
         }
     }

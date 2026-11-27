@@ -15,8 +15,9 @@ public enum PicturePresetPlan {
     public static let validSoundOutputs: Set<Int> = [0, 5, 8]
     public static let colorTempToMtk = [0: 1, 1: 2, 2: 3, 3: 0, 4: 4, 5: 5, 8: 6]
     public static let hdrToneMappingToMtk = [0: 5, 1: 0, 2: 2, 3: 1]
-    public static let hdrModes: Set<Int> = [11, 12, 13, 15, 16, 17, 18, 19, 22, 23,
-                                            29, 30, 31, 32, 33, 39, 40, 41, 42, 43, 44]
+    public static let hdrModes: Set<Int> = [4, 5, 6, 13, 15, 16, 17, 18, 19, 22,
+                                            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
+                                            55, 59, 61, 76]
     public static let settingsKeys = [
         "picture_mode", "tv_picture_light_sensor", "picture_backlight", "xiaomi_picture_backlight",
         "picture_brightness", "picture_contrast", "picture_saturation", "picture_hue", "picture_sharpness",

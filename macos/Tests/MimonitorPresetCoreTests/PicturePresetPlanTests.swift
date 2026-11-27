@@ -183,6 +183,15 @@ final class PicturePresetPlanTests: XCTestCase {
         XCTAssertEqual(game[MemcSupport.primarySettingKey], "3")
     }
 
+    func testHdrModesMatchMtkFirmwareEnums() {
+        for hdrMode in [4, 5, 6, 13, 15, 16, 17, 18, 19, 25, 30, 34, 55, 59, 61, 76] {
+            XCTAssertTrue(PicturePresetPlan.hdrModes.contains(hdrMode), "mode \(hdrMode) should be HDR/DV")
+        }
+        for sdrMode in [9, 10, 14, 64, 68, 69, 73, 75] {
+            XCTAssertFalse(PicturePresetPlan.hdrModes.contains(sdrMode), "mode \(sdrMode) should be SDR")
+        }
+    }
+
     func testHdmiEdidMatrixAndReadbackFlags() {
         XCTAssertEqual(PicturePresetPlan.hdmiEdidVersion(mode320: false, freesync: false), 1)
         XCTAssertEqual(PicturePresetPlan.hdmiEdidVersion(mode320: false, freesync: true), 3)

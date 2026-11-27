@@ -30,7 +30,7 @@ struct PictureView: View {
                         HStack(spacing: 10) {
                             SegmentedOptionPicker(
                                 options: modeOptions,
-                                selectedValue: state.intValue("picture_mode", default: -1),
+                                selectedValue: state.selectedModeButtonValue,
                                 onSelect: { value in
                                     // 不匹配时的占位项只用来显示当前 id，点了不写设备
                                     guard [14, 10, 9].contains(value) else { return }
@@ -161,7 +161,7 @@ struct PictureView: View {
         var options = [14, 10, 9].map {
             Option(label: RegisterMap.modeNames[$0] ?? "\($0)", value: $0)
         }
-        let current = state.intValue("picture_mode", default: -1)
+        let current = state.selectedModeButtonValue
         if current > 0 && !options.contains(where: { $0.value == current }) {
             options.append(Option(label: "\(current)（不匹配）", value: current))
         }

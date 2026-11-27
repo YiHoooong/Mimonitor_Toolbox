@@ -502,10 +502,50 @@ ADJUSTABLE_HOTKEY_PARAMS = {
     },
 }
 PICTURE_MODE_GROUPS = {
-    14: {14, 64, 65, 66, 67, 68},
-    10: {10, 25, 26, 27, 28, 29},
-    9: {9},
+    # 标准组：SDR 标准/PC 色域（14, 69..73）+ HDR 标准/PC 色域（18, 30..34）
+    14: {14, 69, 70, 71, 72, 73, 18, 30, 31, 32, 33, 34},
+    # 游戏组：SDR 游戏/子类型（10, 64..68）+ HDR 游戏/子类型（16, 25..29）+ Dolby Vision 游戏（13）
+    10: {10, 64, 65, 66, 67, 68, 16, 25, 26, 27, 28, 29, 13},
+    # 电影组：SDR 电影（9）+ HDR 电影（17）
+    9: {9, 17},
 }
+SDR_PRIMARY_PICTURE_MODES = {14: 14, 10: 10, 9: 9}
+HDR_PRIMARY_PICTURE_MODES = {14: 18, 10: 16, 9: 17}
+
+
+def primary_picture_mode(mode):
+    """将 MTK 画面模式归并到 UI 三个主按钮键（14 标准 / 10 游戏 / 9 电影），不匹配返回 None。"""
+    try:
+        mode_int = int(mode)
+    except (TypeError, ValueError):
+        return None
+    for primary in (14, 10, 9):
+        if mode_int in PICTURE_MODE_GROUPS[primary]:
+            return primary
+    return None
+
+
+def resolve_target_picture_mode(primary_mode, *, is_hdr=False):
+    """将 UI 主模式（14/10/9）解析为当前 SDR/HDR 信号池对应的 MTK 模式值。"""
+    try:
+        primary = int(primary_mode)
+    except (TypeError, ValueError):
+        return primary_mode
+    table = HDR_PRIMARY_PICTURE_MODES if is_hdr else SDR_PRIMARY_PICTURE_MODES
+    return table.get(primary, primary)
+
+
+def is_screen_off_online(values):
+    """判断设备是否处于「仅关闭画面 / 音响模式」（power_picture_off == 1，ADB 仍在线）。"""
+    if not values:
+        return False
+    raw = values.get("power_picture_off")
+    if raw in (None, "", "null", "N/A"):
+        return False
+    try:
+        return int(str(raw).strip()) == 1
+    except (TypeError, ValueError):
+        return False
 GAME_FEATURE_KEYS = (
     "front_sight_index",
     "mt_game_dynamic_ft",
@@ -559,7 +599,7 @@ def write_screen_light_values(adb, mode, illumination, color_temp, color_value):
         adb.colorful_led("cycle", check=True)
     else:
         adb.colorful_led("off", check=True)
-GAME_PICTURE_MODES = frozenset(PICTURE_MODE_GROUPS[10]) | {4, 15, 19}
+GAME_PICTURE_MODES = frozenset(PICTURE_MODE_GROUPS[10])
 
 MEMC_SETTINGS_KEY = "tv_picture_advance_video_mjc_effect"
 MEMC_GAME_SETTINGS_KEY = "tv_picture_game_mode_with_memc_switch"
@@ -630,53 +670,57 @@ def write_memc_value(adb, mode, value):
     adb.refresh_pq(check=True)
 
 
+# MTK 底层画面模式枚举（对齐固件 PictureSettingsManagerImpl.converSceneModeToXiaomi / converPresetModeToXiaomi）
 PICTURE_SCENE_NAMES = {
+    0: "自定义",
+    2: "体育",
+    3: "图片",
+    4: "Dolby Vision Filmmaker",
+    5: "Dolby Vision IQ",
+    6: "Dolby Vision 暗场",
     9: "电影",
     10: "游戏",
-    11: "Dolby Vision 明亮",
-    12: "Dolby Vision 暗场",
-    13: "Dolby Vision 自定义",
+    13: "Dolby Vision 游戏",
     14: "标准",
-    15: "HDR 游戏",
-    16: "HDR 图片",
+    15: "HDR",
+    16: "HDR 游戏",
     17: "HDR 电影",
-    18: "Dolby Vision IQ",
-    19: "Dolby Vision 游戏",
-    21: "Filmmaker",
-    22: "HDR 显示器",
-    23: "HDR Filmmaker",
-    24: "SDR 游戏 FPS",
-    25: "SDR 游戏 RPG",
-    26: "SDR 游戏 RTS",
-    27: "SDR 游戏 MOBA",
-    28: "SDR 游戏 SPT",
-    29: "HDR 游戏 FPS",
-    30: "HDR 游戏 RPG",
-    31: "HDR 游戏 RTS",
-    32: "HDR 游戏 MOBA",
-    33: "HDR 游戏 SPT",
-    34: "SDR PC AdobeRGB",
-    35: "SDR PC DCI-P3",
-    36: "SDR PC CG",
-    37: "SDR PC 暗房",
-    38: "SDR PC sRGB",
-    39: "HDR PC AdobeRGB",
-    40: "HDR PC DCI-P3",
-    41: "HDR PC CG",
-    42: "HDR PC 暗房",
-    43: "HDR PC sRGB",
-    44: "HDR Vivid",
-    64: "标准预设",
-    65: "标准预设",
-    66: "标准预设",
-    67: "标准预设",
-    68: "标准预设",
+    18: "HDR 标准",
+    19: "HDR 图片",
+    22: "IMAX",
+    25: "HDR 游戏 FPS",
+    26: "HDR 游戏 RPG",
+    27: "HDR 游戏 RTS",
+    28: "HDR 游戏 MOBA",
+    29: "HDR 游戏 SPT",
+    30: "HDR PC AdobeRGB",
+    31: "HDR PC DCI-P3",
+    32: "HDR PC CG",
+    33: "HDR PC 暗房",
+    34: "HDR PC sRGB",
+    35: "HDR10+",
+    55: "HLG",
+    59: "Dolby Vision 明亮",
+    61: "Dolby Vision 自定义",
+    64: "SDR 游戏 FPS",
+    65: "SDR 游戏 RPG",
+    66: "SDR 游戏 RTS",
+    67: "SDR 游戏 MOBA",
+    68: "SDR 游戏 SPT",
+    69: "SDR PC AdobeRGB",
+    70: "SDR PC DCI-P3",
+    71: "SDR PC CG",
+    72: "SDR PC 暗房",
+    73: "SDR PC sRGB",
+    75: "Filmmaker",
+    76: "HDR Filmmaker",
 }
 HDR_TONE_MAPPING_PICTURE_MODES = {
-    11, 12, 13, 15, 16, 17, 18, 19,
-    22, 23,
-    29, 30, 31, 32, 33,
-    39, 40, 41, 42, 43, 44,
+    4, 5, 6, 13,
+    15, 16, 17, 18, 19, 22,
+    25, 26, 27, 28, 29,
+    30, 31, 32, 33, 34, 35,
+    55, 59, 61, 76,
 }
 
 def is_hdr_tone_mapping_picture_mode(mode):
