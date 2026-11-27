@@ -260,4 +260,14 @@ final class AdbClientTests: XCTestCase {
             XCTAssertGreaterThan(afterClearedCount, afterSkippedCount)
         }
     }
+
+    func testScreenOffOnlineMatchesMtkInvertedAudioOnlySemantics() {
+        // MTK g_audio__audio only / power_picture_off: 0 = 息屏(关闭画面), 1 = 正常亮屏
+        XCTAssertTrue(RegisterMap.isScreenOffOnline(["power_picture_off": "0"]))
+        XCTAssertTrue(RegisterMap.isScreenOffOnline(["power_picture_off": " 0\n"]))
+        XCTAssertFalse(RegisterMap.isScreenOffOnline(["power_picture_off": "1"]))
+        XCTAssertFalse(RegisterMap.isScreenOffOnline(["power_picture_off": "null"]))
+        XCTAssertFalse(RegisterMap.isScreenOffOnline(["power_picture_off": ""]))
+        XCTAssertFalse(RegisterMap.isScreenOffOnline([:]))
+    }
 }

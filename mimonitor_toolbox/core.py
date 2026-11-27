@@ -536,14 +536,14 @@ def resolve_target_picture_mode(primary_mode, *, is_hdr=False):
 
 
 def is_screen_off_online(values):
-    """判断设备是否处于「仅关闭画面 / 音响模式」（power_picture_off == 1，ADB 仍在线）。"""
+    """判断设备是否处于「仅关闭画面 / 音响模式」（MTK g_audio__audio only / power_picture_off == 0，亮屏为 1）。"""
     if not values:
         return False
     raw = values.get("power_picture_off")
-    if raw in (None, "", "null", "N/A"):
+    if raw in (None, "", "null", "N/A") or isinstance(raw, bool):
         return False
     try:
-        return int(str(raw).strip()) == 1
+        return int(str(raw).strip()) == 0
     except (TypeError, ValueError):
         return False
 GAME_FEATURE_KEYS = (

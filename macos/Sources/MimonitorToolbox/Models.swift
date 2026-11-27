@@ -68,9 +68,9 @@ enum RegisterMap {
         return table[primary] ?? primary
     }
 
-    /// 是否处于「仅关闭画面 / 音响模式」（power_picture_off == 1，ADB 仍在线）
+    /// 是否处于「仅关闭画面 / 音响模式」（MTK g_audio__audio only / power_picture_off == 0，亮屏为 1）
     static func isScreenOffOnline(_ values: [String: String]) -> Bool {
-        values["power_picture_off"]?.trimmingCharacters(in: .whitespacesAndNewlines) == "1"
+        values["power_picture_off"]?.trimmingCharacters(in: .whitespacesAndNewlines) == "0"
     }
 
     /// 组名（移植自 _picture_mode_group_name）

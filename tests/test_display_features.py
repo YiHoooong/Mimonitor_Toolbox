@@ -3149,9 +3149,14 @@ class DisplayFeatureRegressionFixTests(unittest.TestCase):
             self.assertIn(("jni_set", "g_fusion_picture__pic_reset_def_bypicmode", 0, 3, True), calls)
             self.assertTrue(any("HDR 标准" in line for line in logs))
 
-        # 4) power_picture_off == 1（息屏但 ADB 在线）时跳过回读覆盖与 HDR 记忆轮询
-        self.assertTrue(core.is_screen_off_online({"power_picture_off": "1"}))
-        self.assertFalse(core.is_screen_off_online({"power_picture_off": "0"}))
+        # 4) MTK g_audio__audio only / power_picture_off == 0（息屏但 ADB 在线；1 为正常亮屏）时跳过回读覆盖与 HDR 记忆轮询
+        self.assertTrue(core.is_screen_off_online({"power_picture_off": "0"}))
+        self.assertTrue(core.is_screen_off_online({"power_picture_off": 0}))
+        self.assertFalse(core.is_screen_off_online({"power_picture_off": "1"}))
+        self.assertFalse(core.is_screen_off_online({"power_picture_off": 1}))
+        self.assertFalse(core.is_screen_off_online({"power_picture_off": "null"}))
+        self.assertFalse(core.is_screen_off_online({"power_picture_off": False}))
+        self.assertFalse(core.is_screen_off_online({}))
 
         class PollHost(DeviceFeaturesMixin, display_features.DisplayFeaturesMixin):
             pass
@@ -3160,12 +3165,21 @@ class DisplayFeatureRegressionFixTests(unittest.TestCase):
         ph.current_vals = {"picture_mode": 18, "picture_backlight": 80}
         ph.sliders = {}
         ph.state_buttons = {}
+        ph.mode_btns = {}
         ph.picture_mode_hint_label = mock.Mock()
-        ph._apply_polled_values({"power_picture_off": 1, "picture_mode": 0, "picture_backlight": 1})
+        ph._apply_polled_values({"power_picture_off": 0, "picture_mode": 0, "picture_backlight": 1})
         self.assertEqual(ph.current_vals["picture_mode"], 18)
         self.assertEqual(ph.current_vals["picture_backlight"], 80)
-        self.assertEqual(ph.current_vals["power_picture_off"], 1)
+        self.assertEqual(ph.current_vals["power_picture_off"], 0)
         ph.picture_mode_hint_label.setText.assert_called_with("当前场景：息屏中（已暂停同步）")
+
+        # 亮屏状态下 power_picture_off == 1 正常同步参数并恢复场景显示
+        with mock.patch.object(display_features.FluentStyleSheet.LABEL, "apply"):
+            ph._apply_polled_values({"power_picture_off": 1, "picture_mode": 14, "picture_backlight": 44})
+        self.assertEqual(ph.current_vals["power_picture_off"], 1)
+        self.assertEqual(ph.current_vals["picture_mode"], 14)
+        self.assertEqual(ph.current_vals["picture_backlight"], 44)
+        ph.picture_mode_hint_label.setText.assert_called_with("当前场景：标准（14）")
 
 
 if __name__ == "__main__":

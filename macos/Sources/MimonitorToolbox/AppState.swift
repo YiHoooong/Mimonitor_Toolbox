@@ -1222,7 +1222,7 @@ final class AppState: ObservableObject {
                           self.connectionIntent.isCurrent(connectionRequest),
                           self.pageRefreshIntent.isCurrent(page, pageRequest) else { return }
                     if screenOffOnline {
-                        self.mergeValues(["power_picture_off": "1"])
+                        self.mergeValues(["power_picture_off": "0"])
                     } else {
                         self.mergeValues(settingsVals)
                     }
@@ -1254,7 +1254,7 @@ final class AppState: ObservableObject {
 
             var corrections: [String: String] = [:]
             if screenOffOnline {
-                corrections = ["power_picture_off": "1"]
+                corrections = ["power_picture_off": "0"]
             } else if daemonQueryUsed {
                 corrections = merged
             } else {

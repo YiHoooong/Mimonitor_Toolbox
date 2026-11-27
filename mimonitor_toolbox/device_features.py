@@ -1872,14 +1872,14 @@ class DeviceFeaturesMixin:
     def _apply_polled_values(self, vals):
         from .core import is_screen_off_online
         if is_screen_off_online(vals):
-            self.current_vals["power_picture_off"] = 1
+            self.current_vals["power_picture_off"] = 0
             update_hint = getattr(self, "_update_picture_mode_hint", None)
             active_scene = getattr(self, "_active_picture_scene_mode", None)
             if callable(update_hint):
                 update_hint(active_scene() if callable(active_scene) else None)
             return
         if "power_picture_off" in vals:
-            self.current_vals["power_picture_off"] = 0
+            self.current_vals["power_picture_off"] = 1
         # settings 中的 picture_color_temperature 已经是小米层枚举值；
         # 只有 JNI 的 g_video__clr_temp 读数才需要从 MTK 枚举转换。
         if SOUND_OUTPUT_SETTINGS_KEY in vals:
@@ -2239,10 +2239,11 @@ class DeviceFeaturesMixin:
                 if not _is_intent_snapshot_current(self, intent_generation, intent_ip):
                     return
 
-                # 应用数据到 UI
+                # 应用数据到 UI（息屏在线时仅交给 _apply_polled_values 标记状态，不下发 JNI 背光覆盖）
+                from .core import is_screen_off_online
                 if settings_vals:
                     self.values_signal.emit(settings_vals)
-                if jni_vals:
+                if jni_vals and not is_screen_off_online(settings_vals):
                     self.jni_values_signal.emit(jni_vals)
 
                 loaded = True
